@@ -1,0 +1,3 @@
+Exception in thread "main" com.sun.tools.javac.util.PropagatedException: com.google.errorprone.InvalidCommandLineOptionException: -XDaddTypeAnnotationsToSymbol=true is required by Error Prone on JDK 21
+	at jdk.compiler/com.sun.tools.javac.api.BasicJavacTask.initPlugins(BasicJavacTask.java:232)
+	at jdk.compiler/com.sun.tools.javac.main.Main.compile(Main.java:294)

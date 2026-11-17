@@ -43,14 +43,24 @@ The Gradle Wrapper runs its daemon on JDK 21, selected by
 does not need to be the default `java`.
 
 ```sh
-./gradlew build        # compile, run tests, assemble
-./gradlew test         # tests only
-./gradlew run          # run the CLI entry point
-./gradlew clean build  # full rebuild
+./gradlew build                 # compile, run unit tests, assemble
+./gradlew test                  # unit tests only
+GA_CHECKER_HOME=/path/to/NullAway ./gradlew integrationTest   # real-tool tests (separate)
+./gradlew run --args="check"    # run the check command (configuration: README.md)
+./gradlew clean build           # full rebuild
 ```
 
 Run verification that fits each change. At minimum, run `./gradlew build`
-before reporting a code change as done.
+before reporting a code change as done. Run `integrationTest` when changing
+checker invocation, classification, isolation, or the CLI flow.
+
+Unit tests (`src/test`) must be deterministic and must not depend on
+machine-specific paths or a NullAway checkout. Tests that use real external
+tools belong in `src/integrationTest`. They must fail, never silently skip,
+when their prerequisites are missing.
+
+Never modify a target project or the checker checkout's tracked files. Write
+generated files only to the run directory.
 
 ## Reporting
 

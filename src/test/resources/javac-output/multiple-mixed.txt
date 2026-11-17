@@ -1,0 +1,15 @@
+/work/my project/src/com/example/Foo.java:30: error: [NullAway] initializer method does not guarantee @NonNull field 'name' (line 28) is initialized along all control-flow paths (remember to check for exceptions or early returns).
+    public Foo(String s) {
+           ^
+    (see http://t.uber.com/nullaway )
+/work/my project/src/com/example/Bar.java:7: warning: [deprecation] Date(int,int,int) in Date has been deprecated
+        new java.util.Date(1, 2, 3);
+        ^
+/work/my project/src/com/example/Bar.java:9: error: [NullAway] returning @Nullable expression from method with @NonNull return type
+            return null;
+            ^
+    (see http://t.uber.com/nullaway )
+Note: /work/my project/src/com/example/Baz.java uses unchecked or unsafe operations.
+Note: Recompile with -Xlint:unchecked for details.
+2 errors
+1 warning

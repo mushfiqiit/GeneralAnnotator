@@ -1,0 +1,10 @@
+/work/my project/src/com/example/Foo.java:12: error: [NullAway] dereferenced expression x is @Nullable
+        return x.length();
+                ^
+    (see http://t.uber.com/nullaway )
+/work/my project/src/com/example/Broken.java:5: error: cannot find symbol
+        Missing m = null;
+        ^
+  symbol:   class Missing
+  location: class Broken
+2 errors

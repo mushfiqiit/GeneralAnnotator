@@ -36,3 +36,33 @@ tasks.test {
         events("passed", "skipped", "failed")
     }
 }
+
+// Real-tool integration tests (local NullAway checkout, git, javac). Kept out of `test` and
+// `check`; run explicitly with `./gradlew integrationTest` and GA_CHECKER_HOME set.
+val integrationTest: SourceSet = sourceSets.create("integrationTest") {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+configurations[integrationTest.implementationConfigurationName]
+    .extendsFrom(configurations.testImplementation.get())
+configurations[integrationTest.runtimeOnlyConfigurationName]
+    .extendsFrom(configurations.testRuntimeOnly.get())
+
+tasks.register<Test>("integrationTest") {
+    description = "Runs real-tool integration tests (requires GA_CHECKER_HOME)."
+    group = "verification"
+    testClassesDirs = integrationTest.output.classesDirs
+    classpath = integrationTest.runtimeClasspath
+    useJUnitPlatform()
+    systemProperty(
+        "ga.fixtures",
+        layout.projectDirectory.dir("src/integrationTest/fixtures").asFile.absolutePath,
+    )
+    inputs.dir("src/integrationTest/fixtures")
+    outputs.upToDateWhen { false }
+    shouldRunAfter(tasks.test)
+    testLogging {
+        events("passed", "skipped", "failed")
+        showStandardStreams = true
+    }
+}

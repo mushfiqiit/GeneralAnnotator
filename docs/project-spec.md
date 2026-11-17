@@ -1,7 +1,7 @@
 # GeneralAnnotator — Project Specification
 
-Status: draft, bootstrap stage. Only the build skeleton exists. No pipeline stage
-described here is implemented yet; see `docs/tasks.md` for what is planned next.
+Status: draft. Stage 1 (*Check*) is implemented for NullAway (tasks T1–T5 in
+`docs/tasks.md`). No other pipeline stage is implemented yet.
 
 ## 1. Purpose
 
@@ -104,7 +104,9 @@ interface or in one named class), labeled provisional, and noted here.
 ### Research decisions (explicitly unresolved)
 
 1. **Exact warning identity and matching rules.** What makes two diagnostics
-   in different repository states the same warning? Candidates include file plus
+   in different repository states the same warning? (Stage 1 records
+   per-run observations only: path, line, caret column, tag, and message.
+   It deliberately defines no matching.) Candidates include file plus
    line, enclosing element plus message key, or AST-anchored positions that survive
    line shifts caused by edits. This decision determines what counts as
    "resolved" and "introduced".
@@ -120,17 +122,47 @@ interface or in one named class), labeled provisional, and noted here.
 5. **Criteria for independent annotation batches.** When can several edits be
    attempted together without their effects interfering?
 
+### Engineering decisions settled for stage 1 (revisit if they stop fitting)
+
+- **NullAway invocation: a controlled `javac` + Error Prone command line, not
+  the target's build.** This was decided after inspecting EventBus. Its
+  wrapper is Gradle 6.8.3, which cannot run on the JDK 21 that Error Prone 2.50
+  needs. Its build also includes Android modules that need an Android SDK, which
+  is not installed. The NullAway processor path comes from the local checkout's
+  own build (an external init script that adds one task and reuses the
+  configurations of NullAway's `buildWithNullAway` task). The built jar must lie
+  inside `GA_CHECKER_HOME`. Consequences: source roots (and any classpath) must
+  be configured explicitly, and annotation processors and generated sources are
+  not supported.
+- **AnnotatedPackages.** By default it is derived from the `package`
+  declarations of the analyzed sources and reduced to minimal prefixes. It can be
+  overridden with `GA_NULLAWAY_ANNOTATED_PACKAGES`.
+- **Evidence that the checker ran.** Each javac invocation also compiles a
+  generated probe file outside the target, with one known NullAway violation in
+  its own annotated package. A missing probe finding is an execution failure.
+- **Findings vs. failures.** A sealed `CheckerOutcome` has two types:
+  `CompletedAnalysis` and `ExecutionFailure` (with a kind, reasons, and the
+  incomplete findings). javac exiting 1 only because of NullAway errors counts as
+  completed. The classification rules are in `NullAwayResultClassifier`.
+- **Isolation for this milestone: a full directory copy per run.** For a git
+  target, the copy holds the files from `git ls-files --cached --others
+  --exclude-standard`, with current working-tree contents. Otherwise a tree walk
+  is used, with fixed exclusions. Symlinks are skipped and reported. This is not
+  the long-term mechanism for repository *states* (see below).
+- **Report format.** `report.json` (schemaVersion 1) is written by a small
+  in-house JSON writer, so the project needs no dependency yet. When proposals
+  must be *read*, a JSON library decision is needed.
+
 ### Engineering decisions (open, to be settled by the task that needs them)
 
-- Isolation mechanism for repository states: directory copy, `git worktree`,
-  or something else.
-- How NullAway is invoked on target repositories: through the target's own
-  build, or through a controlled `javac` + Error Prone command line. This also
-  covers how NullAway options such as `AnnotatedPackages` are chosen.
+- Isolation mechanism for *multiple* repository states (copy per state, `git
+  worktree`, overlay, etc.) and how states are identified.
+- Supporting targets whose sources need dependency resolution or generated
+  code, for example by extracting the classpath from the target's build.
 - Which nullability annotation library edits use (JSpecify, or the target's
   existing annotations).
-- File format for manual proposals and for recorded results, and which
-  serialization library to use.
+- File format for manual proposals and which serialization library to use for
+  reading them.
 - How Specimin is invoked and pinned (version, JDK requirements).
 
 ## 7. Current status
@@ -138,7 +170,7 @@ interface or in one named class), labeled provisional, and noted here.
 | Stage | Status |
 |-------|--------|
 | Build skeleton (Gradle Wrapper, JUnit) | Implemented |
-| 1. Check (NullAway) | Not implemented |
+| 1. Check (NullAway) | Implemented: `check` command on configured source roots of one target, verified on fixtures and on EventBus core (`EventBus/src`) |
 | 2. Slice (Specimin) | Not implemented |
 | 3. Extract context | Not implemented |
 | 4. Propose (manual / LLM) | Not implemented |

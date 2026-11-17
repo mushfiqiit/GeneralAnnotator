@@ -27,68 +27,77 @@ Gradle Wrapper (Kotlin DSL), Java 21 toolchain, JUnit Jupiter, a placeholder
 Acceptance: `./gradlew build` passes, and `./gradlew run` prints the
 "not implemented" status message.
 
-## T1 — Parse NullAway diagnostics from captured compiler output · `next`
+## T1 — Parse NullAway diagnostics from captured compiler output · `done`
 
-Add an immutable diagnostic model and a parser that turns captured
-`javac`/Error Prone output text into diagnostics. This task does not run any
-process.
+`diagnostics.Diagnostic` (path as reported, line, optional caret column,
+severity, bracketed checker tag, full multi-line message, source snippet) and
+`diagnostics.JavacOutputParser`. Non-NullAway diagnostics, location-less
+messages, javac count lines, unrecognized lines and problems (missing caret,
+missing/mismatched counts, javac truncation notice) are all retained.
 
-- Model fields: source path, line, optional column, severity (`error` or
-  `warning`), checker name (such as `NullAway`), and message text.
-- Parse Error Prone's format, for example
-  `path/Foo.java:12: warning: [NullAway] dereferenced expression x is @Nullable`,
-  including the source-snippet and caret lines and the trailing
-  `(see http://t.uber.com/nullaway )` line that follow it.
-- Ignore diagnostics that are not NullAway, but expose them separately or count
-  them. Do not drop them silently.
-- Fixtures: captured output text files under `src/test/resources/` covering no
-  diagnostics, one diagnostic, several diagnostics, mixed `error`/`warning`
-  severities, a non-NullAway compiler error, and malformed or truncated output.
+Verified by: `JavacOutputParserTest` with fixtures in
+`src/test/resources/javac-output/` (empty, single, multiple/mixed,
+multi-line javac message, truncated, crash, general error, count mismatch,
+CRLF, split streams).
 
-Acceptance: the parser returns the expected diagnostics for every fixture.
-Malformed input produces a clear result or exception, never a partial result
-that silently loses data.
+## T2 — Classify a checker run: findings vs. execution failure · `done`
 
-## T2 — Classify a checker run: findings vs. execution failure · `todo`
+`checker.CheckerOutcome` (sealed: `CompletedAnalysis` / `ExecutionFailure`
+with `FailureKind`, reasons and incomplete findings) and
+`checker.nullaway.NullAwayResultClassifier`. A non-zero javac exit caused only
+by NullAway errors is a completed analysis; unrelated compiler errors,
+crashes, timeouts, start failures, inconsistent or unrecognized output, and a
+missing probe finding are failures.
 
-Given a captured run result (exit code, stdout, stderr, and timed-out flag),
-produce one of two kinds of result: a successful check with its NullAway
-findings, or an execution failure with a reason.
+Verified by: `NullAwayResultClassifierTest`.
 
-- A non-zero exit caused only by NullAway errors is a successful check with
-  findings.
-- Non-NullAway compilation errors, a missing tool, a timeout, or output that
-  cannot be parsed is an execution failure.
+## T3 — External command runner · `done`
 
-Acceptance: fixture-based tests cover each case, and the two outcome kinds are
-distinct types (or a sealed hierarchy), not a flag.
+`exec.CommandRunner`, `exec.ProcessCommandRunner` (ProcessBuilder argument
+lists, working directory, environment overrides, timeout with process-tree
+kill, concurrent stdout/stderr draining, start failures as results),
+`exec.RecordedCommand` (raw logs). Used for git, the NullAway build and javac.
 
-## T3 — External command runner · `todo`
+Verified by: `ProcessCommandRunnerTest` (output capture, exit codes, spaces,
+environment, working directory, 2 MiB on both streams, timeout, start failure).
 
-Add a `CommandRunner` interface and a process-based implementation. It takes
-the command, working directory, environment, and timeout, and captures exit
-code, stdout, stderr, duration, and whether the command timed out.
+## T4 — NullAway checker on a fixture project · `done`
 
-Acceptance: tests use trivial portable commands to check exit codes, output
-capture, and timeout. A fake runner is available for later tests.
+`checker.Checker`, `checker.Checkers` (rejects unsupported ids),
+`checker.nullaway.NullAwayChecker`: builds the local checkout's jar and
+processor path via an external init script, runs javac + Error Prone with
+derived or configured AnnotatedPackages and a probe file, classifies, and
+reports coverage. Invocation decision recorded in project-spec §6.
 
-## T4 — NullAway checker on a fixture project · `todo`
+Verified by: `NullAwayCheckerTest` (fake runner) and
+`./gradlew integrationTest` (`NullAwayCheckerIntegrationTest`: the
+`simple project` fixture yields exactly its 2 known findings; the
+`broken project` fixture is `COMPILATION_FAILED`).
 
-Add a `Checker` interface and a NullAway implementation that uses T2 and T3.
-Add a tiny fixture Java project with known NullAway warnings. Decide and
-document how NullAway is invoked (project-spec §6, engineering decisions).
+## T4a — `check` command with minimal isolation and report · `done`
 
-Acceptance: an integration test, kept separate from unit tests (for example a
-tagged or separate test task), finds exactly the expected warnings in the
-fixture. Unit tests run with a fake runner.
+Environment configuration (`config.ConfigLoader`), a per-run isolated copy
+(`isolation.WorkingCopyCreator`, git file list or walk, symlinks skipped),
+`report.json` + raw logs per run (`report.RunReport`, `report.Json`), console
+summary and exit codes (`cli.CheckCommand`, `cli.ExitCode`).
 
-## T5 — Isolated repository states · `todo`
+Verified by: `ConfigLoaderTest`, `WorkingCopyCreatorTest` (uncommitted and
+untracked content copied, ignored and deleted files not, symlink reported,
+original unchanged), `CheckCommandTest`, `MainTest`, `JsonTest`,
+`CheckCommandIntegrationTest`, and a real run on EventBus
+(`GA_TARGET_SOURCE_ROOTS=EventBus/src`): COMPLETED, 42 NullAway errors,
+original EventBus files and git metadata byte-identical before and after.
 
-Create isolated working copies of a target repository, each with an
-identifier. Choose and document the isolation mechanism.
+## T5 — Isolated repository states · `next`
+
+T4a provides one fresh copy per run. Still needed for the pipeline: multiple
+identified states derived from one another (apply edits to a state without
+re-copying the original), state identifiers, and cleanup. Choose and document
+the mechanism (project-spec §6).
 
 Acceptance: tests show that edits in one state are visible neither in the
-original repository nor in other states, and that states can be cleaned up.
+original repository nor in other states, that a state can be recreated from
+its identifier, and that states can be cleaned up.
 
 ## T6 — Annotation edit model and applier · `todo`
 

@@ -1,0 +1,5 @@
+/work/my project/src/com/example/Foo.java:12: error: [NullAway] dereferenced expression x is @Nullable
+        return x.length();
+                ^
+    (see http://t.uber.com/nullaway )
+/work/my project/src/com/example/Foo.java:20: error: [NullAway] passing @Nullable parameter 'y' where @NonNull is required
