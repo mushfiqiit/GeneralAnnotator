@@ -39,6 +39,16 @@ class MainTest {
     }
 
     @Test
+    void contextCommandIsDispatchedAndValidatesItsArguments() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "context", "no-such-run-directory"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot extract context"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "context", "x", "--bogus", "W0001"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("unknown arguments: context x --bogus W0001"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("context <run directory> [--warning <ID>]"));
+    }
+
+    @Test
     void checkWithoutConfigurationIsConfigurationError() {
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "check"));
         String text = err.toString(StandardCharsets.UTF_8);

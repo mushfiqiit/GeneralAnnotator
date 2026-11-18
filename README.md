@@ -11,9 +11,12 @@ also writes the **initial warning graph**: one root node per finding, no edges.
 For each warning it also identifies the **Specimin target member** (the
 enclosing method, constructor or field). The `slice` command then generates one
 Specimin slice per warning, but whether a slice still reproduces its warning is
-**not validated** yet. The `visualize` command renders a saved warning graph
-with Graphviz. No other pipeline stage (slice validation, context extraction,
-proposals, editing, graph expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
+**not validated** yet. The `context` command extracts **usage context** for each
+warning's target (call sites, arguments, parameter uses, returns, field reads and
+writes, null checks, annotations) from the run snapshot. The `visualize` command
+renders a saved warning graph with Graphviz. No other pipeline stage (slice
+validation, proposals, LLM calls, editing, graph expansion, search, batching)
+is implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
 
 ## Requirements
@@ -313,6 +316,105 @@ merged in, so you can slice warning by warning.
 | 3 | Specimin setup failed, or at least one slice FAILED (see `slice-results.json`) |
 | 4 | Internal error |
 
+## Extracting usage context (`context`)
+
+```sh
+./gradlew run --args="context runs/<run id>"                   # all warnings
+./gradlew run --args="context runs/<run id> --warning W0020"   # only one warning
+```
+
+`context` collects evidence about where the target's values come from and how
+they are used, as input for a later proposer. The approach is inspired by
+bidirectional type slicing, but it is a practical one-hop Java heuristic, not
+that formal algorithm. It reads `warning-targets.json` (warning IDs are kept),
+`warning-graph.json` (for warning messages) and `report.json` (configured
+source roots, classpath, `--release`). It then parses **and attributes** every
+Java file under the configured source roots of the run's `workspace/target`
+snapshot in one javac task. It does not use the Specimin slice. The checker,
+Specimin and any LLM are not run, and no file outside `context/` is written.
+
+**Matching uses compiler symbols, not names.** A reference counts as a usage
+only if the symbol javac resolved for it is the target's symbol. So overloads,
+fields shadowed by locals or parameters, and same-name members of other classes
+are excluded and counted as `sameNameOtherSymbols`. References that carry the
+target's name but that javac could not resolve, for example because of missing
+dependencies, are listed under `unresolvedReferences` and are *not* counted.
+So are references resolved while javac reported an error at that reference,
+and calls with an erroneous argument type when another overload with that
+number of parameters exists.
+
+Evidence categories (in this order):
+
+| Target | Categories |
+|---|---|
+| method | `warningSite`, `callSites`, `methodReferences`, `parameterUses`, `returnStatements`, `overrideRelations`, `unresolvedReferences` |
+| constructor | `warningSite`, `callSites` (`new`, `this(...)`, `super(...)`, implicit `super()`, anonymous classes), `methodReferences` (`::new`), `parameterUses`, `unresolvedReferences` |
+| field | `warningSite`, `fieldWrites` (initializer, assignments, `+=`, `++`), `fieldReads`, `unresolvedReferences` |
+| unresolved target | `warningSite` only (status `SKIPPED`) |
+
+Each evidence item has a location (path relative to the snapshot), the
+enclosing member, the relevant expression, a small snippet, and these fields:
+
+- **Details by kind.** For calls: the arguments, with their parameter, the kind
+  of expression (`NULL_LITERAL`, `PARAMETER`, `LOCAL_VARIABLE`, `FIELD`,
+  `METHOD_CALL`, ...) and declared annotations. Also `resultUse`, which says how
+  the returned value is consumed: dereferenced, compared with null, assigned
+  (and then the local's later uses in the same member), returned, passed as
+  an argument (callee, parameter and its annotations), discarded, and so on.
+  For parameter uses and field reads: the same consumption kinds, plus
+  `nullGuards`.
+- **`conditions`.** The enclosing `if`, loop, ternary, `&&`/`||`, `case` and
+  `catch` conditions, nearest first.
+- **`nullGuards`.** Syntactic null checks of the same variable that guard the
+  site: an enclosing `x != null`, `instanceof`, an early exit
+  `if (x == null) return;`, `assert`, or `Objects.requireNonNull`.
+- **`localDefinitions`.** Declarations (and up to two earlier assignments) of
+  local variables used by the relevant expression.
+- **`observations`.** Tags such as `NULL_LITERAL`, `DEREFERENCE`,
+  `NULL_COMPARISON`, `GUARDED_BY_NULL_CHECK`, `NULL_ARGUMENT`, `RETURNED`,
+  `IN_CONSTRUCTOR`, and `ERRONEOUS_ARGUMENT_TYPES`.
+
+These are observations about the code, not proofs of the right annotation.
+Usages are not filtered by any safe/unsafe region policy.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GA_CONTEXT_MAX_ITEMS` | 20 | Evidence items kept per category; the rest are counted in `omitted` |
+| `GA_CONTEXT_MAX_SNIPPET_LINES` | 6 | Lines kept per snippet (a window around the site); cut lines are counted in `omittedLines` |
+| `GA_CONTEXT_MAX_CONDITIONS` | 4 | Enclosing conditions kept per item; the rest are counted in `omittedConditions` |
+| `GA_CONTEXT_MAX_LOCAL_USES` | 5 | Later uses of a local that stores the value; the rest are counted in `omitted` |
+
+Evidence is deduplicated and sorted by file, offset and kind, so repeated runs
+give identical files. Output (regenerated on every run):
+
+```
+context/<ID>.json   schemaVersion 1: warning, target identity (declaration, modifiers,
+                    annotations, parameters), references summary, evidence by category
+                    (total, omitted, items), limitations, limits, analysis (files, classpath,
+                    javac options, compiler errors)
+context/<ID>.txt    the same content, readable
+```
+
+javac errors during attribution, such as a missing classpath, don't stop the
+command. They are recorded in `analysis.compilerErrors` and in the
+limitations, and references inside erroneous code end up under
+`unresolvedReferences`. Configure `GA_TARGET_CLASSPATH` for `check` so that the
+run's `report.json` carries the classpath.
+
+| Exit | `context` meaning |
+|---|---|
+| 0 | Context written for every selected warning (`EXTRACTED`, or `SKIPPED` for an unresolved target) |
+| 2 | Invalid argument, limit, run files, or missing snapshot; nothing written |
+| 3 | No attribution possible, or a target member was not found in the snapshot (`FAILED`) |
+| 4 | Internal error, including failure to write the files |
+
+Example (EventBus, W0020, the method `PendingPostQueue#poll()`): `callSites` lists
+`AsyncPoster.run()` storing `queue.poll()` in `pendingPost`, followed by
+`if (pendingPost == null)` and `eventBus.invokeSubscriber(pendingPost)`, guarded
+by an `EARLY_EXIT`. It also lists `BackgroundPoster.run()` and `poll(int)`, which
+returns the value. `returnStatements` shows `return pendingPost;`, with the local
+definition `PendingPost pendingPost = head;`.
+
 ## How the local NullAway checkout is used
 
 1. **Setup.** GeneralAnnotator writes `generated/nullaway-processor-path.init.gradle`
@@ -375,6 +477,7 @@ warnings.txt                   the findings, one per line with graph IDs (start 
 warning-graph.json             initial warning graph (only for a completed analysis)
 warning-targets.json           Specimin target member per warning ID (only with a graph)
 slices/                        written later by `slice` (not by `check`)
+context/                       written later by `context` (not by `check`)
 warning-graph.dot / .svg       written later by `visualize` (not by `check`)
 report.json                    machine-readable report (below)
 logs/<purpose>.stdout.txt      raw stdout of every external command
@@ -518,7 +621,7 @@ mismatched javac counts, or an exit code inconsistent with the diagnostics).
 
 ```
 src/main/java/generalannotator/
-  cli/          check command, exit codes
+  cli/          check, visualize, targets, slice and context commands; exit codes
   config/       environment configuration and validation
   exec/         CommandRunner (ProcessBuilder-based), recorded command logs
   diagnostics/  diagnostic model and javac output parser
@@ -530,6 +633,7 @@ src/main/java/generalannotator/
   visualization/  DOT export and Graphviz rendering (separate from the graph model)
   targets/      Specimin target-member extraction (JDK syntax trees; Specimin is not run)
   slicing/      Slicer interface, Specimin setup and invocation, slice-results.json
+  context/      usage-context extraction (javac-attributed snapshot, symbol-based matching)
 src/main/resources/generalannotator/checker/nullaway/processor-path.init.gradle
 src/test/java                     deterministic unit tests (./gradlew test)
 src/integrationTest/java          real-tool tests (./gradlew integrationTest)

@@ -1,6 +1,7 @@
 package generalannotator;
 
 import generalannotator.cli.CheckCommand;
+import generalannotator.cli.ContextCommand;
 import generalannotator.cli.ExitCode;
 import generalannotator.cli.SliceCommand;
 import generalannotator.cli.TargetsCommand;
@@ -35,10 +36,17 @@ public final class Main {
                       Generate one Specimin slice per warning (or only <ID>) from the run's
                       warning-targets.json into slices/<ID>/. Needs GA_SPECIMIN_HOME. Slices
                       are not validated: the checker is not rerun on them.
+              context <run directory> [--warning <ID>]
+                      Extract usage context (call sites, arguments, parameter uses, returns,
+                      field reads/writes, null checks, annotations) for every warning (or only
+                      <ID>) from the run's snapshot into context/<ID>.json and .txt. Uses javac
+                      symbols; no checker, Specimin or LLM is run. Limits: GA_CONTEXT_MAX_ITEMS,
+                      GA_CONTEXT_MAX_SNIPPET_LINES, GA_CONTEXT_MAX_CONDITIONS, GA_CONTEXT_MAX_LOCAL_USES.
 
             Exit codes: 0 success (check: analysis completed), 2 usage/configuration error,
                         3 execution failure (check: incomplete analysis; visualize: Graphviz
-                        missing or failed; slice: setup failed or a slice FAILED),
+                        missing or failed; slice: setup failed or a slice FAILED;
+                        context: attribution impossible or a target FAILED),
                         4 internal error.""";
 
     private Main() {}
@@ -83,6 +91,17 @@ public final class Main {
                 return new SliceCommand(args[1], args.length == 4 ? Optional.of(args[3]) : Optional.empty(), env,
                         Path.of("").toAbsolutePath(), Path.of(System.getProperty("java.home")),
                         new ProcessCommandRunner(), out, err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length >= 2 && args[0].equals("context")
+                && (args.length == 2 || (args.length == 4 && args[2].equals("--warning")))) {
+            try {
+                return new ContextCommand(args[1], args.length == 4 ? Optional.of(args[3]) : Optional.empty(), env,
+                        Path.of("").toAbsolutePath(), out, err).run();
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);

@@ -237,9 +237,40 @@ reproduced. This needs a rule for matching the warning inside the slice
 (project-spec §6.1) and a decision on how to compile slices (classpath,
 stubs). Update `reproduction` from NOT_VALIDATED.
 
-## T11 — Symbol usage extraction · `todo`
+## T11 — Symbol usage extraction · `done`
 
-Extract usages of the symbols relevant to a warning, using fixtures.
+`context <run directory> [--warning ID]` attributes the run snapshot's
+configured source roots with javac and, for each warning in
+`warning-targets.json` (IDs preserved), writes `context/<ID>.json` and `.txt`.
+Each file holds the target identity (declaration, modifiers, annotations,
+parameters) and evidence by category: warning site, call sites (arguments,
+result consumption, later uses of a local holding the result), method
+references, parameter uses, return statements, override relations, field
+writes and reads. Unresolved references are listed separately. Each item has
+a snippet, enclosing conditions, syntactic null guards, local definitions and
+observations. References are matched by compiler symbol. Untrustworthy
+same-name references are reported as unresolved and not counted. Evidence is
+deduplicated, ordered deterministically, and limited through `GA_CONTEXT_MAX_*`
+with omitted counts. No LLM, checker, Specimin, edit or region policy is
+involved. Code: `context.SourceModel`, `SiteAnalyzer`, `ContextExtractor`,
+`Evidence`, `EvidenceCategory`, `WarningContext`, `ContextJson`,
+`ContextText`, `ContextLimits`, `cli.ContextCommand`, and
+`MemberLocator.targetableMembers`.
+
+Verified by: `ContextExtractorTest` on a four-file fixture. It covers
+cross-file calls, overloads (and calls to them excluded), a shadowing local,
+an unrelated same-name field and method in another class, field reads and
+writes, argument and return flows, a ternary parameter flow, guarded
+dereferences (enclosing condition and early exit), `this(...)`, implicit
+`super()`, anonymous-class and diamond creations, override relations, missing
+dependencies (unresolved receiver), erroneous arguments with same-arity
+overloads in both directions, truncation, and determinism. Also
+`ContextCommandTest` (files and IDs, SKIPPED and FAILED, single warning,
+regeneration, env limits, usage errors, snapshot unchanged) and `MainTest`.
+Real EventBus run: 41 EXTRACTED, 1 SKIPPED (W0033), 0 javac errors.
+
+Not done: usages from unsafe regions (T12), multi-hop or dispatch-aware
+context (project-spec §6), prompting.
 
 ## T12 — Include usages from unsafe regions · `blocked`
 

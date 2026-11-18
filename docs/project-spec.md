@@ -1,8 +1,10 @@
 # GeneralAnnotator — Project Specification
 
 Status: draft. Stage 1 (*Check*) is implemented for NullAway (tasks T1–T4a in
-`docs/tasks.md`), followed by construction of the initial warning graph (T4b).
-No other pipeline stage is implemented yet.
+`docs/tasks.md`), with the initial warning graph (T4b), visualization (T4c),
+Specimin target members (T4d), Specimin slice generation without reproduction
+validation (T10a), and one-hop usage-context extraction (T11). Proposals,
+editing, rechecking, recording and search are not implemented.
 
 ## 1. Purpose
 
@@ -204,6 +206,25 @@ interface or in one named class), labeled provisional, and noted here.
   `--root`. GENERATED means exit 0 and at least one `.java` file;
   reproduction stays NOT_VALIDATED until T10b.
 
+- **Usage context (T11).** `context` attributes all Java files under the
+  configured source roots of the run snapshot in one javac task (JDK
+  compiler API, `-proc:none`, no output files, attribution continues after
+  errors). Context is extracted from the original snapshot, not from the
+  Specimin slice. References are matched by the javac symbol of the target
+  member. The target is found in the attributed tree by its Specimin
+  signature from `warning-targets.json`. Two method symbols with the same
+  owner, name and erased parameter types count as the same method, because
+  diamond inference creates per-call copies. Never trusted, and listed as
+  unresolved: references without a symbol, references where javac reported an
+  error inside the reference itself (outside its arguments), and calls with an
+  erroneous argument type when another overload accepts that number of
+  arguments. Evidence is one hop: call sites (arguments, result consumption,
+  later uses of a local that stores the result), parameter uses, returns,
+  override links in both directions, and field initializers, writes and reads.
+  Null guards are recognized syntactically. Limits are configurable, and
+  omissions are counted. All of this is a heuristic. It does not establish
+  which annotation is correct, and it applies no safe/unsafe policy (§6.2).
+
 ### Engineering decisions (open, to be settled by the task that needs them)
 
 - Warning-graph expansion: which node kinds (for example annotation actions,
@@ -223,6 +244,12 @@ interface or in one named class), labeled provisional, and noted here.
   block, but that would be a guess and is not done; they are SKIPPED.
 - How slices are compiled and checked to validate reproduction (T10b), and
   how a warning in a slice is matched to the original warning (§6.1).
+- How much context a proposer needs. The current extraction is one hop.
+  Possible extensions are following values through further calls, treating
+  calls through an overridden supertype method as usages (dynamic dispatch),
+  and including callers of callers. These should be decided by evaluating
+  proposals (T13), not guessed now. Whether usages in unsafe regions are added
+  or prioritized waits on §6.2 (T12).
 
 ## 7. Current status
 
@@ -235,8 +262,7 @@ interface or in one named class), labeled provisional, and noted here.
 | 2. Slice: target identification | Implemented: Specimin target member per warning (`warning-targets.json`, `targets` command). |
 | 2. Slice: generation | Implemented: `slice` command runs Specimin per warning into `slices/<ID>/` (`slice-results.json`). Reproduction is NOT_VALIDATED. |
 | 2. Slice: reproduction validation | Not implemented (T10b). |
-| 2. Slice (Specimin) | Not implemented |
-| 3. Extract context | Not implemented |
+| 3. Extract context | Implemented for symbol usages: `context` command writes `context/<ID>.json`/`.txt` (one hop, symbol-based, no safe/unsafe policy). Unsafe-region usages (T12) blocked on §6.2. |
 | 4. Propose (manual / LLM) | Not implemented |
 | 5. Apply and recheck | Not implemented |
 | 6. Record | Not implemented |
