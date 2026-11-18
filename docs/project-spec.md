@@ -193,6 +193,17 @@ interface or in one named class), labeled provisional, and noted here.
   3.28.2 (test-only dependency). A target does *not* establish that a slice
   reproduces the warning.
 
+- **Specimin invocation.** The local checkout (`GA_SPECIMIN_HOME`) is
+  built with its own `./gradlew installDist`, and Specimin runs as
+  `java <Specimin's JavaExec --add-exports flags> -cp <install/lib jars>
+  <manifest Main-Class> ...`. The start script was not used because it lacks
+  those flags and fails in google-java-format. The modularity model comes
+  from the graph's checker (`nullaway`). Dependency jars are passed only when
+  `GA_SPECIMIN_JAR_PATH` is set. Every warning runs separately against a
+  disposable copy of its source root, because Specimin may write into
+  `--root`. GENERATED means exit 0 and at least one `.java` file;
+  reproduction stays NOT_VALIDATED until T10b.
+
 ### Engineering decisions (open, to be settled by the task that needs them)
 
 - Warning-graph expansion: which node kinds (for example annotation actions,
@@ -207,10 +218,11 @@ interface or in one named class), labeled provisional, and noted here.
   existing annotations).
 - File format for manual proposals and which serialization library to use for
   reading them.
-- How Specimin is invoked and pinned (version, JDK requirements, jar paths for
-  dependencies), and what to do with warnings whose target is unresolved
-  (for example initializer blocks). This might mean targeting all fields
-  assigned in the block, but that would be a guess and is not done.
+- What to do with warnings whose target is unresolved (for example
+  initializer blocks). This might mean targeting all fields assigned in the
+  block, but that would be a guess and is not done; they are SKIPPED.
+- How slices are compiled and checked to validate reproduction (T10b), and
+  how a warning in a slice is matched to the original warning (§6.1).
 
 ## 7. Current status
 
@@ -220,7 +232,9 @@ interface or in one named class), labeled provisional, and noted here.
 | 1. Check (NullAway) | Implemented: `check` command on configured source roots of one target, verified on fixtures and on EventBus core (`EventBus/src`) |
 | Initial warning graph | Implemented: root warning nodes (distance 0), no edges, `warning-graph.json` save/load. No expansion. |
 | Graph visualization | Implemented: `visualize` command (Graphviz DOT/SVG, hover tooltips). |
-| 2. Slice: target identification | Implemented: Specimin target member per warning (`warning-targets.json`, `targets` command). Specimin is not run; reproduction is not validated. |
+| 2. Slice: target identification | Implemented: Specimin target member per warning (`warning-targets.json`, `targets` command). |
+| 2. Slice: generation | Implemented: `slice` command runs Specimin per warning into `slices/<ID>/` (`slice-results.json`). Reproduction is NOT_VALIDATED. |
+| 2. Slice: reproduction validation | Not implemented (T10b). |
 | 2. Slice (Specimin) | Not implemented |
 | 3. Extract context | Not implemented |
 | 4. Propose (manual / LLM) | Not implemented |

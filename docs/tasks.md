@@ -161,7 +161,7 @@ block. All 41 match JavaParser/Specimin member strings for the same snapshot.
 Not done: running Specimin, and validating that a slice reproduces the
 warning (T10).
 
-## T5 — Isolated repository states · `next`
+## T5 — Isolated repository states · `todo`
 
 T4a provides one fresh copy per run. Still needed for the pipeline: multiple
 identified states derived from one another (apply edits to a state without
@@ -204,12 +204,38 @@ documented, append-only format.
 
 Acceptance: round-trip tests, and an output schema documented in `docs/`.
 
-## T10 — Specimin slicer integration · `todo`
+## T10a — Specimin slice generation · `done`
 
-Add a `Slicer` interface and a Specimin implementation that produces a slice
-for a target warning, then confirms that the warning reproduces in the slice.
-Use the targets from `warning-targets.json` (T4d) as Specimin's `--root`,
-`--targetFile`, `--targetMethod` and `--targetField`.
+`slice <run directory> [--warning ID]` runs the local Specimin
+(`GA_SPECIMIN_HOME`, built with its own `./gradlew installDist`) once per
+warning in `warning-targets.json`. Each run gets a disposable copy of the
+target's `isolatedSourceRoot`, the NullAway modularity model, an optional
+explicit `--jarPath` (`GA_SPECIMIN_JAR_PATH`), and `--disable-root-validation`
+when required. Output goes to a fresh `slices/<ID>/`, and
+`slices/slice-results.json` records GENERATED / FAILED / SKIPPED with
+reproduction NOT_VALIDATED. Earlier results are never overwritten. Code:
+`slicing.Slicer`, `SpeciminDistribution`, `SpeciminSlicer`,
+`SliceResultsJson`, `cli.SliceCommand`, and `WarningTargetsJson.load`.
+
+Verified by: `SpeciminSlicerTest` (exact argument lists for methods,
+constructors and fields, generics and spaces, jar path, root validation,
+disposable copy, non-zero exit, timeout, start failure, empty output, missing
+snapshot root), `SpeciminDistributionTest`, `SliceCommandTest` (all
+warnings, shared targets run separately, continuing after a failure,
+SKIPPED reasons, single warning, refusal to overwrite and merging, invalid
+paths and configuration, missing snapshot, setup failure), and
+`WarningTargetsJsonTest` (reader round trip). Also `SliceIntegrationTest` with
+real Specimin `b1e5d43` (two GENERATED fixture slices and one real FAILED
+"could not locate"). Real EventBus run: 41 GENERATED, 0 FAILED, 1 SKIPPED
+(W0033) in about 44 s; the original project and the run snapshot were
+byte-identical afterwards.
+
+## T10b — Validate that slices reproduce their warnings · `next`
+
+Rerun the checker on each GENERATED slice and decide whether the warning is
+reproduced. This needs a rule for matching the warning inside the slice
+(project-spec §6.1) and a decision on how to compile slices (classpath,
+stubs). Update `reproduction` from NOT_VALIDATED.
 
 ## T11 — Symbol usage extraction · `todo`
 

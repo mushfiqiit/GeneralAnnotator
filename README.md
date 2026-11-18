@@ -9,10 +9,11 @@ command copies a target project into an isolated working copy, runs NullAway
 from a local checkout on it, and writes a report. After a completed analysis it
 also writes the **initial warning graph**: one root node per finding, no edges.
 For each warning it also identifies the **Specimin target member** (the
-enclosing method, constructor or field), but it does not run Specimin. The
-`visualize` command renders a saved warning graph with Graphviz. No other
-pipeline stage (slicing, context extraction, proposals, editing, graph
-expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
+enclosing method, constructor or field). The `slice` command then generates one
+Specimin slice per warning, but whether a slice still reproduces its warning is
+**not validated** yet. The `visualize` command renders a saved warning graph
+with Graphviz. No other pipeline stage (slice validation, context extraction,
+proposals, editing, graph expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
 
 ## Requirements
@@ -48,8 +49,9 @@ For other systems see https://graphviz.org/download/. If `dot` is not on
 ./gradlew build              # compile, run unit tests (deterministic, no external tools except git and the JDK)
 ./gradlew test               # unit tests only
 GA_CHECKER_HOME=/path/to/NullAway ./gradlew integrationTest
-                             # real-tool tests: local NullAway on tiny fixtures and real Graphviz
-                             # rendering (not part of build/check; needs NullAway and dot)
+                             # real-tool tests: local NullAway on tiny fixtures, real Graphviz
+                             # rendering and real Specimin slicing (not part of build/check;
+                             # needs GA_CHECKER_HOME, dot, and GA_SPECIMIN_HOME)
 ./gradlew run --args="help"  # usage
 ```
 
@@ -234,6 +236,83 @@ Unresolved by design, each with a reason:
 - the file is missing, doesn't parse, or its directory doesn't match its
   package.
 
+## Generating Specimin slices (`slice`)
+
+```sh
+export GA_SPECIMIN_HOME=/Users/mushfiqurrahmanchowdhury/Documents/specimin
+./gradlew run --args="slice runs/<run id>"                     # all warnings, one after another
+./gradlew run --args="slice runs/<run id> --warning W0003"     # only one warning
+```
+
+`slice` reads the run's `warning-targets.json` (from `check` or `targets`) and
+runs Specimin once per warning ID. Warnings that share a target still get
+separate runs. Neither the checker nor anything in the original project is run
+or changed.
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `GA_SPECIMIN_HOME` | yes | Absolute path of a local Specimin checkout (https://github.com/mushfiqiit/specimin; must contain `gradlew` and `build.gradle`) |
+| `GA_SPECIMIN_JAVA_HOME` | no | JDK used to build and run Specimin. Default: the JDK running GeneralAnnotator (21). Specimin's own build uses a Java 17 toolchain. |
+| `GA_SPECIMIN_JAR_PATH` | no | Directory of dependency jars, passed as Specimin's `--jarPath`. Default: none, so no `--jarPath`. EventBus core needs none. |
+| `GA_TIMEOUT_SECONDS` | no | Timeout for each Specimin build and Specimin run. Default: 1200. |
+
+How Specimin is used:
+1. **Setup** (once per `slice` command): `./gradlew --console=plain installDist`
+   runs in `GA_SPECIMIN_HOME`, Specimin's own build mechanism (Gradle
+   `application` plugin). The jars in `build/install/specimin/lib` and the
+   main class from `specimin.jar`'s manifest are then used. Logs go to
+   `slices/logs/`. The first build downloads Specimin's Gradle version and
+   takes a few minutes.
+2. **Per warning**: GeneralAnnotator runs `java` directly with Specimin's six
+   `--add-exports=jdk.compiler/...` flags, the same flags its Gradle `run` task
+   uses, which google-java-format needs. The generated start script lacks them
+   and fails. The arguments are passed as a list, so signatures with spaces
+   or generics such as `Class<?>` are passed unchanged:
+   `--root <copy> --targetFile <targetFile> --targetMethod|--targetField <target>
+   --modularityModel nullaway --outputDirectory slices/<ID>/output
+   [--jarPath <dir>] [--disable-root-validation]`. The modularity model comes
+   from the graph's checker; only `nullaway` is supported.
+3. **Isolation**: `--root` is a **disposable copy** of the target's
+   `isolatedSourceRoot` in `slices/<ID>/root-copy`, deleted after the run.
+   Specimin may write into `--root`, for example when decompiling
+   `--jarPath` jars. The run's `workspace/target` snapshot and the original
+   project are only read. `isolatedSourceRoot` must lie inside the run's own
+   snapshot, and `targetFile` must exist under it; otherwise nothing runs.
+
+Statuses (each entry also has `"reproduction": "NOT_VALIDATED"`):
+- `GENERATED`: Specimin exited 0 within the timeout and wrote at least one
+  `.java` file.
+- `FAILED`: Specimin couldn't start, timed out, exited non-zero (the reason
+  quotes its exception, for example "could not locate the following target
+  methods"), or wrote no Java files. Processing continues with the next
+  warning.
+- `SKIPPED`: the target is `UNRESOLVED`; the reason is copied from
+  `warning-targets.json`.
+
+Output in the run directory:
+
+```
+slices/slice-results.json          one entry per warning ID: target, status, reproduction,
+                                   command (argv, exit code, duration, timeout), logs,
+                                   outputDirectory, outputFiles, failureReason; plus the
+                                   Specimin commit, classpath, JVM flags, model, jarPath
+slices/<ID>/output/                the slice (Java files under their package directories)
+slices/<ID>/logs/specimin.stdout.txt, specimin.stderr.txt
+slices/logs/                       Specimin setup (installDist, git) logs
+```
+
+Previous results are **never overwritten**. If a selected warning already has a
+`slices/<ID>/` directory or an entry in `slice-results.json`, `slice` refuses
+before running anything. Results for other warnings are kept, and new ones are
+merged in, so you can slice warning by warning.
+
+| Exit | `slice` meaning |
+|---|---|
+| 0 | Every selected resolved target was GENERATED (SKIPPED entries allowed) |
+| 2 | Invalid argument, configuration, run files or paths, a missing snapshot, or a conflict with earlier results; nothing was run |
+| 3 | Specimin setup failed, or at least one slice FAILED (see `slice-results.json`) |
+| 4 | Internal error |
+
 ## How the local NullAway checkout is used
 
 1. **Setup.** GeneralAnnotator writes `generated/nullaway-processor-path.init.gradle`
@@ -295,6 +374,7 @@ Each run creates `GA_OUTPUT_DIR/<UTC timestamp>-<checker>/`:
 warnings.txt                   the findings, one per line with graph IDs (start here)
 warning-graph.json             initial warning graph (only for a completed analysis)
 warning-targets.json           Specimin target member per warning ID (only with a graph)
+slices/                        written later by `slice` (not by `check`)
 warning-graph.dot / .svg       written later by `visualize` (not by `check`)
 report.json                    machine-readable report (below)
 logs/<purpose>.stdout.txt      raw stdout of every external command
@@ -449,6 +529,7 @@ src/main/java/generalannotator/
   report/       report.json, warnings.txt, JSON writer and strict JSON parser
   visualization/  DOT export and Graphviz rendering (separate from the graph model)
   targets/      Specimin target-member extraction (JDK syntax trees; Specimin is not run)
+  slicing/      Slicer interface, Specimin setup and invocation, slice-results.json
 src/main/resources/generalannotator/checker/nullaway/processor-path.init.gradle
 src/test/java                     deterministic unit tests (./gradlew test)
 src/integrationTest/java          real-tool tests (./gradlew integrationTest)

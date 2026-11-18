@@ -56,7 +56,8 @@ checker invocation, classification, isolation, or the CLI flow.
 
 Unit tests (`src/test`) must be deterministic and must not depend on
 machine-specific paths, a NullAway checkout, or Graphviz. `integrationTest`
-needs `GA_CHECKER_HOME` and Graphviz `dot` (on PATH or via `GA_GRAPHVIZ_DOT`). Tests that use real external
+needs `GA_CHECKER_HOME`, Graphviz `dot` (on PATH or via `GA_GRAPHVIZ_DOT`), and
+`GA_SPECIMIN_HOME`. Tests that use real external
 tools belong in `src/integrationTest`. They must fail, never silently skip,
 when their prerequisites are missing.
 

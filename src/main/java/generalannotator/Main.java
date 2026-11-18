@@ -2,6 +2,7 @@ package generalannotator;
 
 import generalannotator.cli.CheckCommand;
 import generalannotator.cli.ExitCode;
+import generalannotator.cli.SliceCommand;
 import generalannotator.cli.TargetsCommand;
 import generalannotator.cli.VisualizeCommand;
 import generalannotator.exec.ProcessCommandRunner;
@@ -9,6 +10,7 @@ import java.io.PrintStream;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.util.Map;
+import java.util.Optional;
 
 /** Command-line entry point. */
 public final class Main {
@@ -29,10 +31,15 @@ public final class Main {
                       Determine the Specimin target member (targetFile, targetMethod or
                       targetField) of every warning of a completed run and write
                       warning-targets.json. Neither the checker nor Specimin is run.
+              slice <run directory> [--warning <ID>]
+                      Generate one Specimin slice per warning (or only <ID>) from the run's
+                      warning-targets.json into slices/<ID>/. Needs GA_SPECIMIN_HOME. Slices
+                      are not validated: the checker is not rerun on them.
 
             Exit codes: 0 success (check: analysis completed), 2 usage/configuration error,
                         3 execution failure (check: incomplete analysis; visualize: Graphviz
-                        missing or failed), 4 internal error.""";
+                        missing or failed; slice: setup failed or a slice FAILED),
+                        4 internal error.""";
 
     private Main() {}
 
@@ -64,6 +71,18 @@ public final class Main {
         if (args.length == 2 && args[0].equals("targets")) {
             try {
                 return new TargetsCommand(args[1], Path.of("").toAbsolutePath(), out, err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length >= 2 && args[0].equals("slice")
+                && (args.length == 2 || (args.length == 4 && args[2].equals("--warning")))) {
+            try {
+                return new SliceCommand(args[1], args.length == 4 ? Optional.of(args[3]) : Optional.empty(), env,
+                        Path.of("").toAbsolutePath(), Path.of(System.getProperty("java.home")),
+                        new ProcessCommandRunner(), out, err).run();
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);

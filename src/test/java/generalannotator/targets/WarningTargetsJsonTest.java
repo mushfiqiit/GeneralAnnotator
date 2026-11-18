@@ -48,4 +48,33 @@ class WarningTargetsJsonTest {
         assertEquals(List.of("warningId", "location", "status", "reason", "notes"),
                 List.copyOf(unresolved.keySet()));
     }
+
+    @Test
+    void readRoundTripsWhatWasWritten() {
+        List<WarningTarget> targets = List.of(
+                new WarningTarget.Resolved("W0001", "src/p/A.java:5:3", "src", "/copy dir/src", "p/A.java",
+                        MemberKind.CONSTRUCTOR, "p.A", "p.A#A(Map<String, List<?>>)", Optional.of("src"), true,
+                        List.of("a note")),
+                new WarningTarget.Resolved("W0002", "src/p/A.java:2:9", "src", "/copy dir/src", "p/A.java",
+                        MemberKind.FIELD, "p.A", "p.A#f", Optional.empty(), false, List.of()),
+                new WarningTarget.Unresolved("W0003", "src/p/A.java:9:5", "inside an initializer block", List.of()));
+
+        WarningTargetsJson.TargetsFile loaded =
+                WarningTargetsJson.read(WarningTargetsJson.write("run 1", Path.of("/copy dir"), targets));
+
+        assertEquals("run 1", loaded.runId());
+        assertEquals(Path.of("/copy dir"), loaded.workingCopy());
+        assertEquals(targets, loaded.targets());
+    }
+
+    @Test
+    void readRejectsInvalidFiles() {
+        String good = WarningTargetsJson.write("r", Path.of("/c"), List.of(
+                new WarningTarget.Unresolved("W0001", "x:1", "reason", List.of())));
+        for (String bad : List.of(good.replace("\"schemaVersion\": 1", "\"schemaVersion\": 9"),
+                good.replace("\"UNRESOLVED\"", "\"MAYBE\""), "{}", "[]")) {
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> WarningTargetsJson.read(bad), bad);
+        }
+    }
 }
