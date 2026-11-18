@@ -8,6 +8,9 @@ import generalannotator.config.ConfigLoader;
 import generalannotator.exec.CommandResult;
 import generalannotator.exec.CommandRunner;
 import generalannotator.exec.ProcessCommandRunner;
+import generalannotator.graph.WarningGraph;
+import generalannotator.graph.WarningGraphJson;
+import generalannotator.graph.WarningNode;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -45,6 +48,7 @@ class CheckCommandTest {
     private Map<String, String> env;
     private String javacFindingFile = "core/src/org/ex/A.java";
     private boolean javacCompileError;
+    private boolean javacNoTargetFindings;
 
     private final ByteArrayOutputStream out = new ByteArrayOutputStream();
     private final ByteArrayOutputStream err = new ByteArrayOutputStream();
@@ -100,8 +104,10 @@ class CheckCommandTest {
                         + "    (see http://t.uber.com/nullaway )\n";
                 String stderr = probe + ":7: error: [NullAway] dereferenced expression 'o' is @Nullable\n"
                         + "        return o.hashCode();\n               ^\n    (see http://t.uber.com/nullaway )\n"
-                        + finding;
-                if (javacCompileError) {
+                        + (javacNoTargetFindings ? "" : finding);
+                if (javacNoTargetFindings) {
+                    stderr += "1 error\n";
+                } else if (javacCompileError) {
                     stderr += spec.workingDirectory().resolve(javacFindingFile)
                             + ":1: error: cannot find symbol\nimport x.Y;\n        ^\n  symbol: class Y\n3 errors\n";
                 } else {
@@ -153,8 +159,20 @@ class CheckCommandTest {
         assertTrue(Files.exists(runDir.resolve("logs/javac.stderr.txt")));
         List<String> warnings = Files.readAllLines(runDir.resolve("warnings.txt"));
         assertTrue(warnings.contains("# count:   1"), warnings::toString);
-        assertEquals("core/src/org/ex/A.java:2:1: error: [NullAway] returning @Nullable expression",
+        assertEquals("W0001  core/src/org/ex/A.java:2:1: error: [NullAway] returning @Nullable expression",
                 warnings.getLast());
+
+        WarningGraph graph = WarningGraphJson.load(runDir.resolve("warning-graph.json"));
+        assertEquals("20261117T120000Z-nullaway", graph.runId());
+        assertEquals(1, graph.nodes().size());
+        assertTrue(graph.edges().isEmpty());
+        WarningNode node = graph.warningNodes().getFirst();
+        assertEquals("W0001", node.id());
+        assertTrue(node.root());
+        assertEquals(0, node.distance());
+        assertEquals(Optional.of("core/src/org/ex/A.java"), node.targetPath());
+        assertTrue(report.contains("\"warningGraph\": {\n    \"created\": true,\n    \"file\": \"warning-graph.json\""),
+                report);
         assertTrue(Files.exists(runDir.resolve("logs/nullaway-setup.stdout.txt")));
         assertEquals(before, Files.readString(target.resolve("core/src/org/ex/A.java")), "target unchanged");
 
@@ -162,6 +180,22 @@ class CheckCommandTest {
         assertTrue(summary.contains("status:   COMPLETED"), summary);
         assertTrue(summary.contains("findings: 1 {error=1}"), summary);
         assertTrue(summary.contains("exit:     0"), summary);
+        assertTrue(summary.contains("(1 warning node(s), 0 edge(s))"), summary);
+        assertTrue(summary.contains("Warning IDs (all roots, distance 0):\n"
+                + "  W0001  core/src/org/ex/A.java:2:1: error: [NullAway] returning @Nullable expression"), summary);
+    }
+
+    @Test
+    void completedAnalysisWithoutFindingsGivesEmptyGraph() throws IOException {
+        env.put(ConfigLoader.CHECKER_JAVA_HOME, jdk.toString());
+        javacNoTargetFindings = true;
+
+        assertEquals(ExitCode.COMPLETED, run(), out.toString(StandardCharsets.UTF_8));
+
+        WarningGraph graph = WarningGraphJson.load(onlyRunDir().resolve("warning-graph.json"));
+        assertTrue(graph.nodes().isEmpty());
+        assertTrue(graph.edges().isEmpty());
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("no findings, so no warning nodes"));
     }
 
     @Test
@@ -176,6 +210,10 @@ class CheckCommandTest {
         assertTrue(report.contains("\"kind\": \"COMPILATION_FAILED\""));
         assertTrue(report.contains("\"findingsComplete\": false"));
         assertTrue(Files.readString(onlyRunDir().resolve("warnings.txt")).contains("INCOMPLETE"));
+        assertFalse(Files.exists(onlyRunDir().resolve("warning-graph.json")),
+                "a failed analysis must not produce a (possibly empty) warning graph");
+        assertTrue(report.contains("\"created\": false"), report);
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("graph:    not created"));
         assertTrue(out.toString(StandardCharsets.UTF_8).contains("findings are incomplete"));
     }
 

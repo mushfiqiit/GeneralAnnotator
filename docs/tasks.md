@@ -88,6 +88,26 @@ original unchanged), `CheckCommandTest`, `MainTest`, `JsonTest`,
 (`GA_TARGET_SOURCE_ROOTS=EventBus/src`): COMPLETED, 42 NullAway errors,
 original EventBus files and git metadata byte-identical before and after.
 
+## T4b — Initial warning graph · `done`
+
+After a completed analysis, build one root warning node (distance 0) per
+finding, with no edges. IDs are `W0001`, ... in deterministic sorted order.
+Save the graph as `warning-graph.json` in the run directory and print the
+ID-to-warning mapping. A failed analysis writes no graph. Code:
+`graph.GraphNode`, `WarningNode`, `GraphEdge`, `WarningGraph`,
+`InitialWarningGraph`, `WarningGraphJson`, and `report.JsonParser`.
+
+Verified by: `InitialWarningGraphTest` (node count, unique sequential IDs,
+root and distance 0, empty edges, order independence, duplicates, empty
+graph, invariants), `WarningGraphJsonTest` (save/load equality including
+paths with spaces, byte-identical rewrite, empty collections, schema
+validation), `JsonParserTest`, `WarningsTextTest`, `CheckCommandTest`
+(graph written for completed runs including zero findings, absent for
+failures), and a real EventBus run (42 nodes, W0001–W0042, 0 edges).
+
+Not done (later tasks): graph expansion, annotation-action nodes, edge kinds,
+cross-run matching, and visualization.
+
 ## T5 — Isolated repository states · `next`
 
 T4a provides one fresh copy per run. Still needed for the pipeline: multiple

@@ -16,8 +16,14 @@ import generalannotator.isolation.IsolationException;
 import generalannotator.isolation.WorkingCopy;
 import generalannotator.isolation.WorkingCopyCreator;
 import generalannotator.report.Json;
+import generalannotator.checker.CheckerOutcome.CompletedAnalysis;
+import generalannotator.graph.InitialWarningGraph;
+import generalannotator.graph.WarningGraph;
+import generalannotator.graph.WarningGraphJson;
+import generalannotator.graph.WarningNode;
 import generalannotator.report.RunReport;
 import generalannotator.report.WarningsText;
+import java.util.Optional;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
@@ -117,23 +123,32 @@ public final class CheckCommand {
                 ? ExitCode.COMPLETED : ExitCode.EXECUTION_FAILURE;
         Path reportFile = runDir.resolve("report.json");
         Path warningsFile = runDir.resolve(WarningsText.FILE_NAME);
+        Path graphFile = runDir.resolve(WarningGraphJson.FILE_NAME);
+        Path copyRoot = copy == null ? null : copy.root();
+        // The warning graph exists only for a completed analysis; a failure never yields an empty graph.
+        Optional<WarningGraph> graph = outcome instanceof CompletedAnalysis completed
+                ? Optional.of(InitialWarningGraph.build(runId, config.checkerId(), completed, copyRoot))
+                : Optional.empty();
         try {
+            if (graph.isPresent()) {
+                WarningGraphJson.save(graph.get(), graphFile);
+            }
             Map<String, Object> report = RunReport.build(new RunReport.Inputs(runId, runDir, started,
-                    clock.instant(), config, copy, isolationCommands, checkerRun, outcome, exit.code()));
+                    clock.instant(), config, copy, isolationCommands, checkerRun, outcome, exit.code(),
+                    graph.isPresent() ? graphFile : null, graph.orElse(null)));
             Files.writeString(reportFile, Json.write(report), StandardCharsets.UTF_8);
             Files.writeString(warningsFile, WarningsText.format(config.checkerId(),
-                    config.targetProject().toString(), outcome, copy == null ? null : copy.root()),
-                    StandardCharsets.UTF_8);
+                    config.targetProject().toString(), outcome, copyRoot, graph), StandardCharsets.UTF_8);
         } catch (IOException | RuntimeException e) {
             err.println("GeneralAnnotator: failed to write the run output in " + runDir + ": " + e);
             return ExitCode.INTERNAL_ERROR;
         }
-        printSummary(config, copy, checkerRun, outcome, reportFile, warningsFile, exit);
+        printSummary(config, copy, checkerRun, outcome, reportFile, warningsFile, graphFile, graph, exit);
         return exit;
     }
 
     private void printSummary(AnalysisConfig config, WorkingCopy copy, CheckerRun run, CheckerOutcome outcome,
-            Path reportFile, Path warningsFile, ExitCode exit) {
+            Path reportFile, Path warningsFile, Path graphFile, Optional<WarningGraph> graph, ExitCode exit) {
         out.println("GeneralAnnotator check");
         String checkerInfo = config.checkerId();
         if (run != null && run.details().get("nullawayVersion") != null) {
@@ -170,9 +185,26 @@ public final class CheckCommand {
             out.println("  coverage: " + c.analyzedSourceFiles() + " source file(s) in " + c.analyzedSourceRoots()
                     + (outside > 0 ? "; " + outside + " Java file(s) outside the source roots not analyzed" : ""));
         }
+        if (graph.isPresent()) {
+            out.println("  graph:    " + graphFile + " (" + graph.get().nodes().size() + " warning node(s), "
+                    + graph.get().edges().size() + " edge(s))");
+        } else {
+            out.println("  graph:    not created (the analysis did not complete)");
+        }
         out.println("  warnings: " + warningsFile);
         out.println("  report:   " + reportFile);
         out.println("  exit:     " + exit.code() + " (" + exit + ")");
+        if (graph.isPresent()) {
+            List<WarningNode> nodes = graph.get().warningNodes();
+            out.println();
+            out.println(nodes.isEmpty() ? "Warning graph: no findings, so no warning nodes."
+                    : "Warning IDs (all roots, distance 0):");
+            nodes.forEach(n -> out.println("  " + truncate(WarningsText.mappingLine(n), 160)));
+        }
+    }
+
+    private static String truncate(String text, int max) {
+        return text.length() <= max ? text : text.substring(0, max - 3) + "...";
     }
 
     private static String firstLine(String text) {

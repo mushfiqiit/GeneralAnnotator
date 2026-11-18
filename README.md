@@ -6,9 +6,10 @@ and re-checked in isolated repository states.
 
 **Status:** pipeline stage 1 (*Check*) is implemented for NullAway. The `check`
 command copies a target project into an isolated working copy, runs NullAway
-from a local checkout on it, and writes a report. No other pipeline stage
-(slicing, context extraction, proposals, editing, search, batching) is
-implemented. See [docs/project-spec.md](docs/project-spec.md) and
+from a local checkout on it, and writes a report. After a completed analysis it
+also writes the **initial warning graph**: one root node per finding, no edges.
+No other pipeline stage (slicing, context extraction, proposals, editing, graph
+expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
 
 ## Requirements
@@ -142,7 +143,8 @@ The original target is only read. Each run copies it to
 Each run creates `GA_OUTPUT_DIR/<UTC timestamp>-<checker>/`:
 
 ```
-warnings.txt                   the findings, one per line (start here)
+warnings.txt                   the findings, one per line with graph IDs (start here)
+warning-graph.json             initial warning graph (only for a completed analysis)
 report.json                    machine-readable report (below)
 logs/<purpose>.stdout.txt      raw stdout of every external command
 logs/<purpose>.stderr.txt      raw stderr (purposes: isolation-git-*, nullaway-setup, javac)
@@ -152,24 +154,77 @@ classes/                       javac output directory (empty when NullAway repor
 ```
 
 The console summary shows the checker, target (with git HEAD), status, finding
-count with severity counts, coverage, the full paths of `warnings.txt` and
-`report.json`, and the exit code. With the default `GA_OUTPUT_DIR`, run folders
+count with severity counts, coverage, the warning graph's path and size (or
+"not created"), the full paths of `warnings.txt` and `report.json`, and the exit
+code. After a completed analysis it then prints the ID-to-warning mapping, one
+line per node (lines longer than 160 characters are shortened with `...`). With the default `GA_OUTPUT_DIR`, run folders
 are under `runs/` in the GeneralAnnotator checkout (not in the target).
 
 ### `warnings.txt`
 
 `#` header lines give the checker, target, status and count. Then each finding
-gets one line, with its path relative to the target project:
+gets one line, prefixed with its warning-graph ID, in ID order. Paths are
+relative to the target project:
 
 ```
-EventBus/src/org/greenrobot/eventbus/PendingPostQueue.java:20:25: error: [NullAway] @NonNull field 'head' not initialized
+W0001  EventBus/src/org/greenrobot/eventbus/EventBus.java:46:30: error: [NullAway] @NonNull static field 'defaultInstance' not initialized
 ```
 
 The column is omitted when javac printed no caret. Only the first message line
 is shown; the full text is in `report.json`. Probe findings are not listed. If
-the analysis failed, the header says `EXECUTION_FAILURE` and marks the list as
-**INCOMPLETE**. The file is written for every run that gets past configuration,
+the analysis failed, there is no graph, so lines have no ID; the header says
+`EXECUTION_FAILURE` and marks the list as **INCOMPLETE**. The file is written for every run that gets past configuration,
 including runs with zero findings.
+
+### `warning-graph.json` (schemaVersion 1)
+
+Written only when the analysis **completed**. A completed analysis with zero
+findings writes a graph with `"nodes": []`. An execution failure writes **no**
+graph file, so an incomplete analysis can never look like an empty graph.
+`report.json` then says `"warningGraph": {"created": false, ...}` with the reason.
+
+```json
+{
+  "schemaVersion": 1,
+  "graphType": "warning-graph",
+  "runId": "20261118T000203Z-nullaway",
+  "checker": "nullaway",
+  "nodes": [
+    {
+      "id": "W0001",
+      "kind": "warning",
+      "root": true,
+      "distance": 0,
+      "targetPath": "EventBus/src/org/greenrobot/eventbus/EventBus.java",
+      "diagnostic": {
+        "sourcePath": ".../runs/20261118T000203Z-nullaway/workspace/target/EventBus/src/org/greenrobot/eventbus/EventBus.java",
+        "line": 46,
+        "column": 30,
+        "severity": "error",
+        "checker": "NullAway",
+        "message": "@NonNull static field 'defaultInstance' not initialized\n(see http://t.uber.com/nullaway )",
+        "sourceSnippet": "    static volatile EventBus defaultInstance;"
+      }
+    }
+  ],
+  "edges": []
+}
+```
+
+- **Nodes:** one `warning` node per checker finding. Every initial node is a root
+  (`"root": true`) with `"distance": 0`. `diagnostic` is the complete parsed
+  diagnostic; `targetPath` is its path relative to the target, or null if it
+  lies outside the working copy.
+- **IDs:** `W0001`, `W0002`, ... (more digits beyond 9999). They are assigned
+  after sorting findings by target path, line, column (missing first),
+  severity, checker and message, so they don't depend on javac's output order.
+  IDs are preserved when the graph is saved and loaded. They identify warning
+  *occurrences within this run only*; nothing matches warnings across runs.
+- **Edges:** always empty for now. Edge kinds and other node kinds, such as
+  annotation actions, are left to later tasks.
+- The graph is plain data, with no visualization library. Loading
+  (`WarningGraphJson.load`) validates the schema, unique IDs, edge endpoints,
+  and that roots have distance 0.
 
 ### `report.json` (schemaVersion 1)
 
@@ -183,6 +238,7 @@ including runs with zero findings.
 | `checker` | NullAway version and jar, `error_prone_core` jar, full processor path, annotated packages and their source, probe file, `checkerActive`, javac's reported counts, general messages, unrecognized output lines, output problems, argument file |
 | `analysis` | `complete`, `findingsComplete`, `failure` (`kind`, `reasons[]`) or null, `findingCount`, `severityCounts`, `findings[]`, `otherDiagnostics[]` (non-NullAway diagnostics such as lint warnings or compiler errors) |
 | `coverage` | Analyzed source roots and file count, Java files outside the roots per top-level directory, limitations |
+| `warningGraph` | `created`, `file` (`warning-graph.json`), `nodeCount`, `edgeCount`; or `created: false` with a `reason` |
 
 Each diagnostic has `targetPath` (relative to the original target), `isolatedPath`
 (the file in the working copy), `reportedPath` (exactly as javac printed it),
@@ -237,7 +293,8 @@ src/main/java/generalannotator/
   isolation/    isolated working-copy creation
   checker/      Checker interface, outcome/coverage model, checker selection
   checker/nullaway/  NullAway adapter: setup, invocation, classification
-  report/       report.json construction and JSON writer
+  graph/        warning-graph model, initial construction, JSON save/load
+  report/       report.json, warnings.txt, JSON writer and strict JSON parser
 src/main/resources/generalannotator/checker/nullaway/processor-path.init.gradle
 src/test/java                     deterministic unit tests (./gradlew test)
 src/integrationTest/java          real-tool tests (./gradlew integrationTest)

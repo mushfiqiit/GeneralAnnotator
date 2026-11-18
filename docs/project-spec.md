@@ -1,7 +1,8 @@
 # GeneralAnnotator — Project Specification
 
-Status: draft. Stage 1 (*Check*) is implemented for NullAway (tasks T1–T5 in
-`docs/tasks.md`). No other pipeline stage is implemented yet.
+Status: draft. Stage 1 (*Check*) is implemented for NullAway (tasks T1–T4a in
+`docs/tasks.md`), followed by construction of the initial warning graph (T4b).
+No other pipeline stage is implemented yet.
 
 ## 1. Purpose
 
@@ -93,6 +94,9 @@ Out of scope for now:
 | **State transition** | The link from a source state to a result state through an attempt, together with the attempt's outcome. |
 | **Resolution** | The effect of an attempt on a warning: for example resolved, persisting, or newly introduced. Depends on warning identity. |
 | **Annotation sequence** | An ordered series of edits leading from the initial state to a later state. |
+| **Warning graph** | Per-run graph of warning nodes and (later) other nodes and edges. The initial graph is built from a completed analysis only: one root warning node per finding, no edges. Saved as `warning-graph.json`. |
+| **Warning node** | A graph node for one checker finding observed in one run. Its ID (`W0001`, ...) identifies that *occurrence within the run*, not a warning identity across runs. It holds the complete diagnostic. |
+| **Root / distance** | Initial warning nodes are roots with distance 0. How distance grows for nodes added later (for example per annotation step) is not defined yet (§6). |
 | **Batch** | A set of edits attempted together because they are believed to be independent. *Criteria unresolved* (§6). |
 
 ## 6. Unresolved design decisions
@@ -149,12 +153,25 @@ interface or in one named class), labeled provisional, and noted here.
   --exclude-standard`, with current working-tree contents. Otherwise a tree walk
   is used, with fixed exclusions. Symlinks are skipped and reported. This is not
   the long-term mechanism for repository *states* (see below).
-- **Report format.** `report.json` (schemaVersion 1) is written by a small
-  in-house JSON writer, so the project needs no dependency yet. When proposals
-  must be *read*, a JSON library decision is needed.
+- **JSON.** `report.json` and `warning-graph.json` are written by a small
+  in-house writer (`report.Json`). They are read back by a small, strict
+  in-house RFC 8259 parser (`report.JsonParser`), added for graph save/load.
+  The project still has no runtime dependencies. Revisit this if proposal files
+  need richer JSON handling.
+- **Initial warning graph.** It is built only from a `CompletedAnalysis`; a
+  failed run writes no graph, and `report.json` says why. IDs `W0001`, ... are
+  assigned after a deterministic sort (target path, line, column, severity,
+  checker, message, snippet). They are run-local occurrence IDs; this is *not*
+  a decision on §6.1. Node kinds are a sealed type with only `warning` for now.
+  The edge record (`source`, `target`, `kind`) exists so the edges collection
+  is typed, but no edge kinds are defined.
 
 ### Engineering decisions (open, to be settled by the task that needs them)
 
+- Warning-graph expansion: which node kinds (for example annotation actions,
+  warnings observed in later states) and edge kinds are added, what "distance"
+  measures for non-root nodes, and how nodes from different runs or states
+  relate. This depends on §6.1 and §6.3.
 - Isolation mechanism for *multiple* repository states (copy per state, `git
   worktree`, overlay, etc.) and how states are identified.
 - Supporting targets whose sources need dependency resolution or generated
@@ -171,6 +188,7 @@ interface or in one named class), labeled provisional, and noted here.
 |-------|--------|
 | Build skeleton (Gradle Wrapper, JUnit) | Implemented |
 | 1. Check (NullAway) | Implemented: `check` command on configured source roots of one target, verified on fixtures and on EventBus core (`EventBus/src`) |
+| Initial warning graph | Implemented: root warning nodes (distance 0), no edges, `warning-graph.json` save/load. No expansion. |
 | 2. Slice (Specimin) | Not implemented |
 | 3. Extract context | Not implemented |
 | 4. Propose (manual / LLM) | Not implemented |

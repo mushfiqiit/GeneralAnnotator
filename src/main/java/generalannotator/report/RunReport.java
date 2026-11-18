@@ -8,6 +8,7 @@ import generalannotator.config.AnalysisConfig;
 import generalannotator.diagnostics.Diagnostic;
 import generalannotator.exec.CommandResult;
 import generalannotator.exec.RecordedCommand;
+import generalannotator.graph.WarningGraph;
 import generalannotator.isolation.WorkingCopy;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
@@ -40,7 +41,9 @@ public final class RunReport {
             List<RecordedCommand> isolationCommands,
             CheckerRun checkerRun,
             CheckerOutcome outcome,
-            int exitCode) {}
+            int exitCode,
+            Path warningGraphFile,
+            WarningGraph warningGraph) {}
 
     public static Map<String, Object> build(Inputs in) {
         Map<String, Object> report = new LinkedHashMap<>();
@@ -66,7 +69,25 @@ public final class RunReport {
         report.put("checker", in.checkerRun() == null ? null : in.checkerRun().details());
         report.put("analysis", analysis(in.outcome(), in.workingCopy()));
         report.put("coverage", in.checkerRun() == null ? null : coverage(in.checkerRun().coverage()));
+        report.put("warningGraph", warningGraph(in));
         return report;
+    }
+
+    private static Map<String, Object> warningGraph(Inputs in) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        if (in.warningGraph() == null) {
+            m.put("created", false);
+            m.put("file", null);
+            m.put("reason", in.outcome() instanceof ExecutionFailure f
+                    ? "the analysis did not complete (" + f.kind() + "); an incomplete analysis has no warning graph"
+                    : "not created");
+            return m;
+        }
+        m.put("created", true);
+        m.put("file", in.runDirectory().relativize(in.warningGraphFile()).toString());
+        m.put("nodeCount", in.warningGraph().nodes().size());
+        m.put("edgeCount", in.warningGraph().edges().size());
+        return m;
     }
 
     private static Map<String, Object> configuration(AnalysisConfig c) {
