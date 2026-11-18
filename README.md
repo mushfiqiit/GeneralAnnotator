@@ -8,7 +8,8 @@ and re-checked in isolated repository states.
 command copies a target project into an isolated working copy, runs NullAway
 from a local checkout on it, and writes a report. After a completed analysis it
 also writes the **initial warning graph**: one root node per finding, no edges.
-No other pipeline stage (slicing, context extraction, proposals, editing, graph
+The `visualize` command renders a saved warning graph with Graphviz. No other
+pipeline stage (slicing, context extraction, proposals, editing, graph
 expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
 
@@ -25,6 +26,19 @@ expansion, search, batching) is implemented. See [docs/project-spec.md](docs/pro
   compiles with a JDK 27 toolchain, which Gradle's foojay resolver downloads into
   `~/.gradle/jdks` on first use, so the first run needs network access.
 - No system Gradle installation.
+- **Graphviz** (only for `visualize`), installed as described below.
+
+### Installing Graphviz
+
+```sh
+brew install graphviz              # macOS (Homebrew)
+sudo apt-get install graphviz      # Debian/Ubuntu
+dot -V                             # check: prints "dot - graphviz version ..."
+```
+
+For other systems see https://graphviz.org/download/. If `dot` is not on
+`PATH`, set `GA_GRAPHVIZ_DOT` to its full path, for example
+`export GA_GRAPHVIZ_DOT=/opt/homebrew/bin/dot`. Verified with Graphviz 12.1.0.
 
 ## Build and verify
 
@@ -32,7 +46,8 @@ expansion, search, batching) is implemented. See [docs/project-spec.md](docs/pro
 ./gradlew build              # compile, run unit tests (deterministic, no external tools except git and the JDK)
 ./gradlew test               # unit tests only
 GA_CHECKER_HOME=/path/to/NullAway ./gradlew integrationTest
-                             # real-tool tests: local NullAway on tiny fixtures (not part of build/check)
+                             # real-tool tests: local NullAway on tiny fixtures and real Graphviz
+                             # rendering (not part of build/check; needs NullAway and dot)
 ./gradlew run --args="help"  # usage
 ```
 
@@ -71,6 +86,7 @@ Every invalid value is reported together, and nothing runs (exit 2).
 | `GA_CHECKER_JAVA_HOME` | no | JDK used to build NullAway (`JAVA_HOME` for its wrapper) and to run `javac`. Default: the JDK running GeneralAnnotator. |
 | `GA_JAVAC_RELEASE` | no | Value for `javac --release` (for example `8`). Default: not set. |
 | `GA_TIMEOUT_SECONDS` | no | Timeout per external command (git, NullAway build, javac). Default: 1200. |
+| `GA_GRAPHVIZ_DOT` | no | `visualize` only: the Graphviz `dot` executable, as a command name or full path. Default: `dot` on `PATH`. |
 | `GA_OUTPUT_DIR` | no | Directory for run outputs. Default: `./runs` (relative to the working directory). Must be outside the target. |
 
 **Why `GA_TARGET_SOURCE_ROOTS` is required.** GeneralAnnotator does not run the
@@ -84,6 +100,65 @@ reduced to minimal prefixes. NullAway already covers sub-packages, so for exampl
 `org.greenrobot.eventbus.meta` is covered by `org.greenrobot.eventbus`. Sibling
 packages are never merged into a common parent. Files in the unnamed package
 cannot be covered and are reported as a coverage limitation.
+
+## Visualizing a warning graph
+
+`visualize` renders an existing `warning-graph.json` with Graphviz. It does
+**not** rerun the checker and does not change the JSON. You can pass either
+a run directory or the JSON file itself:
+
+```sh
+./gradlew run --args="visualize runs/20261118T000930Z-nullaway"
+./gradlew run --args="visualize runs/20261118T000930Z-nullaway/warning-graph.json"
+open runs/20261118T000930Z-nullaway/warning-graph.svg     # macOS; or open it in any browser
+```
+
+Paths containing spaces need single quotes inside `--args`:
+`--args="visualize '/path/with spaces/runs/<run id>'"`. Relative paths are
+resolved against the GeneralAnnotator directory. After a completed `check`, the
+summary prints the exact `visualize` command for that run.
+
+Output is written **beside the graph JSON**, in the same run folder:
+
+```
+runs/<run id>/warning-graph.json   input (unchanged)
+runs/<run id>/warning-graph.dot    Graphviz source (always written)
+runs/<run id>/warning-graph.svg    rendered picture (only if Graphviz succeeded)
+```
+
+For a JSON file with another name, such as `foo.json`, the outputs are
+`foo.dot` and `foo.svg`.
+
+What the picture shows:
+- **One box per warning node, labeled with its ID** (`W0001`, ...), read
+  directly from the JSON; IDs are never regenerated. All nodes appear, including
+  isolated ones. Red fill means error severity, yellow warning, grey note.
+- **Hover tooltip** (SVG, in a browser): the ID, `path:line:column`, severity,
+  checker, and the full message.
+- **Edges:** only those present in the JSON are drawn; none are invented. All
+  current graphs have none.
+- **Layout:** graphs without edges use Graphviz's `osage` engine, run by the
+  `dot` executable through the graph's `layout` attribute. It packs the
+  disconnected nodes into a compact grid in ID order, reading left to right and
+  top to bottom. (Plain `dot` layout puts them all in one very wide row.) Graphs
+  with edges use the hierarchical `dot` layout.
+- **Empty graph:** a "No warnings" message.
+
+Rendering uses `dot` on `PATH`, or `GA_GRAPHVIZ_DOT` if it is set. That can be a
+command name or an executable's full path; a blank value or a path that isn't an
+executable file is rejected with exit 2. Each rendering has a 5-minute timeout.
+
+If Graphviz is missing or fails, `visualize` exits with **3**. The JSON and DOT
+files are kept and no partial SVG remains; a stale SVG from an earlier
+rendering is removed. The error message says how to install Graphviz or set
+`GA_GRAPHVIZ_DOT`, and prints the exact `dot` command for rendering by hand.
+
+| Exit | `visualize` meaning |
+|---|---|
+| 0 | SVG rendered |
+| 2 | Bad argument: the path doesn't exist, a run folder has no graph (failed runs have none), the JSON is invalid, or `GA_GRAPHVIZ_DOT` is invalid |
+| 3 | Graphviz missing, failed, or timed out (DOT and JSON kept) |
+| 4 | Internal error, such as failing to write the DOT file |
 
 ## How the local NullAway checkout is used
 
@@ -145,6 +220,7 @@ Each run creates `GA_OUTPUT_DIR/<UTC timestamp>-<checker>/`:
 ```
 warnings.txt                   the findings, one per line with graph IDs (start here)
 warning-graph.json             initial warning graph (only for a completed analysis)
+warning-graph.dot / .svg       written later by `visualize` (not by `check`)
 report.json                    machine-readable report (below)
 logs/<purpose>.stdout.txt      raw stdout of every external command
 logs/<purpose>.stderr.txt      raw stderr (purposes: isolation-git-*, nullaway-setup, javac)
@@ -222,7 +298,8 @@ graph file, so an incomplete analysis can never look like an empty graph.
   *occurrences within this run only*; nothing matches warnings across runs.
 - **Edges:** always empty for now. Edge kinds and other node kinds, such as
   annotation actions, are left to later tasks.
-- The graph is plain data, with no visualization library. Loading
+- The graph is plain data, with no visualization library; see "Visualizing a
+  warning graph". Loading
   (`WarningGraphJson.load`) validates the schema, unique IDs, edge endpoints,
   and that roots have distance 0.
 
@@ -295,6 +372,7 @@ src/main/java/generalannotator/
   checker/nullaway/  NullAway adapter: setup, invocation, classification
   graph/        warning-graph model, initial construction, JSON save/load
   report/       report.json, warnings.txt, JSON writer and strict JSON parser
+  visualization/  DOT export and Graphviz rendering (separate from the graph model)
 src/main/resources/generalannotator/checker/nullaway/processor-path.init.gradle
 src/test/java                     deterministic unit tests (./gradlew test)
 src/integrationTest/java          real-tool tests (./gradlew integrationTest)

@@ -195,6 +195,7 @@ public final class CheckCommand {
         out.println("  report:   " + reportFile);
         out.println("  exit:     " + exit.code() + " (" + exit + ")");
         if (graph.isPresent()) {
+            out.println("  visualize: ./gradlew run --args=\"visualize '" + graphFile.getParent() + "'\"");
             List<WarningNode> nodes = graph.get().warningNodes();
             out.println();
             out.println(nodes.isEmpty() ? "Warning graph: no findings, so no warning nodes."

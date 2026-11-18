@@ -166,6 +166,18 @@ interface or in one named class), labeled provisional, and noted here.
   The edge record (`source`, `target`, `kind`) exists so the edges collection
   is typed, but no edge kinds are defined.
 
+- **Visualization.** It lives in a separate `visualization` package; the
+  graph model has no visualization code or dependency. The command reads a
+  saved `warning-graph.json` (it never reruns the checker), writes DOT, and
+  renders SVG through the `CommandRunner` with Graphviz `dot` (overridable
+  with `GA_GRAPHVIZ_DOT`). Edge-free graphs use the `osage` layout through the
+  `layout` graph attribute, because `dot`'s own layout lines disconnected
+  nodes up in one row, and with Graphviz 12.1 its packing ignored `sortv` and
+  swapped the first and last component. Escaping was verified against
+  Graphviz 12.1: a backslash becomes `\\` in labels and `\\\\` in
+  tooltips, because tooltips are expanded twice; `&` becomes `&amp;`. The
+  real-Graphviz integration test guards against version changes.
+
 ### Engineering decisions (open, to be settled by the task that needs them)
 
 - Warning-graph expansion: which node kinds (for example annotation actions,
@@ -189,6 +201,7 @@ interface or in one named class), labeled provisional, and noted here.
 | Build skeleton (Gradle Wrapper, JUnit) | Implemented |
 | 1. Check (NullAway) | Implemented: `check` command on configured source roots of one target, verified on fixtures and on EventBus core (`EventBus/src`) |
 | Initial warning graph | Implemented: root warning nodes (distance 0), no edges, `warning-graph.json` save/load. No expansion. |
+| Graph visualization | Implemented: `visualize` command (Graphviz DOT/SVG, hover tooltips). |
 | 2. Slice (Specimin) | Not implemented |
 | 3. Extract context | Not implemented |
 | 4. Propose (manual / LLM) | Not implemented |

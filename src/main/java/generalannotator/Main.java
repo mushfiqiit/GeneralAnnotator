@@ -2,6 +2,7 @@ package generalannotator;
 
 import generalannotator.cli.CheckCommand;
 import generalannotator.cli.ExitCode;
+import generalannotator.cli.VisualizeCommand;
 import generalannotator.exec.ProcessCommandRunner;
 import java.io.PrintStream;
 import java.nio.file.Path;
@@ -19,9 +20,14 @@ public final class Main {
                       and write a report. Configuration is read from environment variables
                       (GA_CHECKER, GA_CHECKER_HOME, GA_TARGET_PROJECT, GA_TARGET_SOURCE_ROOTS, ...);
                       see README.md.
+              visualize <warning-graph.json | run directory>
+                      Render a saved warning graph with Graphviz (writes .dot and .svg
+                      beside the JSON; the checker is not run). GA_GRAPHVIZ_DOT overrides
+                      the dot executable (default: dot on PATH).
 
-            Exit codes: 0 analysis completed, 2 usage/configuration error,
-                        3 execution failure (incomplete analysis), 4 internal error.""";
+            Exit codes: 0 success (check: analysis completed), 2 usage/configuration error,
+                        3 execution failure (check: incomplete analysis; visualize: Graphviz
+                        missing or failed), 4 internal error.""";
 
     private Main() {}
 
@@ -34,6 +40,16 @@ public final class Main {
             try {
                 return new CheckCommand(env, Path.of("").toAbsolutePath(), Path.of(System.getProperty("java.home")),
                         new ProcessCommandRunner(), Clock.systemUTC(), out, err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length == 2 && args[0].equals("visualize")) {
+            try {
+                return new VisualizeCommand(args[1], env, Path.of("").toAbsolutePath(), new ProcessCommandRunner(),
+                        out, err).run();
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);

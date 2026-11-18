@@ -55,7 +55,8 @@ before reporting a code change as done. Run `integrationTest` when changing
 checker invocation, classification, isolation, or the CLI flow.
 
 Unit tests (`src/test`) must be deterministic and must not depend on
-machine-specific paths or a NullAway checkout. Tests that use real external
+machine-specific paths, a NullAway checkout, or Graphviz. `integrationTest`
+needs `GA_CHECKER_HOME` and Graphviz `dot` (on PATH or via `GA_GRAPHVIZ_DOT`). Tests that use real external
 tools belong in `src/integrationTest`. They must fail, never silently skip,
 when their prerequisites are missing.
 

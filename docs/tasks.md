@@ -108,6 +108,30 @@ failures), and a real EventBus run (42 nodes, W0001–W0042, 0 edges).
 Not done (later tasks): graph expansion, annotation-action nodes, edge kinds,
 cross-run matching, and visualization.
 
+## T4c — Graphviz visualization of the warning graph · `done`
+
+`visualize <warning-graph.json | run directory>` loads a saved graph with
+`WarningGraphJson`, without rerunning the checker. It writes
+`warning-graph.dot` beside the JSON and renders `warning-graph.svg` with
+Graphviz `dot`, run through the existing `CommandRunner`. `GA_GRAPHVIZ_DOT`
+overrides the executable. Nodes are labeled with their existing IDs, tooltips
+show location and message, no edges are invented, edge-free graphs use a
+compact osage grid in ID order, and an empty graph shows "No warnings".
+Missing or failing Graphviz exits 3 and keeps the JSON and DOT. Code:
+`visualization.DotExporter`, `visualization.GraphvizRenderer`, and
+`cli.VisualizeCommand`.
+
+Verified by: `DotExporterTest` (ID labels, tooltips, escaping, isolated
+nodes, no invented edges, empty graph, determinism), `GraphvizRendererTest`
+(success, missing executable, failing dot, no SVG output, timeout; the DOT is
+kept and stale SVGs removed), `VisualizeCommandTest` (run directory and JSON
+file input, override, missing Graphviz, empty graph, invalid inputs), and
+`GraphvizIntegrationTest` with real Graphviz 12.1.0. That test checks SVG
+tooltips decode to the exact text including backslashes and entities, the
+empty-graph message, compact ID-ordered packing of 42 nodes, and the
+end-to-end command. Also rendered the real EventBus graph (42 nodes, 7×6
+grid).
+
 ## T5 — Isolated repository states · `next`
 
 T4a provides one fresh copy per run. Still needed for the pipeline: multiple
