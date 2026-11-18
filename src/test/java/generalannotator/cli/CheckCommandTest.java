@@ -181,6 +181,13 @@ class CheckCommandTest {
         assertTrue(summary.contains("findings: 1 {error=1}"), summary);
         assertTrue(summary.contains("exit:     0"), summary);
         assertTrue(summary.contains("(1 warning node(s), 0 edge(s))"), summary);
+        // The fake finding points at "class A {}" (a class header), so its target is explicitly unresolved.
+        String targets = Files.readString(runDir.resolve("warning-targets.json"));
+        assertTrue(targets.contains("\"warningId\": \"W0001\""), targets);
+        assertTrue(targets.contains("\"status\": \"UNRESOLVED\""), targets);
+        assertTrue(targets.contains("not inside a method, constructor, or field"), targets);
+        assertTrue(summary.contains("targets:  " + runDir.resolve("warning-targets.json") + " (0 resolved, 1 unresolved)"),
+                summary);
         assertTrue(summary.contains("Warning IDs (all roots, distance 0):\n"
                 + "  W0001  core/src/org/ex/A.java:2:1: error: [NullAway] returning @Nullable expression"), summary);
     }
@@ -210,6 +217,7 @@ class CheckCommandTest {
         assertTrue(report.contains("\"kind\": \"COMPILATION_FAILED\""));
         assertTrue(report.contains("\"findingsComplete\": false"));
         assertTrue(Files.readString(onlyRunDir().resolve("warnings.txt")).contains("INCOMPLETE"));
+        assertFalse(Files.exists(onlyRunDir().resolve("warning-targets.json")), "no targets without a graph");
         assertFalse(Files.exists(onlyRunDir().resolve("warning-graph.json")),
                 "a failed analysis must not produce a (possibly empty) warning graph");
         assertTrue(report.contains("\"created\": false"), report);

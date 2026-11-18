@@ -132,6 +132,35 @@ empty-graph message, compact ID-ordered packing of 42 nodes, and the
 end-to-end command. Also rendered the real EventBus graph (42 nodes, 7×6
 grid).
 
+## T4d — Specimin target members per warning · `done`
+
+For every warning node, find the enclosing method, constructor or field
+using the JDK syntax tree API on the run's snapshot. Produce Specimin's
+`--root` (the package root), `--targetFile`, and `--targetMethod` or
+`--targetField`. Write `warning-targets.json` (keyed by warning ID) from
+`check` and from the new `targets <run dir>` command. Unsupported or
+ambiguous locations are explicitly unresolved with a reason. Specimin is not
+run. Code: `targets.MemberLocator`, `SpeciminSignatures`, `ParsedSource`,
+`TargetExtractor`, `WarningTargetsJson`, and `cli.TargetsCommand`.
+
+Verified by: `TargetExtractorTest`. It covers methods, overloads,
+constructors including nested and varargs ones, field initializers, fields
+declared together (by caret position and by message), a message naming
+another field, nested classes, lambdas, anonymous and local classes, a
+secondary top-level class, missing columns, initializer blocks, enum
+constants, record components, compact constructors, annotation elements,
+class headers, positions outside classes, and missing, unparseable or
+misplaced files. Also `SpeciminCompatibilityTest`: every resolved fixture
+target is one of the member strings Specimin builds with JavaParser 3.28.2
+(test-only dependency), which caught the constructor-varargs rule. Then
+`WarningTargetsJsonTest`, `TargetsCommandTest`, `CheckCommandTest`, and the
+fixture integration test (`Greeter#lengthOf(String)`, `Greeter#name()`). Real
+EventBus run: 41 of 42 resolved; the one unresolved is in a static initializer
+block. All 41 match JavaParser/Specimin member strings for the same snapshot.
+
+Not done: running Specimin, and validating that a slice reproduces the
+warning (T10).
+
 ## T5 — Isolated repository states · `next`
 
 T4a provides one fresh copy per run. Still needed for the pipeline: multiple
@@ -179,6 +208,8 @@ Acceptance: round-trip tests, and an output schema documented in `docs/`.
 
 Add a `Slicer` interface and a Specimin implementation that produces a slice
 for a target warning, then confirms that the warning reproduces in the slice.
+Use the targets from `warning-targets.json` (T4d) as Specimin's `--root`,
+`--targetFile`, `--targetMethod` and `--targetField`.
 
 ## T11 — Symbol usage extraction · `todo`
 

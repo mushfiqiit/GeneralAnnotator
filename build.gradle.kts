@@ -19,6 +19,8 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:6.1.3"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    // Test-only: cross-checks target signatures against JavaParser as used by Specimin (same version).
+    testImplementation("com.github.javaparser:javaparser-core:3.28.2")
 }
 
 application {

@@ -1,0 +1,353 @@
+package generalannotator.targets;
+
+import com.sun.source.tree.BlockTree;
+import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.LambdaExpressionTree;
+import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.NewClassTree;
+import com.sun.source.tree.Tree;
+import com.sun.source.tree.VariableTree;
+import com.sun.source.util.TreePath;
+import com.sun.source.util.TreePathScanner;
+import generalannotator.targets.SpeciminSignatures.UnsupportedTypeException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.lang.model.element.Modifier;
+
+/**
+ * Finds the Specimin-targetable member that encloses a source position, using the syntax tree.
+ *
+ * <p>The targetable member is the method, constructor or field declared directly in a <em>named</em>
+ * class: a top-level class or a member class nested only in named classes. Code inside lambdas,
+ * anonymous classes and local classes belongs to the nearest enclosing targetable member (Specimin
+ * cannot target members of anonymous or local classes), and this is recorded in the notes.
+ *
+ * <p>Explicitly unresolved: positions outside any member (class header, imports), initializer
+ * blocks, enum constants, record components, compact record constructors, annotation type elements,
+ * unsupported parameter type syntax, and fields that cannot be told apart.
+ */
+public final class MemberLocator {
+
+    private static final Pattern MESSAGE_FIELD = Pattern.compile("field '([^']+)'");
+
+    private MemberLocator() {}
+
+    /** Result of locating a member. */
+    public sealed interface Location {
+        List<String> notes();
+    }
+
+    /**
+     * @param kind member kind
+     * @param enclosingClass Specimin-style qualified class name
+     * @param target the Specimin target string
+     * @param topLevelClass simple name of the outermost class (for root validation)
+     */
+    public record Found(MemberKind kind, String enclosingClass, String target, String topLevelClass,
+            List<String> notes) implements Location {}
+
+    public record NotFound(String reason, List<String> notes) implements Location {}
+
+    /**
+     * Locates the member at a 1-based line and optional column.
+     *
+     * <p>Without a column, the first and last non-blank characters of the line are both located; the
+     * line resolves only if both give the same target.
+     *
+     * @param message the warning message, used only to disambiguate fields
+     */
+    public static Location locate(ParsedSource source, int line, Optional<Integer> column, String message) {
+        if (column.isPresent()) {
+            long offset = source.offset(line, column.get());
+            if (offset < 0) {
+                return new NotFound("line " + line + ", column " + column.get() + " is outside the file", List.of());
+            }
+            return locateOffset(source, offset, message);
+        }
+        long start = source.lineStart(line);
+        if (start < 0) {
+            return new NotFound("line " + line + " is outside the file", List.of());
+        }
+        long end = source.lineEnd(start);
+        long first = start;
+        while (first < end && Character.isWhitespace(source.text().charAt((int) first))) {
+            first++;
+        }
+        long last = end - 1;
+        while (last > first && Character.isWhitespace(source.text().charAt((int) last))) {
+            last--;
+        }
+        if (first >= end) {
+            return new NotFound("line " + line + " is blank and the diagnostic has no column", List.of());
+        }
+        Location a = locateOffset(source, first, message);
+        Location b = locateOffset(source, last, message);
+        if (a instanceof Found fa && b instanceof Found fb && !fa.target().equals(fb.target())) {
+            return new NotFound("the diagnostic has no column and line " + line + " contains more than one member ("
+                    + fa.target() + ", " + fb.target() + ")", List.of());
+        }
+        if (a instanceof Found && b instanceof NotFound nb) {
+            return new NotFound("the diagnostic has no column and line " + line
+                    + " is only partly inside a member: " + nb.reason(), List.of());
+        }
+        return a;
+    }
+
+    static Location locateOffset(ParsedSource source, long offset, String message) {
+        List<Tree> chain = pathTo(source, offset);
+        CompilationUnitTree unit = source.unit();
+
+        // Walk from the compilation unit down, tracking which classes are "named" (targetable).
+        Set<Tree> namedClasses = Collections.newSetFromMap(new IdentityHashMap<>());
+        List<String> classNames = new ArrayList<>();
+        List<String> namesAtMember = null;
+        int memberIndex = -1;
+        boolean sawNamedClass = false;
+        for (int i = 1; i < chain.size(); i++) {
+            Tree node = chain.get(i);
+            Tree parent = chain.get(i - 1);
+            if (node instanceof ClassTree ct && (parent instanceof CompilationUnitTree || namedClasses.contains(parent))) {
+                namedClasses.add(ct);
+                classNames.add(ct.getSimpleName().toString());
+                sawNamedClass = true;
+                continue;
+            }
+            if (namedClasses.contains(parent) && (node instanceof MethodTree || node instanceof VariableTree
+                    || node instanceof BlockTree)) {
+                memberIndex = i;
+                namesAtMember = List.copyOf(classNames);
+            }
+        }
+
+        List<String> notes = notesBelow(chain, Math.max(memberIndex, 0), namedClasses);
+        if (memberIndex < 0) {
+            return new NotFound(sawNamedClass
+                    ? "the position is inside a class declaration but not inside a method, constructor, or field "
+                            + "(for example the class header or a class annotation)"
+                    : "the position is outside any class declaration (for example package or import statements)",
+                    notes);
+        }
+
+        Tree member = chain.get(memberIndex);
+        ClassTree owner = (ClassTree) chain.get(memberIndex - 1);
+        String qualifiedClass = qualified(unit, namesAtMember);
+        String topLevel = namesAtMember.getFirst();
+
+        if (member instanceof BlockTree) {
+            return new NotFound("the position is inside an initializer block of " + qualifiedClass
+                    + "; Specimin cannot target initializer blocks", notes);
+        }
+        if (member instanceof MethodTree method) {
+            return method(source, method, owner, qualifiedClass, topLevel, notes);
+        }
+        return field(source, (VariableTree) member, owner, qualifiedClass, topLevel, offset, message, notes);
+    }
+
+    private static Location method(ParsedSource source, MethodTree method, ClassTree owner, String qualifiedClass,
+            String topLevel, List<String> notes) {
+        if (owner.getKind() == Tree.Kind.ANNOTATION_TYPE) {
+            return new NotFound("the position is in annotation type element " + qualifiedClass + "#"
+                    + method.getName() + "; Specimin cannot target annotation type elements", notes);
+        }
+        boolean constructor = method.getName().contentEquals("<init>");
+        if (constructor && owner.getKind() == Tree.Kind.RECORD && method.getParameters().stream()
+                .anyMatch(p -> source.positions().getEndPosition(source.unit(), p) < 0)) {
+            return new NotFound("the position is in the compact canonical constructor of record " + qualifiedClass
+                    + "; Specimin does not match compact constructors", notes);
+        }
+        List<String> types = new ArrayList<>();
+        List<String> memberNotes = new ArrayList<>(notes);
+        List<? extends VariableTree> params = method.getParameters();
+        for (int i = 0; i < params.size(); i++) {
+            VariableTree p = params.get(i);
+            boolean varargs = i == params.size() - 1 && isVarargs(source, p);
+            try {
+                if (varargs && constructor) {
+                    // JavaParser 3.28.2 (used by Specimin) omits "..." in constructor declaration strings.
+                    types.add(SpeciminSignatures.varargsElementType(p.getType()));
+                    memberNotes.add("varargs constructor parameter written without '...', as Specimin matches "
+                            + "constructors");
+                } else {
+                    types.add(SpeciminSignatures.parameterType(p.getType(), varargs));
+                }
+            } catch (UnsupportedTypeException e) {
+                return new NotFound("cannot render parameter " + p.getName() + " of " + qualifiedClass + "#"
+                        + method.getName() + ": " + e.getMessage(), notes);
+            }
+        }
+        String name = constructor ? owner.getSimpleName().toString() : method.getName().toString();
+        return new Found(constructor ? MemberKind.CONSTRUCTOR : MemberKind.METHOD, qualifiedClass,
+                SpeciminSignatures.method(qualifiedClass, name, types), topLevel, List.copyOf(memberNotes));
+    }
+
+    private static boolean isVarargs(ParsedSource source, VariableTree param) {
+        long start = source.positions().getStartPosition(source.unit(), param.getType());
+        long end = source.positions().getEndPosition(source.unit(), param.getType());
+        if (start < 0 || end <= start) {
+            return false;
+        }
+        return source.text().substring((int) start, (int) end).strip().endsWith("...");
+    }
+
+    private static Location field(ParsedSource source, VariableTree located, ClassTree owner, String qualifiedClass,
+            String topLevel, long offset, String message, List<String> notes) {
+        CompilationUnitTree unit = source.unit();
+        if (owner.getKind() == Tree.Kind.ENUM && source.positions().getEndPosition(unit, located.getType()) < 0) {
+            return new NotFound("the position is in enum constant " + qualifiedClass + "." + located.getName()
+                    + "; Specimin cannot target enum constants", notes);
+        }
+        if (owner.getKind() == Tree.Kind.RECORD && !located.getModifiers().getFlags().contains(Modifier.STATIC)) {
+            return new NotFound("the position is in record component " + qualifiedClass + "." + located.getName()
+                    + "; Specimin cannot target record components", notes);
+        }
+
+        // Fields declared together ("int a, b;") share a start position, so their ranges overlap.
+        List<VariableTree> candidates = new ArrayList<>();
+        for (Tree member : owner.getMembers()) {
+            if (member instanceof VariableTree v && contains(source, v, offset)) {
+                candidates.add(v);
+            }
+        }
+        if (candidates.isEmpty()) {
+            candidates.add(located);
+        }
+        List<String> fieldNotes = new ArrayList<>(notes);
+        VariableTree chosen = null;
+        if (candidates.size() == 1) {
+            chosen = candidates.getFirst();
+        } else {
+            List<VariableTree> byName = candidates.stream().filter(v -> onName(source, v, offset)).toList();
+            if (byName.size() == 1) {
+                chosen = byName.getFirst();
+            } else {
+                Optional<String> named = messageFieldName(message);
+                List<VariableTree> byMessage = named.isEmpty() ? List.of()
+                        : candidates.stream().filter(v -> v.getName().contentEquals(named.get())).toList();
+                if (byMessage.size() == 1) {
+                    chosen = byMessage.getFirst();
+                    fieldNotes.add("field chosen by the name in the warning message among fields declared together");
+                } else {
+                    return new NotFound("the position is shared by fields declared together ("
+                            + String.join(", ", candidates.stream().map(v -> v.getName().toString()).toList())
+                            + ") and the warning message does not identify one", notes);
+                }
+            }
+        }
+        Optional<String> named = messageFieldName(message);
+        if (named.isPresent() && !chosen.getName().contentEquals(named.get())) {
+            return new NotFound("the position is in field " + chosen.getName() + " but the warning message names field "
+                    + named.get(), notes);
+        }
+        return new Found(MemberKind.FIELD, qualifiedClass,
+                SpeciminSignatures.field(qualifiedClass, chosen.getName().toString()), topLevel, fieldNotes);
+    }
+
+    /** The simple field name in a message like {@code @NonNull field 'Outer$Inner.f' not initialized}. */
+    static Optional<String> messageFieldName(String message) {
+        Matcher m = MESSAGE_FIELD.matcher(message);
+        if (!m.find()) {
+            return Optional.empty();
+        }
+        String name = m.group(1);
+        int cut = Math.max(name.lastIndexOf('.'), name.lastIndexOf('$'));
+        return Optional.of(name.substring(cut + 1));
+    }
+
+    private static boolean contains(ParsedSource source, Tree tree, long offset) {
+        long start = source.positions().getStartPosition(source.unit(), tree);
+        long end = source.positions().getEndPosition(source.unit(), tree);
+        return start >= 0 && end > start && offset >= start && offset < end;
+    }
+
+    /** Whether {@code offset} lies on the declared name of {@code variable}. */
+    private static boolean onName(ParsedSource source, VariableTree variable, long offset) {
+        long start = source.positions().getStartPosition(source.unit(), variable);
+        long end = variable.getInitializer() != null
+                ? source.positions().getStartPosition(source.unit(), variable.getInitializer())
+                : source.positions().getEndPosition(source.unit(), variable);
+        if (start < 0 || end <= start) {
+            return false;
+        }
+        String name = variable.getName().toString();
+        Matcher m = Pattern.compile("(?<![\\p{javaJavaIdentifierPart}])" + Pattern.quote(name)
+                + "(?![\\p{javaJavaIdentifierPart}])").matcher(source.text().substring((int) start, (int) end));
+        int last = -1;
+        while (m.find()) {
+            last = m.start();
+        }
+        if (last < 0) {
+            return false;
+        }
+        long nameStart = start + last;
+        return offset >= nameStart && offset < nameStart + name.length();
+    }
+
+    private static List<String> notesBelow(List<Tree> chain, int from, Set<Tree> namedClasses) {
+        Set<String> notes = new LinkedHashSet<>();
+        for (int i = from + 1; i < chain.size(); i++) {
+            Tree node = chain.get(i);
+            if (node instanceof LambdaExpressionTree) {
+                notes.add("inside a lambda expression; the enclosing member is targeted");
+            } else if (node instanceof ClassTree && !namedClasses.contains(node)) {
+                notes.add(chain.get(i - 1) instanceof NewClassTree
+                        ? "inside an anonymous class; the enclosing member is targeted"
+                        : "inside a local class; the enclosing member is targeted");
+            }
+        }
+        return List.copyOf(notes);
+    }
+
+    private static String qualified(CompilationUnitTree unit, List<String> classNames) {
+        String classes = String.join(".", classNames);
+        return unit.getPackageName() == null ? classes : unit.getPackageName() + "." + classes;
+    }
+
+    /** Trees from the compilation unit down to the innermost tree containing {@code offset}. */
+    private static List<Tree> pathTo(ParsedSource source, long offset) {
+        CompilationUnitTree unit = source.unit();
+        TreePath[] best = {new TreePath(unit)};
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void scan(Tree tree, Void unused) {
+                if (tree == null) {
+                    return null;
+                }
+                long start = source.positions().getStartPosition(unit, tree);
+                long end = source.positions().getEndPosition(unit, tree);
+                boolean known = start >= 0 && end > start;
+                if (known && (offset < start || offset >= end)) {
+                    return null;
+                }
+                if (known && best[0].getLeaf() != tree) {
+                    TreePath here = new TreePath(getCurrentPath(), tree);
+                    if (depth(here) >= depth(best[0])) {
+                        best[0] = here;
+                    }
+                }
+                return super.scan(tree, unused);
+            }
+        }.scan(new TreePath(unit), null);
+        List<Tree> chain = new ArrayList<>();
+        for (Tree t : best[0]) {
+            chain.add(t);
+        }
+        Collections.reverse(chain);
+        return chain;
+    }
+
+    private static int depth(TreePath path) {
+        int depth = 0;
+        for (TreePath p = path; p != null; p = p.getParentPath()) {
+            depth++;
+        }
+        return depth;
+    }
+}

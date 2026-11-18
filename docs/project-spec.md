@@ -178,6 +178,21 @@ interface or in one named class), labeled provisional, and noted here.
   tooltips, because tooltips are expanded twice; `&` becomes `&amp;`. The
   real-Graphviz integration test guards against version changes.
 
+- **Specimin targets.** Members are located with the JDK's syntax tree
+  API (`com.sun.source`, parse only, no new runtime dependency) on the run's
+  isolated snapshot. The caret position decides; messages only tell apart
+  fields declared together, and a conflict is unresolved. Format and rules
+  follow Specimin's source (mushfiqiit/specimin `b1e5d43`): nested classes
+  joined with `.`, constructors as `Class#SimpleName(...)`, parameter types as
+  written without annotations, method varargs `T...` but constructor varargs
+  without `...` (as JavaParser 3.28.2 prints them). Lambdas, anonymous and
+  local classes map to the enclosing member of a named class. Initializer
+  blocks, enum constants, record components, compact constructors and
+  annotation elements are unresolved. Specimin's `--root` is derived from the
+  `package` declaration. A test cross-checks signatures against JavaParser
+  3.28.2 (test-only dependency). A target does *not* establish that a slice
+  reproduces the warning.
+
 ### Engineering decisions (open, to be settled by the task that needs them)
 
 - Warning-graph expansion: which node kinds (for example annotation actions,
@@ -192,7 +207,10 @@ interface or in one named class), labeled provisional, and noted here.
   existing annotations).
 - File format for manual proposals and which serialization library to use for
   reading them.
-- How Specimin is invoked and pinned (version, JDK requirements).
+- How Specimin is invoked and pinned (version, JDK requirements, jar paths for
+  dependencies), and what to do with warnings whose target is unresolved
+  (for example initializer blocks). This might mean targeting all fields
+  assigned in the block, but that would be a guess and is not done.
 
 ## 7. Current status
 
@@ -202,6 +220,7 @@ interface or in one named class), labeled provisional, and noted here.
 | 1. Check (NullAway) | Implemented: `check` command on configured source roots of one target, verified on fixtures and on EventBus core (`EventBus/src`) |
 | Initial warning graph | Implemented: root warning nodes (distance 0), no edges, `warning-graph.json` save/load. No expansion. |
 | Graph visualization | Implemented: `visualize` command (Graphviz DOT/SVG, hover tooltips). |
+| 2. Slice: target identification | Implemented: Specimin target member per warning (`warning-targets.json`, `targets` command). Specimin is not run; reproduction is not validated. |
 | 2. Slice (Specimin) | Not implemented |
 | 3. Extract context | Not implemented |
 | 4. Propose (manual / LLM) | Not implemented |

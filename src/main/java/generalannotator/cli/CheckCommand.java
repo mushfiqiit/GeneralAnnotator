@@ -22,6 +22,9 @@ import generalannotator.graph.WarningGraph;
 import generalannotator.graph.WarningGraphJson;
 import generalannotator.graph.WarningNode;
 import generalannotator.report.RunReport;
+import generalannotator.targets.TargetExtractor;
+import generalannotator.targets.WarningTarget;
+import generalannotator.targets.WarningTargetsJson;
 import generalannotator.report.WarningsText;
 import java.util.Optional;
 import java.io.IOException;
@@ -124,14 +127,19 @@ public final class CheckCommand {
         Path reportFile = runDir.resolve("report.json");
         Path warningsFile = runDir.resolve(WarningsText.FILE_NAME);
         Path graphFile = runDir.resolve(WarningGraphJson.FILE_NAME);
+        Path targetsFile = runDir.resolve(WarningTargetsJson.FILE_NAME);
         Path copyRoot = copy == null ? null : copy.root();
         // The warning graph exists only for a completed analysis; a failure never yields an empty graph.
         Optional<WarningGraph> graph = outcome instanceof CompletedAnalysis completed
                 ? Optional.of(InitialWarningGraph.build(runId, config.checkerId(), completed, copyRoot))
                 : Optional.empty();
+        Optional<List<WarningTarget>> targets = Optional.empty();
         try {
             if (graph.isPresent()) {
                 WarningGraphJson.save(graph.get(), graphFile);
+                targets = Optional.of(new TargetExtractor(copyRoot, config.sourceRoots(), config.javacRelease())
+                        .extract(graph.get()));
+                WarningTargetsJson.save(targetsFile, runId, copyRoot, targets.get());
             }
             Map<String, Object> report = RunReport.build(new RunReport.Inputs(runId, runDir, started,
                     clock.instant(), config, copy, isolationCommands, checkerRun, outcome, exit.code(),
@@ -143,12 +151,14 @@ public final class CheckCommand {
             err.println("GeneralAnnotator: failed to write the run output in " + runDir + ": " + e);
             return ExitCode.INTERNAL_ERROR;
         }
-        printSummary(config, copy, checkerRun, outcome, reportFile, warningsFile, graphFile, graph, exit);
+        printSummary(config, copy, checkerRun, outcome, reportFile, warningsFile, graphFile, graph, exit,
+                targetsFile, targets);
         return exit;
     }
 
     private void printSummary(AnalysisConfig config, WorkingCopy copy, CheckerRun run, CheckerOutcome outcome,
-            Path reportFile, Path warningsFile, Path graphFile, Optional<WarningGraph> graph, ExitCode exit) {
+            Path reportFile, Path warningsFile, Path graphFile, Optional<WarningGraph> graph, ExitCode exit,
+            Path targetsFile, Optional<List<WarningTarget>> targets) {
         out.println("GeneralAnnotator check");
         String checkerInfo = config.checkerId();
         if (run != null && run.details().get("nullawayVersion") != null) {
@@ -191,11 +201,13 @@ public final class CheckCommand {
         } else {
             out.println("  graph:    not created (the analysis did not complete)");
         }
+        targets.ifPresent(t -> out.println("  targets:  " + targetsFile + " (" + TargetsCommand.summary(t) + ")"));
         out.println("  warnings: " + warningsFile);
         out.println("  report:   " + reportFile);
         out.println("  exit:     " + exit.code() + " (" + exit + ")");
         if (graph.isPresent()) {
             out.println("  visualize: ./gradlew run --args=\"visualize '" + graphFile.getParent() + "'\"");
+            out.println("  list targets: ./gradlew run --args=\"targets '" + graphFile.getParent() + "'\"");
             List<WarningNode> nodes = graph.get().warningNodes();
             out.println();
             out.println(nodes.isEmpty() ? "Warning graph: no findings, so no warning nodes."

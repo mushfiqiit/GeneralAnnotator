@@ -8,7 +8,9 @@ and re-checked in isolated repository states.
 command copies a target project into an isolated working copy, runs NullAway
 from a local checkout on it, and writes a report. After a completed analysis it
 also writes the **initial warning graph**: one root node per finding, no edges.
-The `visualize` command renders a saved warning graph with Graphviz. No other
+For each warning it also identifies the **Specimin target member** (the
+enclosing method, constructor or field), but it does not run Specimin. The
+`visualize` command renders a saved warning graph with Graphviz. No other
 pipeline stage (slicing, context extraction, proposals, editing, graph
 expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
@@ -160,6 +162,78 @@ rendering is removed. The error message says how to install Graphviz or set
 | 3 | Graphviz missing, failed, or timed out (DOT and JSON kept) |
 | 4 | Internal error, such as failing to write the DOT file |
 
+## Specimin target members (`warning-targets.json`)
+
+After a completed analysis, `check` determines, for every warning node, the
+member Specimin should preserve. It writes `warning-targets.json` beside
+`warning-graph.json`. **Specimin is not run**, and a target only names the
+enclosing member: whether a slice of it still reproduces the warning is
+validated by a later task.
+
+To compute or refresh the mapping for an existing run without rerunning the
+checker:
+
+```sh
+./gradlew run --args="targets runs/<run id>"
+```
+
+`targets` reads `warning-graph.json`, takes the configured source roots (and
+`--release`) from `report.json`, and resolves positions against the run's own
+snapshot in `workspace/target`. It rewrites `warning-targets.json` and prints
+one line per warning ID. It exits 0 when the file is written, even if some
+warnings are unresolved; 2 when the run directory, graph, report or snapshot is
+missing or invalid; and 4 on an internal error.
+
+How a target is found:
+- The file is the warning's `targetPath` inside the run's isolated copy. It is
+  parsed with the JDK's own Java syntax tree API (`com.sun.source`), and the
+  warning's line and column, the javac caret, select the innermost syntax
+  node. Warning messages are only used to tell apart fields declared together
+  (see below).
+- The target is the method, constructor or field declared directly in a
+  *named* class: a top-level class or a member class. Code in **lambdas**,
+  **anonymous classes** and **local classes** maps to the enclosing member of
+  the named class, and a note says so.
+- Several fields declared together (`int a, b;`) are distinguished by which
+  name the caret is on, then by the field named in the message (for example
+  `@NonNull field 'Outer$Inner.b' not initialized`). If the position points at
+  one field but the message names another, the target is unresolved.
+- Without a column, the line resolves only if its first and last non-blank
+  characters belong to the same member.
+
+Format, following Specimin's own matching code (mushfiqiit/specimin `b1e5d43`,
+`TargetMemberFinderVisitor` and `JavaParserUtil`):
+
+| Field | Meaning (Specimin option) |
+|---|---|
+| `sourceRoot` | Java package root relative to the target (`--root`), derived from the `package` declaration; the file's directory must match it |
+| `isolatedSourceRoot` | The same root as an absolute path in the run's snapshot |
+| `targetFile` | File relative to `sourceRoot` (`--targetFile`), e.g. `org/greenrobot/eventbus/EventBus.java` |
+| `memberKind` | `METHOD`, `CONSTRUCTOR` or `FIELD` |
+| `targetMethod` | `pkg.Outer.Inner#name(T1, T2)` (`--targetMethod`), for methods and constructors |
+| `targetField` | `pkg.Outer.Inner#field` (`--targetField`) |
+| `requiresDisableRootValidation` | The member's top-level class is not the file's primary class, so Specimin needs `--disable-root-validation` |
+| `status`, `reason`, `notes` | `RESOLVED` or `UNRESOLVED`, the reason when unresolved, and context notes (lambda, anonymous or local class) |
+
+Signature rules:
+- Nested classes are joined with `.`, not `$`.
+- Constructors use the class's simple name: `a.Outer.Inner#Inner(int)`.
+- Parameter types are written as in the source: simple names stay simple,
+  generics are kept, arrays are `T[]` (also for `T x[]`), and annotations,
+  parameter names, return types, modifiers and type parameters are dropped.
+- Method varargs are written `T...`. Constructor varargs are written as the
+  element type alone, without `...`, because that is how JavaParser 3.28.2
+  (used by Specimin) prints constructors.
+- Specimin ignores whitespace, so the `, ` separators don't matter.
+
+Unresolved by design, each with a reason:
+- the position is in a class header, an annotation, or outside any class;
+- the position is in an initializer block, an enum constant, a record
+  component, a compact record constructor, or an annotation type element;
+- fields declared together can't be told apart;
+- the file is missing, doesn't parse, or its directory doesn't match its
+  package.
+
 ## How the local NullAway checkout is used
 
 1. **Setup.** GeneralAnnotator writes `generated/nullaway-processor-path.init.gradle`
@@ -220,6 +294,7 @@ Each run creates `GA_OUTPUT_DIR/<UTC timestamp>-<checker>/`:
 ```
 warnings.txt                   the findings, one per line with graph IDs (start here)
 warning-graph.json             initial warning graph (only for a completed analysis)
+warning-targets.json           Specimin target member per warning ID (only with a graph)
 warning-graph.dot / .svg       written later by `visualize` (not by `check`)
 report.json                    machine-readable report (below)
 logs/<purpose>.stdout.txt      raw stdout of every external command
@@ -373,6 +448,7 @@ src/main/java/generalannotator/
   graph/        warning-graph model, initial construction, JSON save/load
   report/       report.json, warnings.txt, JSON writer and strict JSON parser
   visualization/  DOT export and Graphviz rendering (separate from the graph model)
+  targets/      Specimin target-member extraction (JDK syntax trees; Specimin is not run)
 src/main/resources/generalannotator/checker/nullaway/processor-path.init.gradle
 src/test/java                     deterministic unit tests (./gradlew test)
 src/integrationTest/java          real-tool tests (./gradlew integrationTest)

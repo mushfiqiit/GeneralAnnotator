@@ -56,5 +56,10 @@ class CheckCommandIntegrationTest {
         assertTrue(report.contains("\"targetPath\": \"src/main/java/com/example/fixture/Greeter.java\""), report);
         assertTrue(report.contains("\"checkerActive\": true"));
         assertTrue(report.contains("\"mechanism\": \"git\""));
+        String targets = Files.readString(runDir.resolve("warning-targets.json"));
+        assertTrue(targets.contains("\"targetMethod\": \"com.example.fixture.Greeter#lengthOf(String)\""), targets);
+        assertTrue(targets.contains("\"targetMethod\": \"com.example.fixture.Greeter#name()\""), targets);
+        assertTrue(targets.contains("\"sourceRoot\": \"src/main/java\""), targets);
+        assertTrue(targets.contains("\"targetFile\": \"com/example/fixture/Greeter.java\""), targets);
     }
 }

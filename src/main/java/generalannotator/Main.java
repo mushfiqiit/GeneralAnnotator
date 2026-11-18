@@ -2,6 +2,7 @@ package generalannotator;
 
 import generalannotator.cli.CheckCommand;
 import generalannotator.cli.ExitCode;
+import generalannotator.cli.TargetsCommand;
 import generalannotator.cli.VisualizeCommand;
 import generalannotator.exec.ProcessCommandRunner;
 import java.io.PrintStream;
@@ -24,6 +25,10 @@ public final class Main {
                       Render a saved warning graph with Graphviz (writes .dot and .svg
                       beside the JSON; the checker is not run). GA_GRAPHVIZ_DOT overrides
                       the dot executable (default: dot on PATH).
+              targets <run directory>
+                      Determine the Specimin target member (targetFile, targetMethod or
+                      targetField) of every warning of a completed run and write
+                      warning-targets.json. Neither the checker nor Specimin is run.
 
             Exit codes: 0 success (check: analysis completed), 2 usage/configuration error,
                         3 execution failure (check: incomplete analysis; visualize: Graphviz
@@ -50,6 +55,15 @@ public final class Main {
             try {
                 return new VisualizeCommand(args[1], env, Path.of("").toAbsolutePath(), new ProcessCommandRunner(),
                         out, err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length == 2 && args[0].equals("targets")) {
+            try {
+                return new TargetsCommand(args[1], Path.of("").toAbsolutePath(), out, err).run();
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);
