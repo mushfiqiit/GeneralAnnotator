@@ -66,7 +66,19 @@ class MainTest {
                 "prepare-inference", "no-such-run"));
         assertTrue(err.toString(StandardCharsets.UTF_8).contains("GA_INFERENCE_PROMPTS_PER_TASK='11'"));
         assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
-        assertTrue(out.toString(StandardCharsets.UTF_8).contains("prepare-inference <run directory> [--warning <ID>]"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains(
+                "prepare-inference <run directory> [--warning <ID>[,<ID>...]]"));
+    }
+
+    @Test
+    void inferenceCommandIsDispatchedAndValidatesItsArguments() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "inference"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "inference", "status"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of("GA_REMOTE_BASE", "relative"), "inference",
+                "status", "x"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("GA_REMOTE_BASE='relative'"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("inference upload|submit|status|collect|retry|run"));
     }
 
     @Test

@@ -18,9 +18,12 @@ renders a saved warning graph with Graphviz. The `prompts` command assembles
 **one LLM prompt unit per warning** (instructions, the warning, its slice, its
 compact usage context) without calling an LLM. `prepare-inference` turns the
 generated prompts into an immutable **Slurm submission** for NJIT Wulver, with a
-GPU worker that serves the model with vLLM and validates its answers. Uploading,
-submitting and downloading are not implemented yet, and no GPU job has been run.
-No other pipeline stage (slice validation, applying proposals, editing, graph
+GPU worker that serves the model with vLLM and validates its answers. The
+`inference` commands upload it over one shared SSH connection (a single
+password-and-Duo login), submit one Slurm array job, monitor it and collect the
+results. They are tested with fakes only: no job has been submitted to Wulver
+yet, and the GPU smoke test is still to do. Inference results are proposals;
+they are not applied or checker-validated. No other pipeline stage (slice validation, applying proposals, editing, graph
 expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
 
@@ -586,13 +589,14 @@ is `SKIPPED` because its target is an initializer block.
 ```sh
 ./gradlew run --args="prepare-inference runs/<run id>"                   # all GENERATED prompts
 ./gradlew run --args="prepare-inference runs/<run id> --warning W0001"   # one prompt
+./gradlew run --args="prepare-inference runs/<run id> --warning W0001,W0002"   # only these prompts
 GA_INFERENCE_PROMPTS_PER_TASK=10 ./gradlew run --args="prepare-inference runs/<run id>"
 ```
 
 This is the first half of the inference stage. It prepares an **immutable
 submission directory** and the GPU worker that will run inside Slurm. It does
-not upload anything, submit a job, download results or load a model; those
-steps aren't implemented yet. Run `prompts` first.
+not upload anything, submit a job, download results or load a model; the
+`inference` commands (next section) do the remote part. Run `prompts` first.
 
 `prepare-inference` reads `prompts/manifest.json` and takes only `GENERATED`
 entries. On EventBus that is 41 of 42 (W0033 is listed under `excluded`).
@@ -672,7 +676,7 @@ results/<ID>/attempt-NNN/answer.json         the validated answer
 results/<ID>/attempt-NNN/metadata.json       this attempt's metadata
 results/<ID>/result.json                     the decisive attempt (written last, atomically)
 results/tasks/task-NNNN.json                 per task: node, GPUs, server port/startup/version, statuses
-results/logs/task-NNNN/vllm-attempt-K.log    the server log
+results/logs/task-NNNN/job-<SLURM_JOB_ID>/vllm-attempt-K.log    the server log of each Slurm job
 ```
 
 Metadata records:
@@ -743,13 +747,198 @@ Values used in the batch script are limited to safe characters. Not yet
 verified on a GPU: the model, served name, 32768 context, `qwen3` parser,
 sampling defaults, memory threshold and time limit all come from the
 historical Specimin scripts and the Qwen3 model card. A GPU smoke test is still
-needed (see docs/tasks.md, T13c).
+needed (see docs/tasks.md, T13d).
 
 | Exit | `prepare-inference` meaning |
 |---|---|
 | 0 | Submission prepared |
 | 2 | Invalid argument or setting, invalid or inconsistent manifest or prompt file, or an existing submission directory; nothing written |
 | 4 | Internal error |
+
+## Running inference on Wulver (`inference`)
+
+The second half of the inference stage takes a prepared submission
+(`runs/<run id>/inference/<submission id>`) to the cluster and back:
+
+```sh
+./gradlew installDist                       # once: builds the launcher
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)   # macOS; the launcher needs JDK 21
+GA=build/install/GeneralAnnotator/bin/GeneralAnnotator
+SUB=runs/<run id>/inference/<submission id>
+
+$GA inference connect              # reuse the SSH master, or open it with one login (password + Duo)
+$GA inference run     $SUB         # upload, submit once, monitor and collect until every task ends
+$GA inference upload  $SUB         # the steps of run, one at a time
+$GA inference submit  $SUB
+$GA inference status  $SUB
+$GA inference collect $SUB
+$GA inference retry   $SUB         # failed or missing prompts as new attempts
+$GA inference attach  $SUB <job id> | --not-submitted
+```
+
+Use the installed launcher for `connect` and `run`. The login has to happen in
+your terminal, and a process started by `./gradlew run` has none: there
+`connect` prints the exact `ssh` command to run yourself instead. The other
+operations also work through `./gradlew run --args="inference status $SUB"` once
+the connection is open.
+
+**One login, one shared connection.** `inference connect` asks a running OpenSSH
+master whether it is alive (`ssh -O check`). If it isn't, it runs this in your
+terminal, where ssh asks for the password and Duo itself; GeneralAnnotator
+never sees or stores them:
+
+```
+ssh -M -N -f -o ControlPath=~/.ga-ssh/%C -o ControlPersist=4h -o ConnectTimeout=30 mc2399@wulver.njit.edu
+```
+
+The socket directory (`GA_SSH_CONTROL_DIR`, default `~/.ga-ssh`) is created
+with mode 0700. An existing one must be private and yours, or it is refused.
+Every later ssh and rsync call uses the same socket with `ControlMaster=no
+-o BatchMode=yes`: it can only reuse the master, and it fails instead of
+prompting. Host keys are checked as your SSH configuration says, which is never
+edited. If the master is gone, a command stops with exit 5 and asks you to
+reconnect; all progress is kept. To reuse a connection you own instead, set
+`GA_SSH_CONTROL_PATH=config` (the `ControlPath` of your SSH config, for
+example for a host alias in `GA_SSH_TARGET`) or a socket path. In those modes
+GeneralAnnotator never creates or closes the master. `connect` prints how to
+close a managed master early (`ssh -O exit ...`); otherwise it ends after
+`GA_SSH_CONTROL_PERSIST` idle.
+
+**Upload.** Each submission goes to its own directory:
+`<GA_REMOTE_BASE>/<GA_REMOTE_SUBDIR>/<run id>/<submission id>`, by default
+`/project/mjk76/mc2399/generalannotator/inference/...`.
+1. The local inputs are checked against `submission.json` first.
+2. An existing remote directory is used only if it holds the same
+   `submission.json` (same SHA-256) or is one this submission began
+   uploading. Otherwise the upload is refused.
+3. It creates the directory and `logs/` (Slurm writes there).
+4. rsync copies only `submission.json` (first, so a partial directory is
+   recognizable), `settings.json`, the batch script, the worker and the listed
+   prompts, read-only. It never uses `--delete`, and no remote command removes
+   anything.
+5. `sha256sum` on the cluster must match every recorded hash. Only then is the
+   upload VERIFIED.
+
+Prompt files are only copied, never executed. Remote paths and values put in
+remote commands are validated (safe characters) and quoted.
+
+**Submission.** `submit` re-verifies the remote hashes, then calls `sbatch
+--parsable --array=<tasks>%<concurrency> --comment=GeneralAnnotator:<submission>:<label>
+run_inference.sbatch` once from the remote directory. Tasks and concurrency come
+from the prepared submission: one prompt per task by default, at most 10, and
+`GA_INFERENCE_ARRAY_CONCURRENCY` as the throttle. The intent (label `job-001`,
+array) is saved in `remote/state.json` before the call, and the job ID right
+after. Duplicates are prevented three ways:
+- ordinary reruns see the saved job and don't submit;
+- concurrent invocations are refused by an exclusive lock on `remote/lock`;
+- on the cluster, the sbatch call first creates `.ga-sbatch/<label>/` with
+  `mkdir`, which fails if that label was used before, and records sbatch's
+  output and exit code there.
+
+If the connection drops or the output is unreadable during submission, the
+call is **UNKNOWN** and is never retried automatically. `submit`, `run` and
+`retry` refuse until it is resolved, and they show the remote record and any
+jobs in the submission's directory. `attach <job id>` accepts a job only if
+sacct/squeue report its name and working directory as this submission's and its
+array tasks as the requested ones. `attach --not-submitted` is accepted only if
+the remote marker shows sbatch was never reached, or that it failed with no job
+in that directory. A rejected sbatch call (bad account, limits) is recorded as
+REJECTED, and nothing was submitted.
+
+**Status.** `status` lists the sbatch calls and the state of every array task
+of the latest job that includes it. squeue covers active tasks and sacct the
+history; squeue's "invalid job id" just means the job left the queue. A task
+that neither reports is `UNKNOWN`, never finished. Scheduler states describe
+tasks, not prompts (a COMPLETED task can have failed prompts); `status` shows
+the last collection's prompt counts separately. It also writes
+`remote/status.json`. It takes no lock, so it works while `run` is monitoring.
+
+**Collection.** `collect` first checks that the remote `submission.json` still
+has the local SHA-256. It then rsyncs `results/`, `logs/` and `.ga-sbatch/`
+into `remote/incoming/`, skipping files still being written atomically, and
+merges them into `remote/collected/`:
+- attempt files and sbatch records are write-once, so a differing remote copy
+  is a conflict and the local copy is kept;
+- a completed `result.json` is never replaced by one that is not completed;
+- logs and task summaries are replaced by newer versions.
+
+Each prompt's `result.json` must name this submission, run, warning and prompt
+SHA-256, and must match its attempt's `metadata.json`. Completed results must
+also have their raw response and an `answer.json` with the same warning and
+status. `remote/collection.json` records per prompt the status
+(`COMPLETED_PROPOSED`, `COMPLETED_INSUFFICIENT_EVIDENCE`, `FAILED`,
+`NO_RESULT`, `INVALID_RESULT`), the error kind, attempts, and paths to the
+answer, raw response and reasoning. It also lists conflicts and result
+directories of unknown warnings. Partial collection while jobs run is safe.
+
+**Retry.** `retry` runs only if:
+- no sbatch call is UNKNOWN;
+- the scheduler reports every task of every job as finished;
+- a fresh collection is clean.
+
+It then resubmits the array tasks of prompts that are `FAILED` or `NO_RESULT`,
+as a new job in the same remote directory (`--array=0,2%3`). Failures a retry
+cannot fix are listed and skipped: `PROMPT_TOO_LONG`, `PROMPT_HASH_MISMATCH`,
+`PROMPT_MISSING`, `UNSUPPORTED_TEMPLATE`. The worker keeps completed results,
+including other prompts of a 10-prompt task, without requesting them again. It
+writes new `attempt-NNN` directories for the rest, and server logs go to a
+per-job directory, so nothing earlier is overwritten. Nothing retries
+automatically.
+
+**End to end.** `inference run`:
+1. connects (one login if needed);
+2. uploads unless already verified;
+3. submits unless a job exists (it refuses if one is UNKNOWN);
+4. polls status and collects every `GA_REMOTE_POLL_SECONDS` (default 300,
+   minimum 60), until every task has finished.
+
+It exits 0 only when every prompt has a completed result. Ctrl-C, a lost
+connection or `GA_REMOTE_MAX_UNKNOWN_POLLS` polls in a row with unknown
+scheduler state stop only the local monitoring. Jobs are never cancelled, and
+rerunning `run` resumes without resubmitting.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GA_SSH_TARGET` | `mc2399@wulver.njit.edu` | `user@host` or a host alias |
+| `GA_SSH_CONTROL_PATH` | unset | unset: managed socket in `GA_SSH_CONTROL_DIR`; `config`: your SSH config's ControlPath; or an existing socket path (reused only) |
+| `GA_SSH_CONTROL_DIR` | `~/.ga-ssh` | private socket directory (short: socket paths are limited to about 100 characters) |
+| `GA_SSH_CONTROL_PERSIST` | `4h` | idle lifetime of a managed master |
+| `GA_SSH_CONNECT_TIMEOUT_SECONDS` | 30 | SSH ConnectTimeout |
+| `GA_SSH_COMMAND_TIMEOUT_SECONDS` / `_TRANSFER_` / `_AUTH_` | 300 / 3600 / 600 | one remote command, one rsync, the interactive login |
+| `GA_SSH_EXECUTABLE`, `GA_RSYNC_EXECUTABLE` | `ssh`, `rsync` | executables |
+| `GA_REMOTE_BASE` | `/project/mjk76/mc2399` | remote base directory |
+| `GA_REMOTE_SUBDIR` | `generalannotator/inference` | below the base: `<run id>/<submission id>` |
+| `GA_REMOTE_POLL_SECONDS` | 300 | monitoring interval of `run` (minimum 60) |
+| `GA_REMOTE_MAX_UNKNOWN_POLLS` | 3 | `run` stops after this many polls in a row with unknown task states |
+| `GA_SLURM_MAX_ARRAY_SIZE` | 100001 | the cluster's MaxArraySize; larger indices are refused before sbatch |
+
+Local files, all in the submission's `remote/` directory: `state.json`,
+`lock`, `events.log` (append-only record of remote actions), `status.json`,
+`incoming/`, `collected/`, `collection.json`. The prepared inputs stay
+unchanged. Changing `GA_SSH_TARGET`, `GA_REMOTE_BASE` or `GA_REMOTE_SUBDIR`
+after an upload is refused for that submission.
+
+| Exit | `inference` meaning |
+|---|---|
+| 0 | Done; for `run`, every prompt has a completed result |
+| 2 | Invalid arguments, settings or submission; or nothing to attach |
+| 3 | Incomplete or refused: failed or missing prompts, unknown scheduler state, an UNKNOWN or rejected sbatch call, hash or identity mismatch, transfer failure, or another process holds the submission |
+| 4 | Internal error |
+| 5 | The shared SSH connection is not available: reconnect (`inference connect`) and rerun; progress is kept |
+
+**Tested, and what isn't verified yet.** Unit tests cover the command lines,
+output parsing and the whole flow against fakes. A manual cross-check ran
+`inference run`, `retry` and `status` with real rsync, bash and `sha256sum`
+through a fake `ssh` and fake `sbatch`/`squeue`/`sacct` that ran the real worker
+with a fake vLLM. Nothing has contacted Wulver yet. Still to confirm there:
+- the Duo login with `ssh -M` and that `ControlPersist` keeps the master;
+- that `bash -l` finds `sbatch`, `squeue`, `sacct`, `sha256sum` and rsync on
+  the login node;
+- that sacct reports `WorkDir` (needed by `attach`) and `--comment`;
+- the effective account and QoS limits (MaxSubmitJobs and similar) for a
+  41-task array.
+
+The GPU smoke test (T13d) is still needed before relying on results.
 
 ## How the local NullAway checkout is used
 
@@ -959,9 +1148,11 @@ mismatched javac counts, or an exit code inconsistent with the diagnostics).
 
 ```
 src/main/java/generalannotator/
-  cli/          check, visualize, targets, slice and context commands; exit codes
+  cli/          check, visualize, targets, slice, context, prompts, prepare-inference and
+                inference commands; exit codes
   config/       environment configuration and validation
-  exec/         CommandRunner (ProcessBuilder-based), recorded command logs
+  exec/         CommandRunner (ProcessBuilder-based; a terminal-attached variant for ssh login),
+                recorded command logs
   diagnostics/  diagnostic model and javac output parser
   isolation/    isolated working-copy creation
   checker/      Checker interface, outcome/coverage model, checker selection
@@ -973,7 +1164,8 @@ src/main/java/generalannotator/
   slicing/      Slicer interface, Specimin setup and invocation, slice-results.json
   context/      usage-context extraction (javac-attributed snapshot, symbol-based matching)
   prompts/      prompt-unit assembly: artifact join, template, manifest (no LLM calls)
-  inference/    inference submissions: settings, task assignment, Slurm script (no upload)
+  inference/    inference submissions: settings, task assignment, Slurm script
+  inference/remote/  SSH connection sharing, upload, sbatch, squeue/sacct, collection, retry
 src/main/resources/generalannotator/inference/ga_inference_worker.py   the GPU worker
 src/test/python                   worker tests and fakes (./gradlew workerTest)
 src/main/resources/generalannotator/checker/nullaway/processor-path.init.gradle

@@ -38,9 +38,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** {@code prepare-inference} on hand-built prompt manifests. Nothing is uploaded, submitted or run. */
-class PrepareInferenceCommandTest {
+public class PrepareInferenceCommandTest {
 
-    static final Clock CLOCK = Clock.fixed(Instant.parse("2026-11-19T12:00:00Z"), ZoneOffset.UTC);
+    public static final Clock CLOCK = Clock.fixed(Instant.parse("2026-11-19T12:00:00Z"), ZoneOffset.UTC);
     static final String SUBMISSION = "20261119T120000Z-inference";
 
     @TempDir Path temp;
@@ -55,7 +55,7 @@ class PrepareInferenceCommandTest {
     }
 
     /** A run with {@code count} warnings, all GENERATED except {@code skipped}. */
-    static Path makeRun(Path runDir, int count, String... skipped) throws IOException {
+    public static Path makeRun(Path runDir, int count, String... skipped) throws IOException {
         Files.createDirectories(runDir.resolve("prompts"));
         List<Diagnostic> findings = new ArrayList<>();
         for (int i = 1; i <= count; i++) {
@@ -95,6 +95,28 @@ class PrepareInferenceCommandTest {
     static String prompt(String id) {
         return "GeneralAnnotator prompt unit | template prompt-template-1 | run run 1 | warning " + id + "\n\n"
                 + "===== BEGIN WARNING =====\nWarning ID: " + id + " — naïve ✓\n===== END WARNING =====\n";
+    }
+
+    @Test
+    void selectsAListOfWarningsForSmallArrays() throws IOException {
+        assertEquals(ExitCode.COMPLETED, run(Map.of("GA_INFERENCE_ARRAY_CONCURRENCY", "2"), "runs/run 1",
+                "W0002,W0001"), errors());
+        Map<?, ?> s = json("submission.json");
+        assertEquals("W0002,W0001", ((Map<?, ?>) s.get("source")).get("selection"));
+        assertEquals(2L, s.get("taskCount"));
+        assertTrue(Files.readString(submission().resolve("run_inference.sbatch")).contains("#SBATCH --array=0-1%2\n"));
+        assertEquals(List.of("W0001", "W0002"), ((List<?>) s.get("prompts")).stream()
+                .map(p -> ((Map<?, ?>) p).get("warningId")).toList());
+    }
+
+    @Test
+    void rejectsBadWarningLists() {
+        for (String bad : List.of("W0001,,W0002", "W0001,W0001", "W0001;W0002", "W0001,W0042", "W0001,W0099")) {
+            assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "runs/run 1", bad), bad);
+        }
+        assertTrue(errors().contains("W0042 has no GENERATED prompt"), errors());
+        assertTrue(errors().contains("W0099 is not in"), errors());
+        assertFalse(Files.exists(runDir.resolve("inference/" + SUBMISSION)));
     }
 
     private ExitCode run(Map<String, String> env, String... args) {

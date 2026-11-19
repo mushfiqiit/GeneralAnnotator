@@ -3,15 +3,18 @@ package generalannotator;
 import generalannotator.cli.CheckCommand;
 import generalannotator.cli.ContextCommand;
 import generalannotator.cli.ExitCode;
+import generalannotator.cli.InferenceCommand;
 import generalannotator.cli.PrepareInferenceCommand;
 import generalannotator.cli.PromptsCommand;
 import generalannotator.cli.SliceCommand;
 import generalannotator.cli.TargetsCommand;
 import generalannotator.cli.VisualizeCommand;
 import generalannotator.exec.ProcessCommandRunner;
+import generalannotator.exec.TerminalCommandRunner;
 import java.io.PrintStream;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -49,17 +52,31 @@ public final class Main {
                       graph, targets, Specimin slice and compact usage context into prompts/<ID>.txt
                       and prompts/manifest.json. No LLM is called; nothing earlier is rerun.
                       Limits: GA_PROMPT_MAX_CHARS, GA_PROMPT_MAX_FILE_CHARS.
-              prepare-inference <run directory> [--warning <ID>]
+              prepare-inference <run directory> [--warning <ID>[,<ID>...]]
                       Prepare an immutable inference submission (inference/<id>/) from the
-                      GENERATED prompts: copied prompts with SHA-256 hashes, task assignments,
+                      GENERATED prompts (or only the listed ones): copied prompts with SHA-256 hashes, task assignments,
                       settings, a Slurm array batch script and the GPU worker. Local only:
                       nothing is uploaded or submitted. Settings: GA_SLURM_*, GA_INFERENCE_*.
+              inference connect
+                      Reuse a running OpenSSH master to the cluster, or open one with a single
+                      interactive login (password and Duo) in this terminal. Settings: GA_SSH_*.
+              inference upload|submit|status|collect|retry|run <submission dir>
+                      upload: copy the submission's inputs to a unique remote directory and verify
+                      their SHA-256; submit: one sbatch array job (never twice); status: squeue/sacct
+                      state per array task; collect: download and verify results into remote/;
+                      retry: resubmit failed or missing prompts as new attempts once every task has
+                      finished; run: connect, upload, submit, then monitor and collect
+                      (GA_REMOTE_POLL_SECONDS). Settings: GA_SSH_*, GA_REMOTE_*.
+              inference attach <submission dir> <job id> | --not-submitted
+                      Resolve an sbatch call whose outcome is UNKNOWN by attaching a job verified
+                      with the scheduler, or by verifying that no job was created.
 
             Exit codes: 0 success (check: analysis completed), 2 usage/configuration error,
                         3 execution failure (check: incomplete analysis; visualize: Graphviz
                         missing or failed; slice: setup failed or a slice FAILED;
-                        context: attribution impossible or a target FAILED),
-                        4 internal error.""";
+                        context: attribution impossible or a target FAILED;
+                        inference: incomplete, refused or unknown), 4 internal error,
+                        5 inference: the shared SSH connection is not available (reconnect).""";
 
     private Main() {}
 
@@ -136,6 +153,18 @@ public final class Main {
             try {
                 return new PrepareInferenceCommand(args[1], args.length == 4 ? Optional.of(args[3]) : Optional.empty(),
                         env, Path.of("").toAbsolutePath(), Clock.systemUTC(), out, err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length >= 1 && args[0].equals("inference")) {
+            try {
+                return new InferenceCommand(List.of(args).subList(1, args.length), env, Path.of("").toAbsolutePath(),
+                        new ProcessCommandRunner(), new TerminalCommandRunner(), System.console() != null,
+                        Clock.systemUTC(), d -> Thread.sleep(d.toMillis()), InferenceCommand.sshClusters(), out,
+                        err).run();
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);

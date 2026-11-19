@@ -371,14 +371,89 @@ and port collision, fixed busy ports, the login-node and GPU guards, SIGTERM
 cleanup, and resubmission. A manual cross-check ran the worker with the fakes
 on a submission prepared from the EventBus prompts. No GPU job was submitted.
 
-## T13c — Wulver transfer, submission, download and GPU smoke test · `next`
+## T13c — Wulver connection, upload, submission, monitoring and collection · `done`
 
-Upload a submission, `sbatch` it from its directory, download `results/`,
-and verify the results against `submission.json`. Not implemented; see
-project-spec §6. Before relying on any results, run a GPU smoke test with one
-or two prompts (`--warning`). It must confirm that:
-- the model loads from the cache offline with vLLM 0.30.0 on the requested
-  GPU type and fits in memory;
+`inference connect|upload|submit|attach|status|collect|retry|run` take a
+prepared submission to Wulver and back over one shared OpenSSH connection:
+- **Connection:** `connect` reuses a running master or opens one with a single
+  interactive login in the user's terminal. The socket is in a private 0700
+  directory, or a user-owned socket or SSH-config ControlPath is reused. Every
+  other ssh/rsync call uses the same socket with `ControlMaster=no` and
+  `BatchMode=yes`, so a lost connection gives exit 5 (reconnect) instead of a
+  new prompt.
+- **Upload:** only the prepared inputs go to a unique
+  `<base>/<subdir>/<run id>/<submission id>`, without `--delete` and without
+  writing into a foreign directory. Remote SHA-256 hashes are verified before
+  any submission.
+- **Submission:** one `sbatch --parsable` array (prepared tasks and
+  concurrency). The intent is saved before the call and the job ID right after.
+  Duplicates are prevented by the saved state, an exclusive local lock and a
+  remote `mkdir` marker. Lost or unreadable outcomes are UNKNOWN and are
+  resolved only by `attach <job id>` (verified with sacct/squeue) or `attach
+  --not-submitted` (verified absence).
+- **Status:** squeue for active tasks and sacct for history. Missing
+  information is UNKNOWN. Scheduler states are kept apart from prompt results.
+- **Collection:** a mirror, then a non-destructive merge (write-once attempts;
+  a completed result is never replaced by a non-completed one) and per-prompt
+  verification of submission, run, warning, prompt hash, metadata and answer
+  files.
+- **Retry:** only after every task has finished, no outcome is unknown and the
+  collection is clean. It resubmits the tasks of failed or missing prompts in
+  the same directory, where the worker keeps completed results and writes new
+  attempts.
+- **`run`:** connect, upload, submit once, then poll (default 300 s) and
+  collect. Ctrl-C and disconnects leave the jobs running, and rerunning resumes.
+
+`prepare-inference --warning` now also takes a comma-separated list
+(`W0001,W0002`), for small test arrays. The worker now writes server logs per Slurm job
+(`results/logs/task-NNNN/job-<id>/`), so retries keep earlier logs.
+
+Code: `inference.remote.RemoteSettings`, `SshConnection`, `Cluster`,
+`SshCluster`, `SchedulerSnapshot`, `SbatchOutcome`, `RemoteException`,
+`RemoteState`, `StateStore`, `LocalSubmission`, `ResultCollector`,
+`RemoteInference`, `cli.InferenceCommand`, `exec.TerminalCommandRunner`, and
+exit code 5.
+
+Verified by:
+- `SshClusterTest`: argv of every ssh/rsync call (same socket, BatchMode, no
+  `--delete`, no host-key override; only the managed master command is
+  interactive), check, sbatch parsing (ID, `ID;cluster`, rejected, duplicate,
+  missing or garbled output), lost connection and timeout during sbatch as
+  UNKNOWN, squeue/sacct parsing including pending ranges, "invalid job id", a
+  failed sacct and cut-off output, rsync failures as disconnect versus failure,
+  hash output, job records, unsafe values, settings validation.
+- `RemoteInferenceTest` with `FakeCluster`: upload of only the inputs, upload
+  disconnect and resume, hash mismatch blocking submission, foreign remote
+  directories, a single submission across reruns, the concurrent-invocation
+  lock, the remote marker after lost local state, ambiguous disconnect (no
+  resubmission, wrong and unknown jobs refused, verified attach), verified
+  not-submitted, interrupted intent read back as UNKNOWN, rejection, scheduler
+  silence as unknown (status, run, retry), partial collection while running,
+  identity and hash mismatches, retry preservation with conflicts, monitoring
+  to completion, disconnect and interrupt while monitoring, a moved remote
+  location.
+- `InferenceCommandTest`: reuse without login, exactly one interactive login
+  in a 0700 directory, an insecure directory refused, no terminal, a failed
+  login, user-owned connections only reused, exit codes.
+
+A manual cross-check ran the installed launcher (`inference connect`, `run`,
+`retry`, `submit`, `status`) on a 41-prompt, 10-per-task EventBus submission.
+It used real rsync, bash and `sha256sum` through a fake `ssh`, and fake
+`sbatch`/`squeue`/`sacct` running the real worker with a fake vLLM. The cycle
+went from 41 failed (a fixture error) to 40 after a retry, then to all 41
+completed after a second retry. That retry re-requested only W0005 of its
+10-prompt task. Nothing contacted Wulver.
+
+## T13d — Wulver end-to-end and GPU smoke test · `next`
+
+On Wulver, with one or two prompts (`prepare-inference --warning`), confirm:
+- the Duo login through `inference connect` (`ssh -M -N -f`), that
+  `ControlPersist` keeps the master, and that `bash -l` on the login node finds
+  `sbatch`, `squeue`, `sacct`, `sha256sum` and rsync;
+- that sacct reports `WorkDir` for `attach`, and the effective account and QoS
+  limits (MaxSubmitJobs and similar) for a 41-task array;
+- the model loads from the cache offline with vLLM 0.30.0 on the requested GPU
+  type and fits in memory;
 - the served name, the 32768 context and the `qwen3` reasoning parser work,
   and `/tokenize` and `/version` are available;
 - reasoning arrives in `reasoning_content` or `reasoning`;

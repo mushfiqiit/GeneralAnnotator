@@ -269,6 +269,26 @@ interface or in one named class), labeled provisional, and noted here.
   the context, because 16384 truncated answers historically); a minimum of
   70000 MiB of GPU memory; 2 hours per task; array concurrency 4.
 
+- **Wulver transfer and submission (T13c).** OpenSSH connection sharing: one
+  interactive login (password and Duo) in the user's terminal opens a
+  ControlMaster. All other ssh/rsync calls reuse it with `BatchMode=yes` and
+  never prompt, so a lost connection asks for reconnection (exit 5). Each
+  submission gets its own remote directory, and the upload is verified with
+  remote SHA-256 before sbatch. One array job is submitted per explicit
+  request. The intent is persisted before sbatch and the job ID after it.
+  Duplicates are blocked by state, a local lock and a remote `mkdir` marker.
+  Ambiguous outcomes are UNKNOWN until resolved by a scheduler-verified
+  `attach`. Retries are new array jobs in the same directory, allowed only
+  when every task has finished; the worker keeps completed results.
+  **Provisional defaults, isolated in `inference.remote.RemoteSettings`:**
+  - target `mc2399@wulver.njit.edu`, remote base `/project/mjk76/mc2399` with
+    `generalannotator/inference/<run id>/<submission id>`;
+  - managed socket directory `~/.ga-ssh`, ControlPersist 4h;
+  - remote commands run with `bash -l -c`;
+  - polling every 300 s, and monitoring stops after 3 polls with unknown state;
+  - retries skip `PROMPT_TOO_LONG`, `PROMPT_HASH_MISMATCH`, `PROMPT_MISSING` and
+    `UNSUPPORTED_TEMPLATE` (`RemoteInference.NOT_RETRYABLE`).
+
 ### Engineering decisions (open, to be settled by the task that needs them)
 
 - Warning-graph expansion: which node kinds (for example annotation actions,
@@ -288,11 +308,11 @@ interface or in one named class), labeled provisional, and noted here.
 - How proposals are mapped to edits (T6, T7, T13). The worker checks
   answers against the response format (T13b), but whether a proposal's file,
   member and position exist in the original project is not checked yet.
-- Transfer to and from Wulver (T13c): how to upload, submit and download
-  (VPN and MFA are required, so possibly manual), how remote paths are
-  configured, and how downloaded results are verified against
-  `submission.json`. Whether the worker should retry transient HTTP errors
-  itself (it doesn't; resubmission retries failed prompts).
+- Whether the worker should retry transient HTTP errors itself (it doesn't;
+  `inference retry` resubmits failed prompts as new attempts).
+- Effective Wulver limits (account/QoS MaxSubmitJobs, GPU availability) for
+  large arrays are unverified; only MaxArraySize=100001 is known. Whether
+  `GA_INFERENCE_ARRAY_CONCURRENCY=4` is a good default depends on them (T13d).
 - File format for manual proposals and which serialization library to use for
   reading them.
 - What to do with warnings whose target is unresolved (for example
@@ -321,7 +341,7 @@ interface or in one named class), labeled provisional, and noted here.
 | 2. Slice: generation | Implemented: `slice` command runs Specimin per warning into `slices/<ID>/` (`slice-results.json`). Reproduction is NOT_VALIDATED. |
 | 2. Slice: reproduction validation | Not implemented (T10b). |
 | 3. Extract context | Implemented for symbol usages: `context` command writes `context/<ID>.json`/`.txt` (one hop, symbol-based, no safe/unsafe policy). Unsafe-region usages (T12) blocked on §6.2. |
-| 4. Propose (manual / LLM) | Prompt units (`prompts`) and Wulver submissions with a GPU worker (`prepare-inference`), tested with fakes; no upload, submission, download or GPU run yet, and proposals are not applied. |
+| 4. Propose (manual / LLM) | Prompt units (`prompts`), Wulver submissions with a GPU worker (`prepare-inference`), and upload, submission, monitoring, collection and retry over one shared SSH connection (`inference`). All tested with fakes only: nothing has run on Wulver or a GPU yet (T13d), and proposals are not applied. |
 | 5. Apply and recheck | Not implemented |
 | 6. Record | Not implemented |
 | 7. Explore and select | Not implemented; blocked on §6 decisions |

@@ -55,7 +55,8 @@ Run verification that fits each change. At minimum, run `./gradlew build`
 before reporting a code change as done. Run `integrationTest` when changing
 checker invocation, classification, isolation, or the CLI flow. Run
 `workerTest` when changing the inference worker or the files it reads. Never
-submit GPU jobs or load models from tests.
+submit GPU jobs, load models, or connect to the cluster (ssh, rsync, sbatch)
+from tests; remote operations are tested against fakes.
 
 Unit tests (`src/test`) must be deterministic and must not depend on
 machine-specific paths, a NullAway checkout, or Graphviz. `integrationTest`

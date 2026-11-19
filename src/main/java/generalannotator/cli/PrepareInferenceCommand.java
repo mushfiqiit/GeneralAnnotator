@@ -15,10 +15,10 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * {@code prepare-inference <run directory> [--warning ID]}: prepare an immutable inference
+ * {@code prepare-inference <run directory> [--warning ID[,ID...]]}: prepare an immutable inference
  * submission ({@code inference/<submission id>/}) from the run's GENERATED prompt units, with a Slurm
  * array batch script and the GPU worker. Runs locally only: nothing is uploaded or submitted, and
- * no model is loaded. Settings come from {@code GA_SLURM_*} and {@code GA_INFERENCE_*} variables.
+ * no model is loaded ({@link InferenceCommand} does the remote part). Settings come from {@code GA_SLURM_*} and {@code GA_INFERENCE_*} variables.
  *
  * <p>Exit codes: 0 prepared; 2 invalid arguments, settings, prompt manifest or prompt files, or an
  * existing submission directory (nothing written); 4 internal error.
@@ -86,8 +86,8 @@ public final class PrepareInferenceCommand {
                         .orElse("") + ", time " + settings.time() + " per task");
         out.println("  batch:      " + SlurmScript.FILE_NAME + " (sbatch it from the submission directory on the "
                 + "cluster)");
-        out.println("  Nothing was uploaded or submitted, and no model was loaded. Upload, submission and result "
-                + "download are not implemented yet.");
+        out.println("  Nothing was uploaded or submitted, and no model was loaded. Next: inference connect, then "
+                + "inference run " + prepared.directory());
         return ExitCode.COMPLETED;
     }
 

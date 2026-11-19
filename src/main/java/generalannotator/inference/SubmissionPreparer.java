@@ -121,6 +121,16 @@ public final class SubmissionPreparer {
             throw new PreparationException(problems);
         }
 
+        // --warning W0001 or W0001,W0002,...: only these warnings.
+        Set<String> wanted = new LinkedHashSet<>();
+        if (warningId.isPresent()) {
+            for (String w : warningId.get().split(",", -1)) {
+                if (!WARNING_ID.matcher(w.strip()).matches() || !wanted.add(w.strip())) {
+                    throw new PreparationException(List.of("--warning takes warning IDs separated by commas, each "
+                            + "once, for example W0001,W0002; not '" + warningId.get() + "'"));
+                }
+            }
+        }
         List<Prompt> selected = new ArrayList<>();
         List<String> excluded = new ArrayList<>();
         Map<String, Map<String, Object>> excludedEntries = new LinkedHashMap<>();
@@ -139,7 +149,7 @@ public final class SubmissionPreparer {
                 problems.add("manifest lists " + id + " more than once");
                 continue;
             }
-            if (warningId.isPresent() && !warningId.get().equals(id)) {
+            if (!wanted.isEmpty() && !wanted.contains(id)) {
                 continue;
             }
             if (!"GENERATED".equals(e.get("status"))) {
@@ -152,12 +162,12 @@ public final class SubmissionPreparer {
             }
             prompt(e, id, runId, promptsDir, realPrompts, problems).ifPresent(selected::add);
         }
-        if (warningId.isPresent()) {
-            if (!ids.contains(warningId.get())) {
-                problems.add("Warning " + warningId.get() + " is not in " + manifestFile + ".");
-            } else if (!excluded.isEmpty()) {
-                problems.add("Warning " + warningId.get() + " has no GENERATED prompt (status "
-                        + excludedEntries.get(warningId.get()).get("status") + ").");
+        for (String w : wanted) {
+            if (!ids.contains(w)) {
+                problems.add("Warning " + w + " is not in " + manifestFile + ".");
+            } else if (excludedEntries.containsKey(w)) {
+                problems.add("Warning " + w + " has no GENERATED prompt (status "
+                        + excludedEntries.get(w).get("status") + ").");
             }
         }
         if (problems.isEmpty() && selected.isEmpty()) {
@@ -226,7 +236,7 @@ public final class SubmissionPreparer {
             source.put("promptManifest", "prompts/" + PromptManifestJson.FILE_NAME);
             source.put("promptManifestSha256", sha256(manifestBytes));
             source.put("templateVersion", manifest.get("templateVersion"));
-            source.put("selection", warningId.orElse("all GENERATED"));
+            source.put("selection", wanted.isEmpty() ? "all GENERATED" : String.join(",", wanted));
             root.put("source", source);
             root.put("promptsPerTask", settings.promptsPerTask());
             root.put("arrayConcurrency", settings.arrayConcurrency());

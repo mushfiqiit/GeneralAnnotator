@@ -678,8 +678,10 @@ def run(submission_dir: str, task_index: int) -> int:
             try:
                 context["node"]["gpus"] = check_node(settings)
                 vllm = check_environment(settings)
+                # One log directory per Slurm job, so a resubmitted task never overwrites earlier logs.
+                job_tag = f"job-{os.environ['SLURM_JOB_ID']}" if os.environ.get("SLURM_JOB_ID") else f"pid-{os.getpid()}"
                 server = start_server(vllm, settings, os.path.join(submission_dir, "results", "logs",
-                                                                    f"task-{task_index:04d}"))
+                                                                    f"task-{task_index:04d}", job_tag))
             except WorkerError as e:
                 task_error = e
                 log(f"ERROR {e.kind}: {e}")

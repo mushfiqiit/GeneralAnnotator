@@ -14,7 +14,12 @@ public enum ExitCode {
     /** Execution failure: the analysis did not complete or cannot be trusted; findings are incomplete. */
     EXECUTION_FAILURE(3),
     /** Unexpected internal error in GeneralAnnotator (including failure to write the report). */
-    INTERNAL_ERROR(4);
+    INTERNAL_ERROR(4),
+    /**
+     * {@code inference} only: the shared SSH connection is not available. Progress is saved; open the
+     * connection with one interactive login ({@code inference connect}) and rerun.
+     */
+    RECONNECT_REQUIRED(5);
 
     private final int code;
 
