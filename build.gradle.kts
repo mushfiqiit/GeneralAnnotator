@@ -69,3 +69,21 @@ tasks.register<Test>("integrationTest") {
         showStandardStreams = true
     }
 }
+
+// The Python inference worker's unit tests (fake vllm/nvidia-smi, no GPU or network). Kept out of
+// `check` because they need a local Python 3.10+; GA_PYTHON selects the interpreter (default python3).
+tasks.register<Exec>("workerTest") {
+    description = "Runs the Python inference worker's unit tests (requires Python 3.10+)."
+    group = "verification"
+    val python = System.getenv("GA_PYTHON") ?: "python3"
+    commandLine(
+        python, "-c",
+        "import sys; assert sys.version_info >= (3, 10), 'the worker tests need Python 3.10+, not ' + sys.version; " +
+            "import unittest; r = unittest.main(module=None, argv=['workerTest', 'discover', '-s', " +
+            "'src/test/python', '-p', 'test_*.py', '-v'], exit=False).result; " +
+            "sys.exit(0 if r.wasSuccessful() and r.testsRun > 0 else 1)",
+    )
+    inputs.dir("src/test/python")
+    inputs.file("src/main/resources/generalannotator/inference/ga_inference_worker.py")
+    outputs.upToDateWhen { false }
+}

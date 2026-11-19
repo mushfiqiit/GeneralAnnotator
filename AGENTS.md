@@ -46,13 +46,16 @@ does not need to be the default `java`.
 ./gradlew build                 # compile, run unit tests, assemble
 ./gradlew test                  # unit tests only
 GA_CHECKER_HOME=/path/to/NullAway ./gradlew integrationTest   # real-tool tests (separate)
+./gradlew workerTest            # Python inference worker tests (separate; Python 3.10+)
 ./gradlew run --args="check"    # run the check command (configuration: README.md)
 ./gradlew clean build           # full rebuild
 ```
 
 Run verification that fits each change. At minimum, run `./gradlew build`
 before reporting a code change as done. Run `integrationTest` when changing
-checker invocation, classification, isolation, or the CLI flow.
+checker invocation, classification, isolation, or the CLI flow. Run
+`workerTest` when changing the inference worker or the files it reads. Never
+submit GPU jobs or load models from tests.
 
 Unit tests (`src/test`) must be deterministic and must not depend on
 machine-specific paths, a NullAway checkout, or Graphviz. `integrationTest`

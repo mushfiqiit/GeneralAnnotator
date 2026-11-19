@@ -3,8 +3,11 @@
 Status: draft. Stage 1 (*Check*) is implemented for NullAway (tasks T1–T4a in
 `docs/tasks.md`), with the initial warning graph (T4b), visualization (T4c),
 Specimin target members (T4d), Specimin slice generation without reproduction
-validation (T10a), and one-hop usage-context extraction (T11). Proposals,
-editing, rechecking, recording and search are not implemented.
+validation (T10a), one-hop usage-context extraction (T11, T11a), and LLM
+prompt-unit assembly without LLM calls (T13a), and the first half of Wulver
+inference (T13b): an immutable Slurm submission and the GPU worker, tested
+with fakes only. Upload, job submission, result download, applying proposals,
+rechecking, recording and search are not implemented.
 
 ## 1. Purpose
 
@@ -224,6 +227,47 @@ interface or in one named class), labeled provisional, and noted here.
   Null guards are recognized syntactically. Limits are configurable, and
   omissions are counted. All of this is a heuristic. It does not establish
   which annotation is correct, and it applies no safe/unsafe policy (§6.2).
+- **Local alias flow and the compact view (T11a).** Later uses of a local
+  that stores the evidence value are attributed conservatively and textually.
+  A reassignment that is an unconditional statement earlier in a block
+  containing the use ends attribution. A reassignment on some paths (a branch,
+  or later in an enclosing loop), or a storing assignment that runs on some
+  paths only, makes a use `MAY_BE_REASSIGNED`. Exceptions and labeled jumps
+  are ignored. Evidence is deduplicated by kind, location and symbol. Before
+  the item limit, distinct evidence (kind, consumption, observations) is kept
+  first, round robin. `context/<ID>.txt` is the compact LLM-facing view built
+  from the kept evidence: member blocks, merged lines in source order, notes,
+  explicit gaps. `context/<ID>.json` keeps the full details. For class-file
+  declarations only nullness-named and type-use annotations are reported.
+
+- **Prompt units (T13a).** `prompts` joins the warning graph, targets, slice
+  results, slice files and `context/<ID>.txt` by warning ID. It requires one
+  `runId` across graph, targets and slice results, and checks per warning
+  that locations and target members agree and that `context/<ID>.json` names
+  the same run and warning. The JSON is never put into prompts. Each unit
+  holds exactly one warning. Slice files are verbatim, sorted by path, in
+  blocks whose end markers carry a SHA-256 prefix of the content. Line numbers
+  appear only in the usage context, labeled as original. Units over the
+  configured limits are OVERSIZED, never truncated. The template is
+  versioned (`prompt-template-1`), and the manifest has no timestamps.
+
+- **Wulver inference, first half (T13b).** `prepare-inference` copies the
+  GENERATED prompts byte for byte into an immutable `inference/<id>/`
+  directory, built under a temporary name, renamed when complete and made
+  read-only. It records full SHA-256 hashes and assigns prompts
+  deterministically: numeric warning order, 1 to 10 prompts per array task,
+  default 1. Every prompt is a separate request. The worker is standard-library
+  Python, so nothing is installed on the cluster. It runs only inside a Slurm
+  GPU allocation with enough GPU memory, owns a localhost vLLM server with
+  offline cached weights, checks prompt length before sending (never
+  truncating), and validates answers against `prompt-template-1`. Every attempt
+  is saved atomically (raw response, reasoning, answer, metadata), and
+  completed results are kept across resubmissions. **Provisional defaults,
+  isolated in `inference.InferenceSettings` and needing a GPU smoke test:** the
+  historical served name, 32768 context and `qwen3` parser; sampling 0.6 /
+  0.95 / top-k 20 / seed 0 from the Qwen3 model card; `max_tokens` 0 (rest of
+  the context, because 16384 truncated answers historically); a minimum of
+  70000 MiB of GPU memory; 2 hours per task; array concurrency 4.
 
 ### Engineering decisions (open, to be settled by the task that needs them)
 
@@ -236,7 +280,19 @@ interface or in one named class), labeled provisional, and noted here.
 - Supporting targets whose sources need dependency resolution or generated
   code, for example by extracting the classpath from the target's build.
 - Which nullability annotation library edits use (JSpecify, or the target's
-  existing annotations).
+  existing annotations). **Provisional (T13a):** the prompt template's
+  NullAway guidance (`prompts.PromptTemplate.CHECKERS`, the only place it is
+  encoded) asks for the annotations the project already uses and otherwise
+  `org.jspecify.annotations.Nullable`. Edits are not applied yet, so nothing
+  else depends on this.
+- How proposals are mapped to edits (T6, T7, T13). The worker checks
+  answers against the response format (T13b), but whether a proposal's file,
+  member and position exist in the original project is not checked yet.
+- Transfer to and from Wulver (T13c): how to upload, submit and download
+  (VPN and MFA are required, so possibly manual), how remote paths are
+  configured, and how downloaded results are verified against
+  `submission.json`. Whether the worker should retry transient HTTP errors
+  itself (it doesn't; resubmission retries failed prompts).
 - File format for manual proposals and which serialization library to use for
   reading them.
 - What to do with warnings whose target is unresolved (for example
@@ -244,7 +300,9 @@ interface or in one named class), labeled provisional, and noted here.
   block, but that would be a guess and is not done; they are SKIPPED.
 - How slices are compiled and checked to validate reproduction (T10b), and
   how a warning in a slice is matched to the original warning (§6.1).
-- How much context a proposer needs. The current extraction is one hop.
+- How much context a proposer needs, and in what form. The current
+  extraction is one hop, and the compact view is one fixed layout; whether
+  it helps proposals is unmeasured.
   Possible extensions are following values through further calls, treating
   calls through an overridden supertype method as usages (dynamic dispatch),
   and including callers of callers. These should be decided by evaluating
@@ -263,7 +321,7 @@ interface or in one named class), labeled provisional, and noted here.
 | 2. Slice: generation | Implemented: `slice` command runs Specimin per warning into `slices/<ID>/` (`slice-results.json`). Reproduction is NOT_VALIDATED. |
 | 2. Slice: reproduction validation | Not implemented (T10b). |
 | 3. Extract context | Implemented for symbol usages: `context` command writes `context/<ID>.json`/`.txt` (one hop, symbol-based, no safe/unsafe policy). Unsafe-region usages (T12) blocked on §6.2. |
-| 4. Propose (manual / LLM) | Not implemented |
+| 4. Propose (manual / LLM) | Prompt units (`prompts`) and Wulver submissions with a GPU worker (`prepare-inference`), tested with fakes; no upload, submission, download or GPU run yet, and proposals are not applied. |
 | 5. Apply and recheck | Not implemented |
 | 6. Record | Not implemented |
 | 7. Explore and select | Not implemented; blocked on §6 decisions |

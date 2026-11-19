@@ -17,6 +17,7 @@ import java.util.Optional;
  * @param references counts of matched, unresolved and excluded same-name references
  * @param categories evidence, in a fixed category order
  * @param limitations what the extraction does not cover or could not establish
+ * @param compact the compact, member-grouped view of the kept evidence
  */
 public record WarningContext(
         String warningId,
@@ -26,7 +27,8 @@ public record WarningContext(
         Map<String, Object> target,
         Map<String, Object> references,
         List<EvidenceCategory> categories,
-        List<String> limitations) {
+        List<String> limitations,
+        CompactView compact) {
 
     public WarningContext {
         Objects.requireNonNull(warningId, "warningId");
@@ -36,6 +38,7 @@ public record WarningContext(
         references = java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(references));
         categories = List.copyOf(categories);
         limitations = List.copyOf(limitations);
+        Objects.requireNonNull(compact, "compact");
     }
 
     public Optional<EvidenceCategory> category(String name) {

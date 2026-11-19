@@ -1,133 +1,178 @@
 package generalannotator.context;
 
-import java.util.Collection;
+import generalannotator.context.CompactView.Block;
+import generalannotator.context.CompactView.Row;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Renders a {@link WarningContext} as readable text ({@code context/<warningId>.txt}). */
+/**
+ * Renders the compact, LLM-facing view of a {@link WarningContext} ({@code context/<warningId>.txt}):
+ * the warning and target once, then the relevant source lines grouped by enclosing member, each
+ * line once in source order with merged notes and explicit {@code ...} gaps. Empty categories,
+ * zero counts, category descriptions and checker documentation URLs are left out; the JSON file
+ * keeps every extracted detail.
+ */
 public final class ContextText {
+
+    static final Map<String, String> NOUNS = new LinkedHashMap<>();
+
+    static {
+        NOUNS.put("callSites", "call sites");
+        NOUNS.put("methodReferences", "method references");
+        NOUNS.put("parameterUses", "parameter uses");
+        NOUNS.put("returnStatements", "returns");
+        NOUNS.put("overrideRelations", "override relations");
+        NOUNS.put("fieldWrites", "writes");
+        NOUNS.put("fieldReads", "reads");
+    }
+
+    static final String STANDARD_NOTE = "Heuristic one-hop evidence matched by javac symbols; null guards and local "
+            + "alias flow are syntactic and conservative; not a minimal or sound slice; no safe/unsafe-region "
+            + "filtering. Observations are not proofs of the correct annotation.";
 
     private ContextText() {}
 
     public static String render(WarningContext c) {
         StringBuilder out = new StringBuilder();
-        out.append("Context for ").append(c.warningId()).append(" (").append(c.status()).append(")\n");
-        c.reason().ifPresent(r -> out.append("Reason: ").append(r).append('\n'));
-        out.append('\n');
-        out.append("Warning\n");
-        c.warning().forEach((k, v) -> {
-            if (v != null) {
-                out.append("  ").append(k).append(": ").append(oneLine(String.valueOf(v))).append('\n');
-            }
-        });
+        Map<String, Object> w = c.warning();
+        out.append(c.warningId());
+        if (w.get("checker") != null) {
+            out.append("  ").append(w.get("checker"));
+        }
+        if (w.get("severity") != null) {
+            out.append(' ').append(w.get("severity"));
+        }
+        out.append("  ").append(w.get("location")).append('\n');
+        if (w.get("message") != null) {
+            out.append(stripUrls(String.valueOf(w.get("message")))).append('\n');
+        }
+        if (c.status() != ContextStatus.EXTRACTED) {
+            out.append("Status: ").append(c.status()).append(c.reason().map(r -> " (" + r + ")").orElse(""))
+                    .append('\n');
+        }
+
+        CompactView view = c.compact();
         if (!c.target().isEmpty()) {
-            out.append("\nTarget\n");
-            c.target().forEach((k, v) -> {
-                if (v instanceof Collection<?> items && !items.isEmpty() && items.iterator().next() instanceof Map) {
-                    out.append("  ").append(k).append(":\n");
-                    items.forEach(i -> out.append("    - ").append(inline(i)).append('\n'));
-                } else if (v != null && !(v instanceof Collection<?> items && items.isEmpty())) {
-                    out.append("  ").append(k).append(": ").append(inline(v)).append('\n');
-                }
-            });
-        }
-        if (!c.references().isEmpty()) {
-            out.append("\nReferences: ").append(inline(c.references())).append('\n');
-        }
-        for (EvidenceCategory category : c.categories()) {
-            out.append("\n== ").append(category.name()).append(" (").append(category.items().size()).append(" of ")
-                    .append(category.total());
-            if (category.omitted() > 0) {
-                out.append(", ").append(category.omitted()).append(" omitted by the limit");
+            out.append('\n').append("Target: ").append(c.target().get("memberKind")).append(' ')
+                    .append(c.target().get("target"));
+            if (view.targetInBlock()) {
+                out.append("  (declared at ").append(c.target().get("declaredAt")).append("; block marked [target])");
+            } else if (c.target().get("file") != null) {
+                out.append("  (").append(c.target().get("file")).append(')');
             }
-            out.append(") ==\n");
-            out.append("   ").append(category.description()).append('\n');
-            int n = 1;
-            for (Evidence e : category.items()) {
-                item(out, n++, e);
+            out.append('\n');
+            rows(out, view.target());
+        }
+        summary(out, c);
+
+        for (Block block : view.blocks()) {
+            out.append('\n').append(block.file()).append("  ").append(block.member());
+            if (block.targetMember()) {
+                out.append("  [target]");
+            }
+            out.append('\n');
+            rows(out, block.rows());
+        }
+        binaryOverrides(out, c);
+        unresolved(out, c);
+
+        out.append("\nNotes:\n");
+        for (String l : c.limitations()) {
+            if (!ContextExtractor.STANDARD_LIMITATIONS.contains(l)) {
+                out.append("- ").append(l).append('\n');
             }
         }
-        out.append("\n== limitations ==\n");
-        c.limitations().forEach(l -> out.append("- ").append(l).append('\n'));
+        out.append("- ").append(STANDARD_NOTE).append(" Full details: ").append(c.warningId()).append(".json.\n");
         return out.toString();
     }
 
-    private static void item(StringBuilder out, int n, Evidence e) {
-        out.append("\n[").append(n).append("] ").append(e.kind());
-        out.append(" at ").append(e.location() == null ? "(class file)" : e.location().toString());
-        out.append("\n    in: ").append(e.enclosingMember()).append('\n');
-        if (e.expression() != null && !e.expression().isEmpty()) {
-            out.append("    expression: ").append(e.expression()).append('\n');
+    /** {@code Found: 2 writes, 4 reads} plus truncation and exclusion counts, all only when non-zero. */
+    private static void summary(StringBuilder out, WarningContext c) {
+        List<String> found = new ArrayList<>();
+        List<String> truncated = new ArrayList<>();
+        for (EvidenceCategory category : c.categories()) {
+            String noun = NOUNS.get(category.name());
+            if (noun == null || category.total() == 0) {
+                continue;
+            }
+            found.add(category.total() + " " + (category.total() == 1 ? noun.substring(0, noun.length() - 1) : noun));
+            if (category.omitted() > 0) {
+                truncated.add(category.items().size() + " of " + category.total() + " " + noun);
+            }
         }
-        if (!e.observations().isEmpty()) {
-            out.append("    observations: ").append(String.join(", ",
-                    e.observations().stream().map(Enum::name).toList())).append('\n');
+        if (!found.isEmpty()) {
+            out.append("Found: ").append(String.join(", ", found)).append('\n');
+        } else if (c.status() == ContextStatus.EXTRACTED) {
+            out.append("Found: no uses of the target in the analyzed sources\n");
         }
-        e.details().forEach((k, v) -> {
-            if (v instanceof List<?> items && !items.isEmpty() && items.getFirst() instanceof Map) {
-                out.append("    ").append(k).append(":\n");
-                items.forEach(i -> out.append("      - ").append(inline(i)).append('\n'));
-            } else {
-                out.append("    ").append(k).append(": ").append(inline(v)).append('\n');
+        if (!truncated.isEmpty()) {
+            out.append("Shown: ").append(String.join(", ", truncated))
+                    .append(" (limit GA_CONTEXT_MAX_ITEMS; distinct kinds of use are kept first)\n");
+        }
+        if (c.references().get("sameNameOtherSymbols") instanceof Integer n && n > 0) {
+            out.append("Excluded: ").append(n).append(" same-name reference(s) to other symbols\n");
+        }
+    }
+
+    private static void rows(StringBuilder out, List<Row> rows) {
+        int width = 1;
+        for (Row r : rows) {
+            width = Math.max(width, String.valueOf(r.line()).length());
+        }
+        for (Row r : rows) {
+            if (r.gap()) {
+                out.append("  ").append(" ".repeat(width)).append("  ").append(r.text()).append("  // ")
+                        .append(r.omitted()).append(r.omitted() == 1 ? " line" : " lines").append(" omitted\n");
+                continue;
+            }
+            String number = String.valueOf(r.line());
+            out.append("  ").append(" ".repeat(width - number.length())).append(number).append("  ").append(r.text());
+            if (!r.notes().isEmpty()) {
+                out.append("  // ").append(String.join("; ", r.notes()));
+            }
+            out.append('\n');
+        }
+    }
+
+    private static void binaryOverrides(StringBuilder out, WarningContext c) {
+        c.category("overrideRelations").ifPresent(category -> {
+            List<String> lines = new ArrayList<>();
+            for (Evidence e : category.items()) {
+                if (e.location() == null) {
+                    String annotations = e.details().get("methodAnnotations") instanceof List<?> a && !a.isEmpty()
+                            ? "  " + String.join(" ", a.stream().map(String::valueOf).toList()) : "";
+                    lines.add("  " + e.enclosingMember() + annotations
+                            + (e.kind().equals("OVERRIDES") ? "  (overridden by the target; class file)"
+                                    : "  (class file)"));
+                }
+            }
+            if (!lines.isEmpty()) {
+                out.append("\nOverride relations without source:\n");
+                lines.forEach(l -> out.append(l).append('\n'));
             }
         });
-        if (!e.conditions().isEmpty()) {
-            out.append("    conditions (nearest first):\n");
-            e.conditions().forEach(c -> out.append("      ").append(c.kind()).append(" ").append(c.text())
-                    .append("  (line ").append(c.line()).append(")\n"));
-        }
-        if (e.omittedConditions() > 0) {
-            out.append("      ... ").append(e.omittedConditions()).append(" more condition(s) omitted\n");
-        }
-        if (!e.localDefinitions().isEmpty()) {
-            out.append("    local definitions:\n");
-            e.localDefinitions().forEach(d -> out.append("      ").append(d.line()).append(": ").append(d.text())
-                    .append('\n'));
-        }
-        if (e.snippet() != null) {
-            int width = String.valueOf(e.snippet().endLine()).length();
-            for (int i = 0; i < e.snippet().lines().size(); i++) {
-                String num = String.valueOf(e.snippet().startLine() + i);
-                out.append("    | ").append(" ".repeat(width - num.length())).append(num).append("  ")
-                        .append(e.snippet().lines().get(i)).append('\n');
-            }
-            if (e.snippet().omittedLines() > 0) {
-                out.append("    | (").append(e.snippet().omittedLines()).append(" line(s) of this statement omitted)\n");
-            }
-        }
     }
 
-    /** Compact one-line rendering of JSON-like values. */
-    static String inline(Object v) {
-        return switch (v) {
-            case null -> "null";
-            case Map<?, ?> m -> {
-                StringBuilder s = new StringBuilder("{");
-                m.forEach((k, x) -> {
-                    if (x != null && !(x instanceof Collection<?> c && c.isEmpty())) {
-                        if (s.length() > 1) {
-                            s.append(", ");
-                        }
-                        s.append(k).append('=').append(inline(x));
-                    }
-                });
-                yield s.append('}').toString();
+    private static void unresolved(StringBuilder out, WarningContext c) {
+        c.category("unresolvedReferences").filter(u -> u.total() > 0).ifPresent(u -> {
+            out.append("\nUnresolved same-name references (not counted as uses): ").append(u.total());
+            if (u.omitted() > 0) {
+                out.append(", ").append(u.items().size()).append(" shown");
             }
-            case Collection<?> c -> {
-                StringBuilder s = new StringBuilder("[");
-                for (Object x : c) {
-                    if (s.length() > 1) {
-                        s.append(", ");
-                    }
-                    s.append(inline(x));
-                }
-                yield s.append(']').toString();
+            out.append('\n');
+            for (Evidence e : u.items()) {
+                out.append("  ").append(e.location()).append("  ").append(e.expression()).append("  // ")
+                        .append(e.details().get("reason")).append('\n');
             }
-            default -> oneLine(String.valueOf(v));
-        };
+        });
     }
 
-    private static String oneLine(String s) {
-        return s.replace("\r", "").replace("\n", " / ");
+    /** Removes checker documentation links such as {@code (see http://t.uber.com/nullaway )}. */
+    public static String stripUrls(String message) {
+        String s = message.replaceAll("\\s*\\(see\\s+https?://[^)]*\\)", "");
+        s = s.replaceAll("\\s*https?://\\S+", "");
+        return s.replaceAll("\\s*\\R\\s*", " ").strip();
     }
 }

@@ -141,9 +141,12 @@ class ContextCommandTest {
         assertTrue(((String) skipped.get("reason")).contains("initializer block"));
 
         String text = Files.readString(runDir.resolve("context/W0002.txt"));
-        assertTrue(text.startsWith("Context for W0002 (EXTRACTED)"), text);
-        assertTrue(text.contains("== callSites (1 of 1) =="), text);
-        assertTrue(text.contains("| 7  String s = lib.find(\"k\");"), text);
+        assertTrue(text.startsWith("W0002  NullAway ERROR  core/src/a/Lib.java:7:16\n"
+                + "returning @Nullable expression from method with @NonNull return type\n"), text);
+        assertTrue(text.contains("Found: 1 call site, 2 parameter uses, 1 return\n"), text);
+        assertTrue(text.contains("String s = lib.find(\"k\");  // call\n"), text);
+        assertTrue(text.contains("return s.length();  // s holds the value from line 7\n"), text);
+        assertTrue(text.contains("Unresolved same-name references (not counted as uses): 1\n"), text);
         String console = out.toString(StandardCharsets.UTF_8);
         assertTrue(console.contains("W0002  EXTRACTED  METHOD a.Lib#find(String) callSites=1"), console);
         assertTrue(console.contains("W0003  SKIPPED"), console);

@@ -19,6 +19,7 @@ import java.util.Set;
  * @param localDefinitions definitions of local variables used by the relevant expression
  * @param details JSON-compatible kind-specific details (ordered)
  * @param observations syntactic observations
+ * @param marks source ranges for the compact view (not written to JSON)
  */
 public record Evidence(
         String kind,
@@ -31,7 +32,8 @@ public record Evidence(
         int omittedConditions,
         List<LocalDefinition> localDefinitions,
         Map<String, Object> details,
-        Set<Observation> observations) {
+        Set<Observation> observations,
+        List<Mark> marks) {
 
     public Evidence {
         Objects.requireNonNull(kind, "kind");
@@ -39,6 +41,42 @@ public record Evidence(
         localDefinitions = List.copyOf(localDefinitions);
         details = java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(details));
         observations = java.util.Collections.unmodifiableSet(new java.util.TreeSet<>(observations));
+        marks = List.copyOf(marks);
+    }
+
+    /**
+     * A member (method, constructor, field, initializer, or class for compiler-generated code) that
+     * contains evidence.
+     *
+     * @param file path relative to the snapshot
+     * @param label member label
+     * @param startLine first line of the declaration (annotations and modifiers included)
+     * @param headerEndLine last line of the declaration header (the line with the body's brace)
+     * @param endLine last line of the member
+     */
+    public record Member(String file, String label, int startLine, int headerEndLine, int endLine) {}
+
+    /** Lines {@code fromLine..toLine} of {@code member} to show; {@code tag} (may be null) annotates {@code fromLine}. */
+    public record Mark(Member member, int fromLine, int toLine, Tag tag) {}
+
+    /** A note attached to a shown source line. */
+    public sealed interface Tag permits Label, Alias {}
+
+    /** A plain note, for example {@code read}, {@code write}, {@code call}. */
+    public record Label(String text) implements Tag {}
+
+    /**
+     * The line uses local {@code variable}, which was given the evidence value at {@code fromLine}.
+     *
+     * @param definite no reassignment can intervene and the assignment runs on every path
+     * @param reassignedAt reassignments that may intervene (on some paths)
+     * @param partial the assignment at {@code fromLine} runs on some paths only
+     */
+    public record Alias(String variable, int fromLine, boolean definite, List<Integer> reassignedAt, boolean partial)
+            implements Tag {
+        public Alias {
+            reassignedAt = List.copyOf(reassignedAt);
+        }
     }
 
     /** {@code file:line:column} of a source position, with the file relative to the run snapshot. */

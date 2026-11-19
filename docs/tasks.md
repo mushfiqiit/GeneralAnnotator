@@ -272,9 +272,119 @@ Real EventBus run: 41 EXTRACTED, 1 SKIPPED (W0033), 0 javac errors.
 Not done: usages from unsafe regions (T12), multi-hop or dispatch-aware
 context (project-spec §6), prompting.
 
+## T11a — Compact, type-relevant context view · `done`
+
+`context/<ID>.txt` is now a compact LLM-facing view, while `context/<ID>.json`
+keeps every detail. The view shows the warning and target declaration once.
+Evidence is grouped by enclosing member, overlapping snippets are merged into
+lines shown once in source order, and lines carry short notes (read, write,
+call, return, alias holds or may hold, annotations the snippet does not show).
+Omitted code is an explicit `...` gap. Empty categories, zero counts,
+descriptions and checker URLs are left out. Initializers, writes, arguments,
+returns, dereferences, annotations, enclosing and early-exit conditions, and
+`synchronized`/`volatile` context are kept. The underlying alias flow was
+fixed: uses after an unconditional reassignment are no longer attributed, and
+uses after a conditional one are `MAY_BE_REASSIGNED`. Evidence is
+deduplicated by location and symbol, and distinct evidence is kept first
+before the limit. CLI, file names, IDs and limitations are unchanged. Code:
+`context.CompactView`, `CompactViewBuilder`, `ContextText`, plus changes to
+`SiteAnalyzer` (alias flow, exit branches, member ranges), `ContextExtractor`
+(marks, dedup, prioritization) and `Evidence` (marks).
+
+Verified by: `CompactViewTest` on `q/Holder.java`, which mirrors W0001. It
+covers both writes, the lazy-initialization chain with null checks and the
+return, the target declaration and each line shown once, sorted rows, explicit
+gaps, unconditional reassignment, branch, partial assignment and loop
+uncertainty, early-exit guards, deduplication by location, annotation notes,
+distinct-first limits and determinism, and URL stripping. Also the updated
+`ContextCommandTest`. EventBus: W0001.txt went from 6091 to 2163 bytes, and
+all 42 .txt files from 230316 to 80250 bytes.
+
 ## T12 — Include usages from unsafe regions · `blocked`
 
 Blocked on project-spec §6.2 (safe/unsafe region definition).
+
+## T13a — LLM prompt units · `done`
+
+`prompts <run directory> [--warning ID]` assembles one prompt unit per
+warning without calling an LLM. The warning (from `warning-graph.json`), its
+target, its Specimin slice files and its compact usage context
+(`context/<ID>.txt`, without its duplicated header; the JSON is only checked)
+are joined by warning ID and verified to belong to the same run. The
+versioned instructions ask for the smallest annotation-only edits and forbid
+suppressions and body changes. They treat the context as read-only evidence
+and slice stubs as reduction artifacts, and require a JSON reply (`warningId`,
+`status` PROPOSED or INSUFFICIENT_EVIDENCE, precisely located `edits`,
+`rationale`, `uncertainty`). Slice reproduction status (`NOT_VALIDATED`) is
+preserved. Missing, failed or mismatched inputs make a warning SKIPPED, and
+units over `GA_PROMPT_MAX_CHARS`/`GA_PROMPT_MAX_FILE_CHARS` are OVERSIZED
+(never truncated). Output is `prompts/<ID>.txt` and `prompts/manifest.json`.
+Code: `prompts.PromptSources`, `PromptAssembler`, `PromptTemplate`,
+`ContextSection`, `PromptLimits`, `PromptManifestJson`, `cli.PromptsCommand`.
+
+Verified by: `PromptsCommandTest` on a run built with real targets and
+context. It covers association and single-warning isolation (no other ID
+appears), a two-file slice in path order and verbatim with an embedded
+"instruction" comment kept as data, the context without its header or JSON,
+the target block, SKIPPED for an unresolved target, a failed slice, missing
+context, missing slice results and removal of stale prompts, rejection of
+artifacts from another run, a slice made for another member and context of
+another warning, OVERSIZED per file and per unit with sizes, invalid limits,
+byte-identical reruns, and manifest merging. Also `MainTest`. EventBus: 41
+GENERATED, 1 SKIPPED (W0033).
+
+## T13b — Wulver inference: submission and GPU worker · `done`
+
+`prepare-inference <run directory> [--warning ID]` turns the GENERATED
+entries of `prompts/manifest.json` into an immutable `inference/<id>/`
+submission. It contains the prompts copied unchanged, `submission.json` (IDs,
+full SHA-256 hashes, slice reproduction copied unchanged, deterministic task
+assignments, excluded entries), `settings.json`, `run_inference.sbatch` (an
+array job with configurable account, partition, QoS, GRES, constraint, time,
+modules and concurrency) and `worker/ga_inference_worker.py`. Batch sizes 1 to
+10 are accepted (41 prompts at 10 per task give 10, 10, 10, 10, 1); anything
+else is rejected. The worker:
+- refuses to load a model outside a Slurm GPU job or on a GPU that is too small;
+- checks the conda environment;
+- runs its own localhost vLLM server with offline weights, handling startup
+  failures, timeouts and port collisions;
+- sends prompts one at a time after a length check;
+- saves raw responses, reasoning, validated answers and metadata atomically;
+- keeps completed results across resubmissions;
+- stops its server on exit and on SIGTERM.
+
+Code: `inference.InferenceSettings`, `TaskAssignment`, `SlurmScript`,
+`SubmissionPreparer`, `cli.PrepareInferenceCommand`, the resource
+`generalannotator/inference/ga_inference_worker.py`, and the Gradle task
+`workerTest`.
+
+Verified by: `PrepareInferenceCommandTest` (41 prompts with defaults, 10 per
+task, invalid batch sizes, single warning, duplicate IDs, unsafe paths, missing,
+edited, mismatched and symlinked prompt files, run and template mismatches, no
+overwrite and no partial leftovers, determinism, settings validation and
+customization, and the keys the worker reads) and `MainTest`. Also
+`workerTest`: 16 Python tests with a fake vLLM server and `nvidia-smi`
+covering answer validation, completed and INSUFFICIENT_EVIDENCE outcomes,
+malformed, truncated, empty and wrong-ID answers, HTTP errors, too-long
+prompts, hash mismatches, the server dying mid-task, startup crash, timeout
+and port collision, fixed busy ports, the login-node and GPU guards, SIGTERM
+cleanup, and resubmission. A manual cross-check ran the worker with the fakes
+on a submission prepared from the EventBus prompts. No GPU job was submitted.
+
+## T13c — Wulver transfer, submission, download and GPU smoke test · `next`
+
+Upload a submission, `sbatch` it from its directory, download `results/`,
+and verify the results against `submission.json`. Not implemented; see
+project-spec §6. Before relying on any results, run a GPU smoke test with one
+or two prompts (`--warning`). It must confirm that:
+- the model loads from the cache offline with vLLM 0.30.0 on the requested
+  GPU type and fits in memory;
+- the served name, the 32768 context and the `qwen3` reasoning parser work,
+  and `/tokenize` and `/version` are available;
+- reasoning arrives in `reasoning_content` or `reasoning`;
+- the sampling and `max_tokens` defaults give complete JSON answers;
+- startup and answer times fit `GA_SLURM_TIME`;
+- `--signal=B:TERM@120` reaches the worker under `exec`.
 
 ## T13 — LLM proposer · `todo`
 

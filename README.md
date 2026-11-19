@@ -14,9 +14,14 @@ Specimin slice per warning, but whether a slice still reproduces its warning is
 **not validated** yet. The `context` command extracts **usage context** for each
 warning's target (call sites, arguments, parameter uses, returns, field reads and
 writes, null checks, annotations) from the run snapshot. The `visualize` command
-renders a saved warning graph with Graphviz. No other pipeline stage (slice
-validation, proposals, LLM calls, editing, graph expansion, search, batching)
-is implemented. See [docs/project-spec.md](docs/project-spec.md) and
+renders a saved warning graph with Graphviz. The `prompts` command assembles
+**one LLM prompt unit per warning** (instructions, the warning, its slice, its
+compact usage context) without calling an LLM. `prepare-inference` turns the
+generated prompts into an immutable **Slurm submission** for NJIT Wulver, with a
+GPU worker that serves the model with vLLM and validates its answers. Uploading,
+submitting and downloading are not implemented yet, and no GPU job has been run.
+No other pipeline stage (slice validation, applying proposals, editing, graph
+expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
 
 ## Requirements
@@ -55,6 +60,8 @@ GA_CHECKER_HOME=/path/to/NullAway ./gradlew integrationTest
                              # real-tool tests: local NullAway on tiny fixtures, real Graphviz
                              # rendering and real Specimin slicing (not part of build/check;
                              # needs GA_CHECKER_HOME, dot, and GA_SPECIMIN_HOME)
+./gradlew workerTest         # the Python inference worker's tests (fake vllm/nvidia-smi;
+                             # needs Python 3.10+, GA_PYTHON selects it; not part of build)
 ./gradlew run --args="help"  # usage
 ```
 
@@ -359,8 +366,9 @@ enclosing member, the relevant expression, a small snippet, and these fields:
   of expression (`NULL_LITERAL`, `PARAMETER`, `LOCAL_VARIABLE`, `FIELD`,
   `METHOD_CALL`, ...) and declared annotations. Also `resultUse`, which says how
   the returned value is consumed: dereferenced, compared with null, assigned
-  (and then the local's later uses in the same member), returned, passed as
-  an argument (callee, parameter and its annotations), discarded, and so on.
+  (and then the local's later uses in the same member, see *local aliases*
+  below), returned, passed as an argument (callee, parameter and its
+  annotations), discarded, and so on.
   For parameter uses and field reads: the same consumption kinds, plus
   `nullGuards`.
 - **`conditions`.** The enclosing `if`, loop, ternary, `&&`/`||`, `case` and
@@ -377,23 +385,62 @@ enclosing member, the relevant expression, a small snippet, and these fields:
 These are observations about the code, not proofs of the right annotation.
 Usages are not filtered by any safe/unsafe region policy.
 
+**Local aliases** (`laterUsesOfLocal`). When the value is stored in a local,
+later uses of that local in the same member are followed conservatively:
+
+- A use is `DEFINITE` only if no reassignment can run in between and the
+  storing assignment runs on every path to the use.
+- A reassignment that runs on every path before the use (a plain statement
+  earlier in a block that contains the use) ends attribution. Such uses are
+  not listed, only counted in `afterReassignment`.
+- A use is `MAY_BE_REASSIGNED` when a reassignment runs on some paths only
+  (inside a branch, or later in an enclosing loop), listed in `reassignedAt`,
+  or when the storing assignment itself runs on some paths only
+  (`assignedOnSomePathsOnly`, with the local's `declaredAt` line).
+- Exceptions and labeled jumps are ignored.
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `GA_CONTEXT_MAX_ITEMS` | 20 | Evidence items kept per category; the rest are counted in `omitted` |
+| `GA_CONTEXT_MAX_ITEMS` | 20 | Evidence items kept per category; the rest are counted in `omitted`. Distinct evidence is kept first (round robin over kind, how the value is used, and observations), then shown in source order |
 | `GA_CONTEXT_MAX_SNIPPET_LINES` | 6 | Lines kept per snippet (a window around the site); cut lines are counted in `omittedLines` |
 | `GA_CONTEXT_MAX_CONDITIONS` | 4 | Enclosing conditions kept per item; the rest are counted in `omittedConditions` |
 | `GA_CONTEXT_MAX_LOCAL_USES` | 5 | Later uses of a local that stores the value; the rest are counted in `omitted` |
 
-Evidence is deduplicated and sorted by file, offset and kind, so repeated runs
-give identical files. Output (regenerated on every run):
+Evidence is deduplicated by kind, source location and symbol (not by text)
+and ordered deterministically, so repeated runs give identical files. Output
+(regenerated on every run):
 
 ```
-context/<ID>.json   schemaVersion 1: warning, target identity (declaration, modifiers,
-                    annotations, parameters), references summary, evidence by category
-                    (total, omitted, items), limitations, limits, analysis (files, classpath,
-                    javac options, compiler errors)
-context/<ID>.txt    the same content, readable
+context/<ID>.json   full extraction details, schemaVersion 1: warning, target identity
+                    (declaration, modifiers, annotations, parameters), references summary,
+                    evidence by category (total, omitted, items with all fields above),
+                    limitations, limits, analysis (files, classpath, javac options, errors)
+context/<ID>.txt    compact view for an LLM or a reader (below)
 ```
+
+The `.txt` file is the **compact view**. It contains:
+
+- The warning once, without checker documentation URLs, and the target
+  declaration once.
+- `Found:` counts; `Shown:` truncation, `Excluded:` same-name references to
+  other symbols and unresolved references only when non-zero.
+- One block per enclosing member, in file and line order. A block has the
+  member's header, then every relevant source line **once, in source order**:
+  evidence statements, enclosing conditions, early-exit branches of null
+  checks and guards, local definitions, and alias uses. Overlapping snippets
+  of several evidence items are merged.
+- Short `//` notes on the lines: `read`, `write`, `call`, `return`,
+  `param x`, `warning`, `reassigns h`, `h holds the value from line 7`,
+  `h may hold the value from line 7 or 10 (reassigned at 10, 12 on some
+  paths)`. There are also notes for annotations the snippet does not show,
+  such as a callee parameter's `@Nullable`. For class files, only
+  nullness-named and type-use annotations are reported.
+- Omitted code as an explicit `...  // N lines omitted` row. Lines made only
+  of closing brackets are shown rather than elided, and nothing is invented.
+- Run-specific limitations, and one line for the standard ones.
+
+The compact view is built only from the kept evidence. It is not a minimal or
+sound slice.
 
 javac errors during attribution, such as a missing classpath, don't stop the
 command. They are recorded in `analysis.compilerErrors` and in the
@@ -408,12 +455,301 @@ run's `report.json` carries the classpath.
 | 3 | No attribution possible, or a target member was not found in the snapshot (`FAILED`) |
 | 4 | Internal error, including failure to write the files |
 
-Example (EventBus, W0020, the method `PendingPostQueue#poll()`): `callSites` lists
-`AsyncPoster.run()` storing `queue.poll()` in `pendingPost`, followed by
-`if (pendingPost == null)` and `eventBus.invokeSubscriber(pendingPost)`, guarded
-by an `EARLY_EXIT`. It also lists `BackgroundPoster.run()` and `poll(int)`, which
-returns the value. `returnStatements` shows `return pendingPost;`, with the local
-definition `PendingPost pendingPost = head;`.
+Example (EventBus W0001, the field `EventBus#defaultInstance`, `context/W0001.txt`, abridged):
+
+```
+W0001  NullAway ERROR  EventBus/src/org/greenrobot/eventbus/EventBus.java:46:30
+@NonNull static field 'defaultInstance' not initialized
+
+Target: FIELD org.greenrobot.eventbus.EventBus#defaultInstance  (EventBus/src/org/greenrobot/eventbus/EventBus.java)
+  46  static volatile EventBus defaultInstance;  // warning
+Found: 2 writes, 4 reads
+
+EventBus/src/org/greenrobot/eventbus/EventBus.java  org.greenrobot.eventbus.EventBus#getDefault()
+  82  public static EventBus getDefault() {
+  83      EventBus instance = defaultInstance;  // read
+  84      if (instance == null) {  // instance holds the value from line 83
+  85          synchronized (EventBus.class) {
+  86              instance = EventBus.defaultInstance;  // read; reassigns instance
+  87              if (instance == null) {  // instance holds the value from line 86
+  88                  instance = EventBus.defaultInstance = new EventBus();  // write; reassigns instance
+  89              }
+  90          }
+  91      }
+  92      return instance;  // instance may hold the value from line 83 or 86 (reassigned at 86, 88 on some paths; line 86 runs on some paths only)
+  93  }
+
+EventBus/src/org/greenrobot/eventbus/EventBusBuilder.java  org.greenrobot.eventbus.EventBusBuilder#installDefaultEventBus()
+  177  public EventBus installDefaultEventBus() {
+  178      synchronized (EventBus.class) {
+  179          if (EventBus.defaultInstance != null) {  // read
+  180              throw new EventBusException("Default instance already exists." +
+  ...
+  183          EventBus.defaultInstance = build();  // write
+  184          return EventBus.defaultInstance;  // read
+```
+
+## Assembling LLM prompt units (`prompts`)
+
+```sh
+./gradlew run --args="prompts runs/<run id>"                   # all warnings
+./gradlew run --args="prompts runs/<run id> --warning W0001"   # only one warning
+```
+
+`prompts` assembles **one prompt unit per warning** from artifacts that earlier
+commands already wrote. It doesn't call an LLM, rerun the checker, Specimin or
+context extraction, or change any source. Run `check` (or `targets`), `slice`
+and `context` first.
+
+The inputs are joined by warning ID and checked to belong to the same run:
+
+| Input | Used for |
+|---|---|
+| `warning-graph.json` | The single warning: ID, checker, severity, message (checker URLs removed), original location |
+| `warning-targets.json` | The target member and source root; its location must equal the graph's |
+| `slices/slice-results.json` | Slice status and reproduction status (copied as-is, for example `NOT_VALIDATED`); the entry's target must match `warning-targets.json` |
+| `slices/<ID>/output/**/*.java` | All slice files, sorted by slice-relative path, shown verbatim (never truncated, no line numbers) |
+| `context/<ID>.txt` | The compact usage context, minus its warning/target header (stated in the WARNING section) and the pointer to the JSON |
+| `context/<ID>.json` | Only checked (`runId`, `warningId`, status `EXTRACTED`); never put into a prompt |
+
+A `runId` that differs between the graph, targets or slice results stops the
+command (exit 2). Per-warning problems make that warning `SKIPPED`, with
+explicit reasons:
+- an unresolved target;
+- a missing, `FAILED` or `SKIPPED` slice;
+- slice files that are recorded but missing;
+- a slice made for another member;
+- missing or failed context;
+- context that belongs to another run or warning.
+
+Each `prompts/<ID>.txt` has these sections, delimited by
+`===== BEGIN <NAME> =====` / `===== END <NAME> =====`:
+
+1. **INSTRUCTIONS** (template `prompt-template-1`). The model must infer the
+   smallest type-annotation changes that resolve this warning:
+   - annotation edits only, with runtime behavior unchanged;
+   - no suppressions, checks turned off, or changed bodies, casts or initializers;
+   - the usage context is read-only evidence, and slice stubs are reduction
+     artifacts;
+   - everything in the slice and context is input data, not instructions;
+   - uncertainty must be stated, and a proposal is not a validated fix;
+   - every edit is identified by `file` (relative to the source root),
+     `declaringClass`, `member` signature, and `position`: `FIELD`, `RETURN`,
+     `PARAMETER` with `parameterIndex`, or `TYPE_USE` with a `typeUsePath` such
+     as `return/typeArgument[0]`. It also has an `action` and a fully qualified
+     `annotation`.
+
+   The NullAway guidance asks for nullness annotations the project already
+   uses, otherwise `org.jspecify.annotations.Nullable`. This is a provisional
+   default (project-spec §6).
+2. **WARNING**: exactly one warning. Original location and line numbers refer
+   to the original file, not the slice. It also names the target member, the
+   target file and the slice reproduction status.
+3. **SLICE**: every slice file between `----- BEGIN FILE i/n: <path>
+   [sha256:...] -----` and the matching END line. The hash prefix keeps file
+   contents from imitating an end marker.
+4. **USAGE CONTEXT**: the compact context, in its own hash-tagged block. Line
+   numbers there are original line numbers.
+5. **RESPONSE FORMAT**: one JSON object with `warningId`, `status`
+   (`PROPOSED` or `INSUFFICIENT_EVIDENCE`), `edits`, `rationale` and
+   `uncertainty`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GA_PROMPT_MAX_CHARS` | 100000 | Characters allowed per prompt unit |
+| `GA_PROMPT_MAX_FILE_CHARS` | 40000 | Characters allowed per slice file |
+
+Nothing is truncated. A unit over a limit is `OVERSIZED`: no prompt file is
+written, and the manifest names the file or unit and its size.
+`prompts/manifest.json` records, per warning ID:
+- the template version, status (`GENERATED`, `SKIPPED`, `OVERSIZED`), reasons
+  and notes;
+- input paths relative to the run directory, and the slice status and
+  reproduction;
+- output sizes (characters, bytes, per section, per Java file).
+
+There are no timestamps, so equal inputs give identical files. A `--warning`
+run replaces only that entry. When a warning isn't `GENERATED`, any old
+`prompts/<ID>.txt` for it is deleted, so no stale prompt is left behind.
+
+| Exit | `prompts` meaning |
+|---|---|
+| 0 | Manifest written (`SKIPPED` and `OVERSIZED` entries allowed) |
+| 2 | Invalid argument or limit, missing graph or targets, artifacts from different runs, an unsupported checker, or an unknown warning; nothing written |
+| 4 | Internal error, including failure to write |
+
+On EventBus: 41 units are `GENERATED` (6.9 to 14.4 thousand characters). W0033
+is `SKIPPED` because its target is an initializer block.
+
+## Preparing Wulver inference (`prepare-inference`)
+
+```sh
+./gradlew run --args="prepare-inference runs/<run id>"                   # all GENERATED prompts
+./gradlew run --args="prepare-inference runs/<run id> --warning W0001"   # one prompt
+GA_INFERENCE_PROMPTS_PER_TASK=10 ./gradlew run --args="prepare-inference runs/<run id>"
+```
+
+This is the first half of the inference stage. It prepares an **immutable
+submission directory** and the GPU worker that will run inside Slurm. It does
+not upload anything, submit a job, download results or load a model; those
+steps aren't implemented yet. Run `prompts` first.
+
+`prepare-inference` reads `prompts/manifest.json` and takes only `GENERATED`
+entries. On EventBus that is 41 of 42 (W0033 is listed under `excluded`).
+
+It validates:
+- the manifest structure, and that its `runId` equals the warning graph's;
+- unique, well-formed warning IDs (`W0001`, ...);
+- each `output.file` is exactly `prompts/<ID>.txt`, and the file is a regular
+  file inside `prompts/` (not a symlink out of it);
+- each file's size matches the manifest, and its header names the same run
+  and warning;
+- the template version is supported.
+
+Any problem stops it (exit 2) before anything is written. It writes
+`inference/<UTC timestamp>-inference/`:
+
+```
+submission.json        submission and run IDs, checker, source manifest SHA-256, and per prompt:
+                       warningId, file, full SHA-256, bytes, templateVersion, slice status and
+                       reproduction (copied unchanged, e.g. NOT_VALIDATED), taskIndex; the task
+                       assignments; excluded (non-GENERATED) entries with reasons; hashes of
+                       settings.json, the worker and the batch script
+settings.json          model, sampling, server limits, environment and Slurm settings (below)
+prompts/<ID>.txt       the prompt files, byte for byte
+run_inference.sbatch   Slurm array job, one task per assignment group
+worker/ga_inference_worker.py   the GPU worker (standard-library Python 3.10+)
+logs/                  empty; Slurm writes %x.%A_%a.out/.err here
+```
+
+The directory is built under a temporary name and renamed when complete. Its
+files are then read-only, and an existing submission is never overwritten.
+
+**Task assignment.** Prompts are sorted by warning number and cut into
+consecutive groups of `GA_INFERENCE_PROMPTS_PER_TASK`. The default is 1, the
+allowed range is 1 to 10, and anything else is rejected. 41 prompts with batch
+size 10 give tasks of 10, 10, 10, 10 and 1. Every prompt is still its own
+request. `GA_INFERENCE_ARRAY_CONCURRENCY` (default 4) is the separate `%N`
+throttle of `--array=0-<n-1>%N`.
+
+**Batch script.** Each array task:
+- refuses to run outside `sbatch` or from another directory, so submit it from
+  the submission directory;
+- runs `module purge`, loads the configured modules, and activates the conda
+  environment;
+- sets `HF_HOME`, `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so weights
+  come from the cache and nothing is downloaded or installed;
+- `exec`s the worker for `$SLURM_ARRAY_TASK_ID`.
+
+`--signal=B:TERM@120` gives the worker time to stop its server before the
+time limit.
+
+**Worker** (inside the GPU allocation, never on a login node):
+1. It refuses to start a model without `SLURM_JOB_ID`, with an empty
+   `CUDA_VISIBLE_DEVICES` or without `nvidia-smi`, or when an allocated GPU has
+   less than `GA_INFERENCE_MIN_GPU_MEMORY_MIB`. It checks that the configured
+   conda environment is the active one and that `HF_HOME` exists.
+2. It starts its own `vllm serve <model> --host 127.0.0.1 --port <free port>
+   --served-model-name ... --max-model-len ... [--reasoning-parser ...]`. Before
+   starting, it checks that the port is free. A collision ("Address already in
+   use") is retried on another port, a fixed `GA_INFERENCE_PORT` is never
+   shared, and `/v1/models` must list the served name.
+3. It waits for `/health` up to the startup timeout. If the server exits or
+   never becomes healthy, the end of its log is recorded.
+4. It runs the task's prompts one after another. Before sending a prompt it
+   counts its tokens with `/tokenize`. A prompt that would leave fewer than
+   `GA_INFERENCE_MAX_TOKENS` (or `GA_INFERENCE_MIN_COMPLETION_TOKENS`) answer
+   tokens is `PROMPT_TOO_LONG` and is not sent. Prompts are never truncated.
+5. It stops its server (process group: SIGTERM, then SIGKILL) on exit,
+   including on `scancel` and at the time limit.
+
+**Results** (on the cluster, under the submission directory):
+
+```
+results/<ID>/attempt-NNN/raw-response.json   the complete API response (raw-response.txt if not JSON)
+results/<ID>/attempt-NNN/reasoning.txt       reasoning, when the server returns it (or inline <think>)
+results/<ID>/attempt-NNN/answer.json         the validated answer
+results/<ID>/attempt-NNN/metadata.json       this attempt's metadata
+results/<ID>/result.json                     the decisive attempt (written last, atomically)
+results/tasks/task-NNNN.json                 per task: node, GPUs, server port/startup/version, statuses
+results/logs/task-NNNN/vllm-attempt-K.log    the server log
+```
+
+Metadata records:
+- the prompt's SHA-256 (rechecked before sending), the template version, and
+  the slice status and reproduction, unchanged;
+- the model and sampling settings, the request parameters, timing, token
+  usage and finish reason;
+- the status, error kind and message, and validation errors.
+
+Answers are checked against the `prompt-template-1` format:
+- one JSON object (one ```json fence is tolerated, surrounding prose is not);
+- the matching `warningId`;
+- `status` is `PROPOSED` (at least one edit) or `INSUFFICIENT_EVIDENCE` (no
+  edits);
+- each edit has a relative `.java` file, a declaring class and member, a
+  position kind with `parameterIndex` or a `typeUsePath` in the template
+  grammar, `ADD`/`REMOVE`, and a fully qualified annotation;
+- `rationale` and `uncertainty` are present.
+
+The statuses are `COMPLETED_PROPOSED`, `COMPLETED_INSUFFICIENT_EVIDENCE` (a
+completed outcome), or `FAILED`. A failure has one of these error kinds:
+`MALFORMED_ANSWER`, `INVALID_ANSWER`, `WRONG_WARNING_ID`, `EMPTY_ANSWER`,
+`TRUNCATED` (`finish_reason=length`), `HTTP_ERROR`, `TIMEOUT`,
+`PROMPT_TOO_LONG`, `PROMPT_HASH_MISMATCH`, `SERVER_UNAVAILABLE`,
+`STARTUP_FAILED`, `STARTUP_TIMEOUT`, `PORT_IN_USE`, `NOT_IN_SLURM_JOB`,
+`NO_GPU`, `GPU_TOO_SMALL`, `ENVIRONMENT_ERROR` or `TERMINATED`.
+
+A failed request doesn't touch other prompts' results. A resubmitted task
+keeps completed results with the same prompt hash, without sending them again,
+and retries the rest as a new attempt. When nothing is left, it starts no
+server. A result is a proposal: it is not checker-validated and doesn't mean
+the warning is resolved.
+
+Worker exit codes: 0 all assigned prompts completed, 2 invalid submission or
+task, 3 some prompts failed, 4 the server never ran (node, environment or
+startup failure).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GA_SLURM_ACCOUNT` / `_PARTITION` / `_QOS` | `mjk76` / `gpu` / `standard` | Slurm account, partition, QoS |
+| `GA_SLURM_GRES` | `gpu:1` | GPU request, `gpu[:type]:count` |
+| `GA_SLURM_CONSTRAINT`, `GA_SLURM_MEM` | unset | optional node constraint and memory |
+| `GA_SLURM_CPUS_PER_TASK` | 8 | CPUs per array task |
+| `GA_SLURM_TIME` | `02:00:00` | time limit per array task (startup plus its prompts) |
+| `GA_SLURM_SIGNAL_SECONDS` | 120 | SIGTERM this long before the time limit (0 disables) |
+| `GA_SLURM_JOB_NAME` | `ga-inference` | job name |
+| `GA_SLURM_MODULES` | `wulver Miniforge3` | modules loaded before activation |
+| `GA_INFERENCE_PROMPTS_PER_TASK` | 1 | prompts per array task, 1 to 10 |
+| `GA_INFERENCE_ARRAY_CONCURRENCY` | 4 | array tasks running at once |
+| `GA_INFERENCE_CONDA_ENV` | `/project/mjk76/mc2399/envs/llm` | conda environment (Python 3.11.16, vLLM 0.30.0 observed) |
+| `GA_INFERENCE_HF_HOME` | `/project/mjk76/mc2399/hf_cache` | Hugging Face cache, used offline |
+| `GA_INFERENCE_MODEL` | `Qwen/Qwen3.8-27B` | cached model |
+| `GA_INFERENCE_SERVED_MODEL_NAME` | `qwen3.8-27b` | served name |
+| `GA_INFERENCE_MAX_MODEL_LEN` | 32768 | context length (prompt + answer) |
+| `GA_INFERENCE_REASONING_PARSER` | `qwen3` | vLLM reasoning parser, or `none` |
+| `GA_INFERENCE_VLLM_ARGS` | empty | extra `vllm serve` arguments, for example `--gpu-memory-utilization 0.92`; host, port, model name, context length and parser are reserved |
+| `GA_INFERENCE_TEMPERATURE` / `_TOP_P` / `_TOP_K` / `_SEED` | 0.6 / 0.95 / 20 / 0 | sampling; `TOP_K=0` doesn't send it |
+| `GA_INFERENCE_MAX_TOKENS` | 0 | `max_tokens` per answer; 0 leaves the rest of the context |
+| `GA_INFERENCE_MIN_COMPLETION_TOKENS` | 4096 | answer tokens a prompt must leave free when `MAX_TOKENS` is 0 |
+| `GA_INFERENCE_PORT` / `_PORT_ATTEMPTS` | 0 / 3 | fixed port (0 picks a free one) and start attempts |
+| `GA_INFERENCE_STARTUP_TIMEOUT_SECONDS` | 1200 | wait for `/health` |
+| `GA_INFERENCE_HEALTH_POLL_SECONDS` | 5 | polling interval |
+| `GA_INFERENCE_REQUEST_TIMEOUT_SECONDS` | 2700 | one request |
+| `GA_INFERENCE_STOP_TIMEOUT_SECONDS` | 30 | grace period when stopping the server |
+| `GA_INFERENCE_MIN_GPU_MEMORY_MIB` | 70000 | refuse smaller GPUs (27B bf16 weights alone need about 54 GB) |
+
+Values used in the batch script are limited to safe characters. Not yet
+verified on a GPU: the model, served name, 32768 context, `qwen3` parser,
+sampling defaults, memory threshold and time limit all come from the
+historical Specimin scripts and the Qwen3 model card. A GPU smoke test is still
+needed (see docs/tasks.md, T13c).
+
+| Exit | `prepare-inference` meaning |
+|---|---|
+| 0 | Submission prepared |
+| 2 | Invalid argument or setting, invalid or inconsistent manifest or prompt file, or an existing submission directory; nothing written |
+| 4 | Internal error |
 
 ## How the local NullAway checkout is used
 
@@ -478,6 +814,8 @@ warning-graph.json             initial warning graph (only for a completed analy
 warning-targets.json           Specimin target member per warning ID (only with a graph)
 slices/                        written later by `slice` (not by `check`)
 context/                       written later by `context` (not by `check`)
+prompts/                       written later by `prompts`: <ID>.txt and manifest.json
+inference/<submission id>/     written later by `prepare-inference` (immutable submission)
 warning-graph.dot / .svg       written later by `visualize` (not by `check`)
 report.json                    machine-readable report (below)
 logs/<purpose>.stdout.txt      raw stdout of every external command
@@ -634,6 +972,10 @@ src/main/java/generalannotator/
   targets/      Specimin target-member extraction (JDK syntax trees; Specimin is not run)
   slicing/      Slicer interface, Specimin setup and invocation, slice-results.json
   context/      usage-context extraction (javac-attributed snapshot, symbol-based matching)
+  prompts/      prompt-unit assembly: artifact join, template, manifest (no LLM calls)
+  inference/    inference submissions: settings, task assignment, Slurm script (no upload)
+src/main/resources/generalannotator/inference/ga_inference_worker.py   the GPU worker
+src/test/python                   worker tests and fakes (./gradlew workerTest)
 src/main/resources/generalannotator/checker/nullaway/processor-path.init.gradle
 src/test/java                     deterministic unit tests (./gradlew test)
 src/integrationTest/java          real-tool tests (./gradlew integrationTest)

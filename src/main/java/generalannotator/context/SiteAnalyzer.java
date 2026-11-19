@@ -221,7 +221,12 @@ final class SiteAnalyzer {
             out.remove("");
             return List.copyOf(out);
         }
-        e.getAnnotationMirrors().forEach(a -> out.add(a.toString()));
+        // Class files: only nullness-named declaration annotations (Nullable, NonNull, CheckForNull, NullMarked,
+        // ...) and type-use annotations; JVM-internal markers such as @IntrinsicCandidate are not type evidence.
+        e.getAnnotationMirrors().stream()
+                .filter(a -> a.getAnnotationType().asElement().getSimpleName().toString()
+                        .toLowerCase(java.util.Locale.ROOT).contains("null"))
+                .forEach(a -> out.add(a.toString()));
         TypeMirror type = e instanceof ExecutableElement ee ? ee.getReturnType() : e.asType();
         if (type != null) {
             type.getAnnotationMirrors().forEach(a -> out.add(a.toString()));
@@ -579,7 +584,12 @@ final class SiteAnalyzer {
         Tree s = stmt.getLeaf();
         if (s instanceof IfTree t && t.getElseStatement() == null && exits(t.getThenStatement())
                 && nonNullWhen(child(stmt, t.getCondition()), var, false)) {
-            return Optional.of(guard("EARLY_EXIT", stmt, t.getCondition()));
+            Map<String, Object> g = guard("EARLY_EXIT", stmt, t.getCondition());
+            int[] exit = lines(stmt.getCompilationUnit(), t.getThenStatement());
+            if (exit != null) {
+                g.put("exitLines", List.of(exit[0], exit[1]));
+            }
+            return Optional.of(g);
         }
         if (s instanceof AssertTree a && nonNullWhen(child(stmt, a.getCondition()), var, true)) {
             return Optional.of(guard("ASSERTION", stmt, a.getCondition()));
@@ -822,7 +832,18 @@ final class SiteAnalyzer {
         m.put("parameterAnnotations", annotations(param));
     }
 
-    /** Later uses of local {@code variable} after {@code after} within the same member, classified (no further hops). */
+    /**
+     * Later uses of local {@code variable} after the assignment {@code at} (ending at {@code after})
+     * within the same member, classified without further hops.
+     *
+     * <p>Alias flow is tracked textually and conservatively. A use is attributed to the stored value
+     * ({@code DEFINITE}) only if no reassignment can run between the assignment and the use, and the
+     * assignment itself runs on every path to the use. A reassignment that runs on every path before
+     * the use ends attribution: the use is not reported, only counted in {@code afterReassignment}.
+     * A reassignment on some paths only (a branch, or a loop back edge), or an assignment that runs
+     * on some paths only, makes the use {@code MAY_BE_REASSIGNED} with the lines responsible.
+     * Exceptions and labeled jumps are ignored.
+     */
     private void localUses(TreePath at, Element variable, long after, Map<String, Object> m) {
         if (variable == null || !(variable.getKind() == ElementKind.LOCAL_VARIABLE
                 || variable.getKind() == ElementKind.RESOURCE_VARIABLE)) {
@@ -833,41 +854,234 @@ final class SiteAnalyzer {
             return;
         }
         List<TreePath> uses = new ArrayList<>();
+        List<TreePath> reassignments = new ArrayList<>();
         new TreePathScanner<Void, Void>() {
             @Override
             public Void visitIdentifier(IdentifierTree node, Void unused) {
-                long s = model.start(getCurrentPath().getCompilationUnit(), node);
-                if (s >= after && variable.equals(element(getCurrentPath()))) {
-                    uses.add(getCurrentPath());
+                TreePath path = getCurrentPath();
+                if (variable.equals(element(path))) {
+                    Tree parent = path.getParentPath().getLeaf();
+                    boolean written = (parent instanceof AssignmentTree a && a.getVariable() == node)
+                            || (parent instanceof CompoundAssignmentTree ca && ca.getVariable() == node)
+                            || (parent instanceof UnaryTree u && isIncrement(u));
+                    if (written) {
+                        reassignments.add(path.getParentPath());
+                    }
+                    boolean pureWrite = parent instanceof AssignmentTree a && a.getVariable() == node;
+                    if (!pureWrite && model.start(path.getCompilationUnit(), node) >= after) {
+                        uses.add(path);
+                    }
                 }
                 return null;
             }
         }.scan(scope, null);
-        List<Map<String, Object>> described = new ArrayList<>();
-        for (TreePath use : uses.subList(0, Math.min(uses.size(), limits.maxLocalUses()))) {
-            Map<String, Object> u = new LinkedHashMap<>();
-            u.put("line", ref(use).line());
-            Set<Observation> ignored = new LinkedHashSet<>();
-            Tree parent = use.getParentPath().getLeaf();
-            if (parent instanceof AssignmentTree a && a.getVariable() == use.getLeaf()) {
-                u.put("use", Map.of("kind", "REASSIGNED"));
-            } else {
-                u.put("use", consumption(use, ignored, false));
+        CompilationUnitTree cu = at.getCompilationUnit();
+        boolean declaration = at.getLeaf() instanceof VariableTree;
+        List<Integer> reassignedLines = new ArrayList<>();
+        for (TreePath r : reassignments) {
+            if (model.start(cu, r.getLeaf()) >= after) {
+                reassignedLines.add(ref(r).line());
+            }
+        }
+        List<Map<String, Object>> attributed = new ArrayList<>();
+        int afterReassignment = 0;
+        for (TreePath use : uses) {
+            long u = model.start(cu, use.getLeaf());
+            List<Integer> uncertain = new ArrayList<>();
+            boolean killed = false;
+            for (TreePath r : reassignments) {
+                long rs = model.start(cu, r.getLeaf());
+                long re = model.end(cu, r.getLeaf());
+                if (rs >= after && re <= u) {
+                    if (mustPrecede(r, use)) {
+                        killed = true;
+                        break;
+                    }
+                    uncertain.add(ref(r).line());
+                } else if (rs > u && inSameLoop(r, use)) {
+                    uncertain.add(ref(r).line()); // may flow back to the use on a later iteration
+                }
+            }
+            if (killed) {
+                afterReassignment++;
+                continue;
+            }
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("line", ref(use).line());
+            boolean partial = !declaration && !mustPrecede(at, use);
+            entry.put("flow", uncertain.isEmpty() && !partial ? "DEFINITE" : "MAY_BE_REASSIGNED");
+            if (!uncertain.isEmpty()) {
+                entry.put("reassignedAt", uncertain.stream().distinct().sorted().toList());
+            }
+            if (partial) {
+                entry.put("assignedOnSomePathsOnly", true);
+            }
+            Map<String, Object> consumed = consumption(use, new LinkedHashSet<>(), false);
+            entry.put("use", consumed);
+            int[] exit = "NULL_COMPARISON".equals(consumed.get("kind")) ? exitBranchLines(use) : null;
+            if (exit != null) {
+                entry.put("exitLines", List.of(exit[0], exit[1]));
             }
             List<Map<String, Object>> guards = nullGuards(use, new VarRef(variable, ""));
             if (!guards.isEmpty()) {
-                u.put("nullGuards", guards);
+                entry.put("nullGuards", guards);
             }
-            Snippet s = snippet(use);
-            u.put("statement", s == null ? "" : collapse(String.join(" ", s.lines())));
-            described.add(u);
+            Snippet sn = snippet(use);
+            entry.put("statement", sn == null ? "" : collapse(String.join(" ", sn.lines())));
+            attributed.add(entry);
         }
+        List<Map<String, Object>> kept = attributed.subList(0, Math.min(attributed.size(), limits.maxLocalUses()));
         Map<String, Object> local = new LinkedHashMap<>();
         local.put("variable", variable.getSimpleName().toString());
-        local.put("total", uses.size());
-        local.put("omitted", uses.size() - described.size());
-        local.put("uses", described);
+        local.put("total", attributed.size());
+        local.put("omitted", attributed.size() - kept.size());
+        local.put("afterReassignment", afterReassignment);
+        if (!declaration) {
+            model.declaration(variable).ifPresent(d -> local.put("declaredAt", ref(d).line()));
+        }
+        local.put("reassignedAt", reassignedLines.stream().distinct().sorted().toList());
+        local.put("uses", List.copyOf(kept));
         m.put("laterUsesOfLocal", local);
+    }
+
+    private static boolean isIncrement(UnaryTree u) {
+        return switch (u.getKind()) {
+            case PREFIX_INCREMENT, PREFIX_DECREMENT, POSTFIX_INCREMENT, POSTFIX_DECREMENT -> true;
+            default -> false;
+        };
+    }
+
+    /**
+     * Whether {@code first} (an assignment or declaration) runs on every path that reaches {@code
+     * later}: both lie in one block, {@code first}'s statement comes earlier in that block, and
+     * within its statement {@code first} is not under a branch, loop, lambda or short-circuit
+     * operator. Conservative: false whenever this cannot be shown.
+     */
+    boolean mustPrecede(TreePath first, TreePath later) {
+        List<Tree> laterChain = new ArrayList<>();
+        for (TreePath p = later; p != null; p = p.getParentPath()) {
+            laterChain.add(p.getLeaf());
+        }
+        TreePath child = first;
+        for (TreePath p = first.getParentPath(); p != null; child = p, p = p.getParentPath()) {
+            Tree leaf = p.getLeaf();
+            if (leaf instanceof MethodTree || leaf instanceof ClassTree || leaf instanceof LambdaExpressionTree) {
+                return false;
+            }
+            if (leaf instanceof BlockTree block && laterChain.contains(leaf)) {
+                Tree firstStatement = child.getLeaf();
+                Tree laterStatement = null;
+                for (int i = laterChain.indexOf(leaf) - 1; i >= 0; i--) {
+                    if (block.getStatements().contains(laterChain.get(i))) {
+                        laterStatement = laterChain.get(i);
+                        break;
+                    }
+                }
+                List<? extends StatementTree> statements = block.getStatements();
+                return laterStatement != null && firstStatement != laterStatement
+                        && statements.indexOf(firstStatement) >= 0
+                        && statements.indexOf(firstStatement) < statements.indexOf(laterStatement)
+                        && unconditionalWithin(first, child);
+            }
+        }
+        return false;
+    }
+
+    /** Whether {@code inner} runs whenever statement {@code statement} (an ancestor path) runs. */
+    private static boolean unconditionalWithin(TreePath inner, TreePath statement) {
+        for (TreePath p = inner; p != null && p != statement; p = p.getParentPath()) {
+            Tree parent = p.getParentPath() == null ? null : p.getParentPath().getLeaf();
+            boolean ok = parent instanceof ExpressionStatementTree || parent instanceof VariableTree
+                    || parent instanceof AssignmentTree || parent instanceof ParenthesizedTree
+                    || (parent instanceof MethodInvocationTree mi && mi.getArguments().contains(p.getLeaf()));
+            if (!ok) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Whether a loop inside the member encloses both paths. */
+    private static boolean inSameLoop(TreePath a, TreePath b) {
+        List<Tree> bChain = new ArrayList<>();
+        for (TreePath p = b; p != null; p = p.getParentPath()) {
+            bChain.add(p.getLeaf());
+        }
+        for (TreePath p = a; p != null; p = p.getParentPath()) {
+            Tree leaf = p.getLeaf();
+            if (leaf instanceof MethodTree || leaf instanceof ClassTree || leaf instanceof LambdaExpressionTree) {
+                return false;
+            }
+            boolean loop = leaf instanceof WhileLoopTree || leaf instanceof DoWhileLoopTree
+                    || leaf instanceof ForLoopTree || leaf instanceof EnhancedForLoopTree;
+            if (loop && bChain.contains(leaf)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Lines {start, end} of the then-branch when {@code site} is (part of) the condition of an
+     * {@code if} whose then-branch always exits (return, throw, break, continue), else null.
+     */
+    int[] exitBranchLines(TreePath site) {
+        TreePath p = site;
+        while (p.getParentPath() != null && (p.getParentPath().getLeaf() instanceof ParenthesizedTree
+                || p.getParentPath().getLeaf() instanceof BinaryTree
+                || p.getParentPath().getLeaf() instanceof UnaryTree)) {
+            p = p.getParentPath();
+        }
+        TreePath parent = p.getParentPath();
+        if (parent != null && parent.getLeaf() instanceof IfTree t && t.getCondition() == p.getLeaf()
+                && exits(t.getThenStatement())) {
+            return lines(parent.getCompilationUnit(), t.getThenStatement());
+        }
+        return null;
+    }
+
+    /**
+     * The member containing {@code site} with its line range: the nearest method, field or
+     * initializer block of a class, or the class itself for compiler-generated members.
+     */
+    Evidence.Member member(TreePath site) {
+        for (TreePath p = site; p != null; p = p.getParentPath()) {
+            Tree leaf = p.getLeaf();
+            TreePath parent = p.getParentPath();
+            boolean isMember = leaf instanceof MethodTree || leaf instanceof ClassTree
+                    || (parent != null && parent.getLeaf() instanceof ClassTree
+                            && (leaf instanceof VariableTree || leaf instanceof BlockTree));
+            if (!isMember) {
+                continue;
+            }
+            CompilationUnitTree cu = p.getCompilationUnit();
+            int[] range = lines(cu, leaf);
+            if (range == null) {
+                continue; // compiler-generated; use the enclosing class
+            }
+            // Header: a method through its body's opening brace, a field's whole declaration, else the first line.
+            int headerEnd = range[0];
+            if (leaf instanceof MethodTree m) {
+                int[] body = m.getBody() == null ? null : lines(cu, m.getBody());
+                headerEnd = m.getBody() == null ? range[1] : body == null ? range[0] : body[0];
+            } else if (leaf instanceof VariableTree) {
+                headerEnd = range[1];
+            }
+            return new Evidence.Member(model.unit(cu).relativePath(), enclosingMember(p), range[0], headerEnd,
+                    range[1]);
+        }
+        return null;
+    }
+
+    /** Lines {start, end} of a tree, or null without positions. */
+    int[] lines(CompilationUnitTree cu, Tree tree) {
+        long s = model.start(cu, tree);
+        long e = model.end(cu, tree);
+        if (s < 0 || e <= s) {
+            return null;
+        }
+        SourceModel.Unit unit = model.unit(cu);
+        return new int[] {unit.line(s), unit.line(e - 1)};
     }
 
     /** The body of the nearest enclosing method, lambda, initializer block or field initializer. */

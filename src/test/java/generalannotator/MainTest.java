@@ -49,6 +49,27 @@ class MainTest {
     }
 
     @Test
+    void promptsCommandIsDispatchedAndValidatesItsArguments() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "prompts", "no-such-run-directory"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot assemble prompts"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "prompts", "x", "--only", "W0001"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("unknown arguments: prompts x --only W0001"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("prompts <run directory> [--warning <ID>]"));
+    }
+
+    @Test
+    void prepareInferenceCommandIsDispatchedAndValidatesItsArguments() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "prepare-inference", "no-such-run"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot prepare inference"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of("GA_INFERENCE_PROMPTS_PER_TASK", "11"),
+                "prepare-inference", "no-such-run"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("GA_INFERENCE_PROMPTS_PER_TASK='11'"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("prepare-inference <run directory> [--warning <ID>]"));
+    }
+
+    @Test
     void checkWithoutConfigurationIsConfigurationError() {
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "check"));
         String text = err.toString(StandardCharsets.UTF_8);

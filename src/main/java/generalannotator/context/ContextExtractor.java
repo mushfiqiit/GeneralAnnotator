@@ -72,6 +72,9 @@ public final class ContextExtractor {
                     + "of the target (overrideRelations lists the override links).",
             "Null guards are recognized syntactically (x != null conditions, instanceof, early exits, assert, "
                     + "Objects.requireNonNull); intervening assignments, aliasing and concurrency are ignored.",
+            "Later uses of a local holding the value are attributed textually: an unconditional earlier "
+                    + "reassignment ends attribution, a reassignment on some paths (or a loop back edge) makes the use "
+                    + "MAY_BE_REASSIGNED; exceptions and labeled jumps are ignored.",
             "Only the configured source roots of the run snapshot are analyzed; generated sources and code "
                     + "outside them are not.",
             "No safe/unsafe region classification is applied (project-spec §6.2); all found usages are listed.",
@@ -81,6 +84,7 @@ public final class ContextExtractor {
     private final SiteAnalyzer sites;
     private final ContextLimits limits;
     private final List<String> runLimitations;
+    private final CompactViewBuilder compact;
 
     /**
      * @param runLimitations limitations that apply to every warning of the run (for example compiler
@@ -91,6 +95,7 @@ public final class ContextExtractor {
         this.limits = limits;
         this.sites = new SiteAnalyzer(model, limits);
         this.runLimitations = List.copyOf(runLimitations);
+        this.compact = new CompactViewBuilder(model, limits);
     }
 
     public WarningContext extract(WarningTarget target, Optional<WarningNode> node) {
@@ -100,8 +105,9 @@ public final class ContextExtractor {
         if (target instanceof WarningTarget.Unresolved u) {
             limitations.add("The warning has no resolved target member (" + u.reason() + "), so only the warning "
                     + "site is described.");
+            List<EvidenceCategory> categories = List.of(category("warningSite", site.stream().toList()));
             return new WarningContext(u.warningId(), ContextStatus.SKIPPED, Optional.of(u.reason()), warning, Map.of(),
-                    Map.of(), List.of(category("warningSite", site.stream().toList())), limitations);
+                    Map.of(), categories, limitations, compact.build(categories, null));
         }
         WarningTarget.Resolved r = (WarningTarget.Resolved) target;
         String file = r.sourceRoot().equals(".") ? r.targetFile() : r.sourceRoot() + "/" + r.targetFile();
@@ -182,7 +188,8 @@ public final class ContextExtractor {
         summary.put("unresolved", refs.unresolved.size());
         summary.put("sameNameOtherSymbols", refs.excluded);
         return new WarningContext(r.warningId(), ContextStatus.EXTRACTED, Optional.empty(), warning,
-                identity(r, file, memberPath, element), summary, categories, limitations);
+                identity(r, file, memberPath, element), summary, categories, limitations,
+                compact.build(categories, sites.member(memberPath)));
     }
 
     private WarningContext failed(WarningTarget.Resolved r, Map<String, Object> warning, Optional<Evidence> site,
@@ -191,8 +198,9 @@ public final class ContextExtractor {
         Map<String, Object> target = new LinkedHashMap<>();
         target.put("memberKind", r.memberKind().name());
         target.put("target", r.target());
+        List<EvidenceCategory> categories = List.of(category("warningSite", site.stream().toList()));
         return new WarningContext(r.warningId(), ContextStatus.FAILED, Optional.of(reason), warning, target, Map.of(),
-                List.of(category("warningSite", site.stream().toList())), limitations);
+                categories, limitations, compact.build(categories, null));
     }
 
     // ---------------------------------------------------------------- categories
@@ -210,20 +218,60 @@ public final class ContextExtractor {
             Map.entry("unresolvedReferences", "References carrying the target's name that javac could not "
                     + "resolve, or resolved while reporting an error there; not counted as usages."));
 
+    /**
+     * Deduplicates by kind, source location and symbol; keeps distinct evidence first (round robin
+     * over facets: kind, how the value is used, observations) up to the item limit; returns the kept
+     * items in source order.
+     */
     private EvidenceCategory category(String name, List<Evidence> items) {
         Map<String, Evidence> unique = new LinkedHashMap<>();
         for (Evidence e : items) {
-            unique.putIfAbsent(e.kind() + "|" + e.location() + "|" + e.expression() + "|"
-                    + e.details().get("parameterIndex"), e);
+            String where = e.location() == null ? "binary:" + e.enclosingMember()
+                    : e.location().file() + "@" + e.sortOffset();
+            Object symbol = e.details().containsKey("parameterIndex") ? e.details().get("parameterIndex")
+                    : e.details().get("method");
+            unique.putIfAbsent(e.kind() + "|" + where + "|" + symbol, e);
         }
         List<Evidence> sorted = new ArrayList<>(unique.values());
-        sorted.sort(Comparator.<Evidence, String>comparing(e -> e.location() == null ? "￿" : e.location().file())
-                .thenComparingLong(Evidence::sortOffset)
-                .thenComparing(Evidence::kind)
-                .thenComparing(e -> e.expression() == null ? "" : e.expression())
-                .thenComparing(e -> String.valueOf(e.details().get("parameterIndex"))));
-        List<Evidence> kept = sorted.subList(0, Math.min(sorted.size(), limits.maxItemsPerCategory()));
+        sorted.sort(SOURCE_ORDER);
+        Map<String, List<Evidence>> facets = new LinkedHashMap<>();
+        for (Evidence e : sorted) {
+            facets.computeIfAbsent(facet(e), f -> new ArrayList<>()).add(e);
+        }
+        List<Evidence> kept = new ArrayList<>();
+        for (int round = 0; kept.size() < limits.maxItemsPerCategory(); round++) {
+            boolean any = false;
+            for (List<Evidence> group : facets.values()) {
+                if (round < group.size() && kept.size() < limits.maxItemsPerCategory()) {
+                    kept.add(group.get(round));
+                    any = true;
+                }
+            }
+            if (!any) {
+                break;
+            }
+        }
+        kept.sort(SOURCE_ORDER);
         return new EvidenceCategory(name, DESCRIPTIONS.get(name), sorted.size(), kept);
+    }
+
+    private static final Comparator<Evidence> SOURCE_ORDER = Comparator
+            .<Evidence, String>comparing(e -> e.location() == null ? "\uffff" : e.location().file())
+            .thenComparingLong(Evidence::sortOffset)
+            .thenComparing(Evidence::kind)
+            .thenComparing(e -> e.expression() == null ? "" : e.expression())
+            .thenComparing(e -> String.valueOf(e.details().get("parameterIndex")));
+
+    /** What makes evidence distinct for prioritization: its kind, how the value is used, and its observations. */
+    private static String facet(Evidence e) {
+        String use = "";
+        for (String key : List.of("use", "resultUse", "returned", "assigned", "referenceUse")) {
+            if (e.details().get(key) instanceof Map<?, ?> m && m.get("kind") != null) {
+                use = String.valueOf(m.get("kind"));
+                break;
+            }
+        }
+        return e.kind() + "|" + use + "|" + e.observations();
     }
 
     private Evidence evidence(String kind, TreePath site, String expression, Map<String, Object> details,
@@ -232,8 +280,152 @@ public final class ContextExtractor {
         all.addAll(obs);
         Conditions conditions = sites.conditions(site);
         List<LocalDefinition> defs = new ArrayList<>(new LinkedHashSet<>(definitions));
+        Evidence.Snippet snippet = sites.snippet(site);
         return new Evidence(kind, sites.ref(site), sites.startOf(site), sites.enclosingMember(site), expression,
-                sites.snippet(site), conditions.kept(), conditions.omitted(), defs, details, all);
+                snippet, conditions.kept(), conditions.omitted(), defs, details, all,
+                marks(kind, site, snippet, conditions.kept(), defs, details, all));
+    }
+
+    /** Source ranges the compact view shows for one evidence item. */
+    private List<Evidence.Mark> marks(String kind, TreePath site, Evidence.Snippet snippet,
+            List<Evidence.Condition> conditions, List<LocalDefinition> defs, Map<String, Object> details,
+            Set<Observation> obs) {
+        Evidence.Member member = sites.member(site);
+        if (member == null) {
+            return List.of();
+        }
+        List<Evidence.Mark> marks = new ArrayList<>();
+        int line = sites.ref(site).line();
+        if (snippet != null) {
+            marks.add(new Evidence.Mark(member, snippet.startLine(), snippet.endLine(), null));
+        }
+        marks.add(new Evidence.Mark(member, line, line, new Evidence.Label(label(kind, details))));
+        for (String note : annotationNotes(details)) {
+            marks.add(new Evidence.Mark(member, line, line, new Evidence.Label(note)));
+        }
+        for (Evidence.Condition c : conditions) {
+            if (c.line() > 0) {
+                marks.add(new Evidence.Mark(member, c.line(), c.line(), null));
+            }
+        }
+        for (LocalDefinition d : defs) {
+            if (d.line() > 0) {
+                marks.add(new Evidence.Mark(member, d.line(), d.line(), null));
+            }
+        }
+        if (obs.contains(Observation.NULL_COMPARISON)) {
+            int[] exit = sites.exitBranchLines(site);
+            if (exit != null) {
+                marks.add(new Evidence.Mark(member, exit[0], Math.min(exit[1],
+                        exit[0] + limits.maxSnippetLines() - 1), null));
+            }
+        }
+        collect(details, member, line, marks);
+        return marks;
+    }
+
+    /** Guard lines and local alias uses anywhere in the details. */
+    private void collect(Object value, Evidence.Member member, int fromLine, List<Evidence.Mark> marks) {
+        if (value instanceof Map<?, ?> m) {
+            if (m.containsKey("kind") && m.containsKey("condition") && m.get("line") instanceof Integer l && l > 0) {
+                marks.add(new Evidence.Mark(member, l, l, null));
+                if (m.get("exitLines") instanceof List<?> exit && exit.size() == 2) {
+                    int a = (Integer) exit.get(0);
+                    int b = (Integer) exit.get(1);
+                    marks.add(new Evidence.Mark(member, a, Math.min(b, a + limits.maxSnippetLines() - 1), null));
+                }
+            }
+            if (m.get("laterUsesOfLocal") instanceof Map<?, ?> local) {
+                String variable = String.valueOf(local.get("variable"));
+                for (Object o : (List<?>) local.get("uses")) {
+                    Map<?, ?> use = (Map<?, ?>) o;
+                    int at = (Integer) use.get("line");
+                    List<Integer> reassigned = new ArrayList<>();
+                    if (use.get("reassignedAt") instanceof List<?> rs) {
+                        rs.forEach(x -> reassigned.add((Integer) x));
+                    }
+                    marks.add(new Evidence.Mark(member, at, at, new Evidence.Alias(variable, fromLine,
+                            "DEFINITE".equals(use.get("flow")), reassigned,
+                            Boolean.TRUE.equals(use.get("assignedOnSomePathsOnly")))));
+                    collect(use.get("nullGuards"), member, fromLine, marks);
+                    if (use.get("exitLines") instanceof List<?> exit && exit.size() == 2) {
+                        int a = (Integer) exit.get(0);
+                        int b = (Integer) exit.get(1);
+                        marks.add(new Evidence.Mark(member, a, Math.min(b, a + limits.maxSnippetLines() - 1), null));
+                    }
+                }
+                if (local.get("declaredAt") instanceof Integer d) {
+                    marks.add(new Evidence.Mark(member, d, d, null));
+                }
+                for (Object x : (List<?>) local.get("reassignedAt")) {
+                    marks.add(new Evidence.Mark(member, (Integer) x, (Integer) x,
+                            new Evidence.Label("reassigns " + variable)));
+                }
+            }
+            for (Map.Entry<?, ?> e : m.entrySet()) {
+                if (!"laterUsesOfLocal".equals(e.getKey())) {
+                    collect(e.getValue(), member, fromLine, marks);
+                }
+            }
+        } else if (value instanceof List<?> list) {
+            list.forEach(x -> collect(x, member, fromLine, marks));
+        }
+    }
+
+    /** The short note shown on the evidence line. */
+    private static String label(String kind, Map<String, Object> details) {
+        return switch (kind) {
+            case "WARNING_SITE" -> "warning";
+            case "METHOD_CALL", "OBJECT_CREATION" -> "call";
+            case "THIS_CALL" -> "this(...) call";
+            case "SUPER_CALL" -> "super(...) call";
+            case "IMPLICIT_SUPER_CALL" -> "implicit super() call";
+            case "ANONYMOUS_CLASS_CREATION" -> "anonymous subclass creation";
+            case "METHOD_REFERENCE" -> "method reference";
+            case "PARAMETER_USE" -> "param " + details.get("parameter");
+            case "PARAMETER_REASSIGNED" -> "param " + details.get("parameter") + " reassigned";
+            case "RETURN" -> "return";
+            case "OVERRIDES" -> "overridden by the target";
+            case "OVERRIDDEN_BY" -> "overrides the target";
+            case "INITIALIZER" -> "initializer";
+            case "ASSIGNMENT" -> "write";
+            case "COMPOUND_ASSIGNMENT" -> "write (compound)";
+            case "INCREMENT_OR_DECREMENT" -> "write (++/--)";
+            case "READ" -> "read";
+            default -> kind.toLowerCase(java.util.Locale.ROOT);
+        };
+    }
+
+    /** Declared annotations that the snippet does not show (callee parameters, assigned variables, ...). */
+    static List<String> annotationNotes(Map<String, Object> details) {
+        Set<String> notes = new LinkedHashSet<>();
+        annotationNotes(details, notes);
+        return List.copyOf(notes);
+    }
+
+    private static void annotationNotes(Object value, Set<String> notes) {
+        if (value instanceof Map<?, ?> m) {
+            note(m, "parameterAnnotations", "param " + m.get("parameter") + " of " + m.get("callee"), notes);
+            note(m, "variableAnnotations", String.valueOf(m.get("variable")), notes);
+            note(m, "methodAnnotations", String.valueOf(m.containsKey("from") ? m.get("from") : m.get("method")), notes);
+            note(m, "calleeAnnotations", m.get("callee") + " returns", notes);
+            note(m, "annotations", String.valueOf(m.containsKey("variable") ? m.get("variable") : m.get("name")), notes);
+            // Later uses of a local are on other lines; their annotations are not notes for this line.
+            m.forEach((k, v) -> {
+                if (!"laterUsesOfLocal".equals(k)) {
+                    annotationNotes(v, notes);
+                }
+            });
+        } else if (value instanceof List<?> list) {
+            list.forEach(v -> annotationNotes(v, notes));
+        }
+    }
+
+    private static void note(Map<?, ?> m, String key, String subject, Set<String> notes) {
+        if (m.get(key) instanceof List<?> annotations && !annotations.isEmpty()
+                && annotations.getFirst() instanceof String) {
+            notes.add(subject + ": " + String.join(" ", annotations.stream().map(String::valueOf).toList()));
+        }
     }
 
     // ---------------------------------------------------------------- warning
@@ -871,7 +1063,7 @@ public final class ContextExtractor {
         if (declaration.isEmpty()) {
             details.put("declaredIn", "class file (no source in the snapshot)");
             return new Evidence(kind, null, -1, sites.label(other), sites.label(other), null, List.of(), 0, List.of(),
-                    details, Set.of());
+                    details, Set.of(), List.of());
         }
         details.put("declaredIn", "source");
         return evidence(kind, declaration.get(), sites.label(other), details, Set.of(), List.of());

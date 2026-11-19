@@ -3,6 +3,8 @@ package generalannotator;
 import generalannotator.cli.CheckCommand;
 import generalannotator.cli.ContextCommand;
 import generalannotator.cli.ExitCode;
+import generalannotator.cli.PrepareInferenceCommand;
+import generalannotator.cli.PromptsCommand;
 import generalannotator.cli.SliceCommand;
 import generalannotator.cli.TargetsCommand;
 import generalannotator.cli.VisualizeCommand;
@@ -42,6 +44,16 @@ public final class Main {
                       <ID>) from the run's snapshot into context/<ID>.json and .txt. Uses javac
                       symbols; no checker, Specimin or LLM is run. Limits: GA_CONTEXT_MAX_ITEMS,
                       GA_CONTEXT_MAX_SNIPPET_LINES, GA_CONTEXT_MAX_CONDITIONS, GA_CONTEXT_MAX_LOCAL_USES.
+              prompts <run directory> [--warning <ID>]
+                      Assemble one LLM prompt unit per warning (or only <ID>) from the run's warning
+                      graph, targets, Specimin slice and compact usage context into prompts/<ID>.txt
+                      and prompts/manifest.json. No LLM is called; nothing earlier is rerun.
+                      Limits: GA_PROMPT_MAX_CHARS, GA_PROMPT_MAX_FILE_CHARS.
+              prepare-inference <run directory> [--warning <ID>]
+                      Prepare an immutable inference submission (inference/<id>/) from the
+                      GENERATED prompts: copied prompts with SHA-256 hashes, task assignments,
+                      settings, a Slurm array batch script and the GPU worker. Local only:
+                      nothing is uploaded or submitted. Settings: GA_SLURM_*, GA_INFERENCE_*.
 
             Exit codes: 0 success (check: analysis completed), 2 usage/configuration error,
                         3 execution failure (check: incomplete analysis; visualize: Graphviz
@@ -102,6 +114,28 @@ public final class Main {
             try {
                 return new ContextCommand(args[1], args.length == 4 ? Optional.of(args[3]) : Optional.empty(), env,
                         Path.of("").toAbsolutePath(), out, err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length >= 2 && args[0].equals("prompts")
+                && (args.length == 2 || (args.length == 4 && args[2].equals("--warning")))) {
+            try {
+                return new PromptsCommand(args[1], args.length == 4 ? Optional.of(args[3]) : Optional.empty(), env,
+                        Path.of("").toAbsolutePath(), out, err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length >= 2 && args[0].equals("prepare-inference")
+                && (args.length == 2 || (args.length == 4 && args[2].equals("--warning")))) {
+            try {
+                return new PrepareInferenceCommand(args[1], args.length == 4 ? Optional.of(args[3]) : Optional.empty(),
+                        env, Path.of("").toAbsolutePath(), Clock.systemUTC(), out, err).run();
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);

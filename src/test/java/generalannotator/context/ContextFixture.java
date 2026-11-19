@@ -156,6 +156,95 @@ final class ContextFixture {
                     }
                 }
                 """);
+        FILES.put("q/Holder.java", """
+                package q;
+
+                class Holder {
+                    static volatile Holder instance;
+
+                    static Holder get() {
+                        Holder h = instance;
+                        if (h == null) {
+                            synchronized (Holder.class) {
+                                h = Holder.instance;
+                                if (h == null) {
+                                    h = Holder.instance = new Holder();
+                                }
+                            }
+                        }
+                        return h;
+                    }
+                }
+
+                class Installer {
+                    Holder install() {
+                        synchronized (Holder.class) {
+                            if (Holder.instance != null) {
+                                throw new IllegalStateException("already installed");
+                            }
+                            Holder.instance = new Holder();
+                            return Holder.instance;
+                        }
+                    }
+                }
+
+                class Aliases {
+                    String source;
+
+                    int straight() {
+                        String s = source;
+                        int n = s.length();
+                        s = "other";
+                        return n + s.length();
+                    }
+
+                    int branchy(boolean flag) {
+                        String s = source;
+                        if (flag) {
+                            s = "other";
+                        }
+                        return s.length();
+                    }
+
+                    int assignedInBranch(boolean flag) {
+                        String s = "init";
+                        if (flag) {
+                            s = source;
+                        }
+                        return s.length();
+                    }
+
+                    int guarded() {
+                        String s = source;
+                        if (s == null) {
+                            return 0;
+                        }
+                        return s.length();
+                    }
+
+                    void loop() {
+                        String s = source;
+                        while (s != null) {
+                            use(s);
+                            s = next();
+                        }
+                    }
+
+                    void direct() {
+                        use(source);
+                    }
+
+                    void use(@Nullable String x) {
+                    }
+
+                    String next() {
+                        return null;
+                    }
+                }
+
+                @interface Nullable {
+                }
+                """);
     }
 
     private ContextFixture() {}
@@ -174,6 +263,18 @@ final class ContextFixture {
             }
         }
         return root;
+    }
+
+    /** 1-based line of the first line containing {@code needle} after the first line containing {@code after}. */
+    static int line(String file, String after, String needle) {
+        int from = line(file, after);
+        String[] lines = FILES.get(file).split("\n", -1);
+        for (int i = from; i < lines.length; i++) {
+            if (lines[i].contains(needle)) {
+                return i + 1;
+            }
+        }
+        throw new IllegalArgumentException(needle + " not after " + after + " in " + file);
     }
 
     /** 1-based line of the first line containing {@code needle} in fixture file {@code file}. */
