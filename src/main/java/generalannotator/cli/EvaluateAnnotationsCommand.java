@@ -21,20 +21,24 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * {@code evaluate-annotations <submission directory> [--warning <ID>]}: evaluate every candidate edit
- * from the collected answers of one submission independently against one baseline analysis of the
- * run snapshot, and record the results and the expanded graph under {@code runs/<run>/evaluations/}
- * (see {@link Evaluator}). The checker settings come from the {@code check} environment variables;
- * the target and source roots are the run's own. {@code --warning} selects the candidates proposed for
- * that warning; it never narrows the checker's scope or the comparison.
+ * {@code evaluate-annotations <submission directory> [--warning <ID>] [--reuse-from <evaluation dir>]}:
+ * evaluate every unique annotation package of the collected answers of one submission (answers with
+ * the same complete edit set share one package) independently against one baseline analysis of the run
+ * snapshot, and record the results and the expanded graph under {@code runs/<run>/evaluations/} (see
+ * {@link Evaluator}). The checker settings come from the {@code check} environment variables; the
+ * target and source roots are the run's own. {@code --warning} selects the package(s) any of whose
+ * answers was about that warning; it never narrows the checker's scope or the comparison, and the
+ * selected package keeps all its origins. {@code --reuse-from} imports verified-equivalent checker
+ * results from an earlier one-package-per-answer evaluation, which is only read.
  *
  * <p>The candidates belong to one inference round ({@code round}, 1 for answers about the run's initial
  * warnings); warnings introduced while evaluating them get that round's IDs ({@code W1001, ...}).
  *
  * <p>Exit codes: 0 every selected candidate has a recorded outcome (which may be a failure of that
  * attempt); 2 invalid arguments, configuration or artifacts; 3 nothing to evaluate, the baseline
- * analysis failed, another process is writing the evaluation, the evaluation must be migrated first, or
- * the round's warning IDs are exhausted; 4 internal error.
+ * analysis failed, another process is writing the evaluation, the evaluation must be migrated first,
+ * the earlier evaluation given to {@code --reuse-from} is not equivalent, or the round's warning IDs are
+ * exhausted; 4 internal error.
  */
 public final class EvaluateAnnotationsCommand {
 
@@ -46,6 +50,7 @@ public final class EvaluateAnnotationsCommand {
 
     private final String submissionArgument;
     private final Optional<String> warning;
+    private final Optional<String> reuseFrom;
     private final Map<String, String> env;
     private final Path workingDirectory;
     private final Path defaultJavaHome;
@@ -60,8 +65,17 @@ public final class EvaluateAnnotationsCommand {
     public EvaluateAnnotationsCommand(String submissionArgument, Optional<String> warning, Map<String, String> env,
             Path workingDirectory, Path defaultJavaHome, CheckerFactory checkers, AnnotationApplier applier,
             WarningMatcher matcher, int round, Clock clock, PrintStream out, PrintStream err) {
+        this(submissionArgument, warning, Optional.empty(), env, workingDirectory, defaultJavaHome, checkers, applier,
+                matcher, round, clock, out, err);
+    }
+
+    public EvaluateAnnotationsCommand(String submissionArgument, Optional<String> warning, Optional<String> reuseFrom,
+            Map<String, String> env, Path workingDirectory, Path defaultJavaHome, CheckerFactory checkers,
+            AnnotationApplier applier, WarningMatcher matcher, int round, Clock clock, PrintStream out,
+            PrintStream err) {
         this.submissionArgument = submissionArgument;
         this.warning = warning;
+        this.reuseFrom = reuseFrom;
         this.env = Map.copyOf(env);
         this.workingDirectory = workingDirectory;
         this.defaultJavaHome = defaultJavaHome;
@@ -95,9 +109,10 @@ public final class EvaluateAnnotationsCommand {
         }
         out.println("GeneralAnnotator evaluate-annotations (submission " + candidates.submissionId() + ", run "
                 + candidates.runId() + ")");
-        out.println("  candidates: " + candidates.candidates().size() + " annotation package(s) (one per proposed "
-                + "answer, " + candidates.editCount() + " edit(s) in all; each package is applied as a whole and "
-                + "checked once); " + candidates.excluded().size() + " answer(s) excluded");
+        out.println("  candidates: " + candidates.importedProposals() + " imported proposal(s) -> "
+                + candidates.candidates().size() + " unique annotation package(s) (answers with the same complete edit "
+                + "set share one package; " + candidates.editCount() + " edit(s) in all; each package is applied as a "
+                + "whole and checked once); " + candidates.excluded().size() + " answer(s) excluded");
         candidates.excluded().forEach(x -> out.println("    excluded " + x.warningId() + " (" + x.status() + "): "
                 + firstLine(x.reason())));
         if (warning.isPresent()) {
@@ -107,13 +122,17 @@ public final class EvaluateAnnotationsCommand {
             if (!known) {
                 return usage("warning " + w + " is not in submission " + candidates.submissionId());
             }
-            long selected = candidates.candidates().stream().filter(c -> c.proposedFor(w)).count();
-            if (selected == 0) {
+            var selected = candidates.candidates().stream().filter(c -> c.proposedFor(w)).toList();
+            if (selected.isEmpty()) {
                 out.println("  Nothing to evaluate: the answer for " + w + " yielded no annotation package.");
                 return ExitCode.EXECUTION_FAILURE;
             }
-            out.println("  selected:   the package proposed for " + w + " (the checker still "
-                    + "analyzes every source root, and comparisons use every finding)");
+            for (Candidates.Candidate c : selected) {
+                out.println("  selected:   " + c.id() + ", the package proposed for " + w
+                        + (c.origins().size() > 1 ? " (shared with the answers for " + String.join(", ",
+                                c.warningIds().stream().filter(x -> !x.equals(w)).toList()) + ")" : "")
+                        + "; the checker still analyzes every source root, and comparisons use every finding");
+            }
         } else if (candidates.candidates().isEmpty()) {
             out.println("  Nothing to evaluate: no answer proposed an applicable edit.");
             return ExitCode.EXECUTION_FAILURE;
@@ -138,9 +157,21 @@ public final class EvaluateAnnotationsCommand {
                 + "), source roots " + candidates.sourceRoots() + ", classpath "
                 + config.analysis().classpath().stream().map(e -> e.path().toString()).toList());
 
+        Optional<Path> reuse = Optional.empty();
+        if (reuseFrom.isPresent()) {
+            try {
+                reuse = Optional.of(workingDirectory.resolve(reuseFrom.get()).normalize());
+            } catch (InvalidPathException e) {
+                return usage("'" + reuseFrom.get() + "' is not a valid path");
+            }
+            if (!Files.isDirectory(reuse.get())) {
+                return usage(reuse.get() + " is not an evaluation directory");
+            }
+        }
         Evaluator.Result result;
         try {
-            result = new Evaluator(candidates, config, checker, applier, matcher, round, clock, out).run(warning);
+            result = new Evaluator(candidates, config, checker, applier, matcher, round, clock, out).run(warning,
+                    reuse);
         } catch (WarningIds.AllocationException e) {
             err.println("GeneralAnnotator: evaluation stopped: " + e.getMessage() + ". The attempt being recorded is "
                     + "left incomplete; no ID was reused.");
@@ -174,6 +205,11 @@ public final class EvaluateAnnotationsCommand {
         out.println("  graph:      " + result.directory().resolve(Evaluator.GRAPH));
         out.println("  summary:    " + result.directory().resolve(Evaluator.SUMMARY));
         out.println("  visualize:  ./gradlew run --args=\"visualize '" + result.directory() + "'\"");
+        long imported = result.attempts().stream().filter(a -> a.how().startsWith("imported")).count();
+        if (reuse.isPresent()) {
+            out.println("  reuse:      " + imported + " package result(s) imported; see "
+                    + result.directory().resolve("reuse"));
+        }
         out.println("  Each package was applied as a whole and evaluated alone against the baseline; independently "
                 + "successful packages are not shown to combine safely, and no fixes were inferred for introduced "
                 + "warnings.");

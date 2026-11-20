@@ -174,7 +174,7 @@ class WarningIdMigrationTest {
         assertEquals(OptionalInt.of(0), ((WarningNode) g.node("W0001").orElseThrow()).round());
         AnnotationNode a = (AnnotationNode) g.node("A0002").orElseThrow();
         assertEquals(1, a.edits().size(), "the historical single-edit meaning is kept");
-        assertEquals(OptionalInt.of(0), a.proposals().get(0).answerEditIndex());
+        assertEquals(List.of(List.of(0)), a.proposals().get(0).answerEditIndices());
 
         List<?> introduced = (List<?>) json("attempts/A0002/attempt.json").get("introduced");
         assertEquals(List.of("W1002", "W1003"), introduced.stream().map(m -> ((Map<?, ?>) m).get("warningId")).toList());

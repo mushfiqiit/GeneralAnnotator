@@ -400,7 +400,8 @@ three `@Nullable` fields became A0024–A0026 and were evaluated separately.
 - **Package contents.** A package keeps its warning, answer provenance,
   rationale, uncertainty and every edit. Identical entries within the answer
   are merged, keeping their indices and uncertainties. Answers about different
-  warnings stay separate packages even when they share edits.
+  warnings stayed separate packages even when they shared edits (replaced by
+  T8c: identical edit sets now share one package).
 - **Applying and checking.** Each package is applied all or nothing in one
   fresh copy of the baseline, and NullAway runs once:
   - any rejected, conflicting or suppressing edit rejects the package and
@@ -449,6 +450,114 @@ On a scratch copy of the EventBus run:
 - 26 packages reduced the count, 8 kept it with matched changes, and 5
   increased it;
 - the earlier single-edit evaluation directory stayed byte-identical.
+
+## T8c — Equivalent annotation packages share one evaluation · `done`
+
+T8b made one package per answer, so answers about different warnings that
+proposed exactly the same edit set were evaluated separately. On EventBus,
+A0022, A0026, A0028 and A0029 all add `@Nullable` to
+`SubscriberMethodFinder.FindState.clazz`. Each was checked, and each added
+its own copy of the same five introduced warnings. They now share one package.
+- **Equivalence.** After import, answers are grouped by their complete edit
+  set, compared as sets of `AnnotationEdit` values. Equality covers source
+  root, source-relative file, declaring class, member signature, exact
+  position (parameter index, type-use path), action and annotation name.
+  - Edit order and repeated entries are ignored.
+  - Rationale, uncertainty, warning and provenance are excluded.
+  - Only what the edit model already normalizes is equal; names are not
+    resolved.
+  - Overlapping and subset packages stay separate; packages are never split.
+- **Provenance.** Each package keeps every originating answer as an origin:
+  warning, answer, attempt, prompt hash, answer file and hash, rationale,
+  uncertainty, and per-edit answer indices and uncertainties.
+  - `--warning` selects a package if any origin matches, and keeps all its
+    origins.
+  - The CLI and `summary.json` report imported proposals and unique packages.
+- **Identity.** Edits are kept in canonical order (`Candidates.editKey`). IDs
+  follow each package's first warning. The canonical key is the exact edit
+  text; the package key is only its hash. Resume requires the recorded edit
+  set to be equal field by field, not only the hash.
+  - The evaluation key moves to model `equivalent-package-1` (key version 3,
+    record version 4), so results are never shared across baselines,
+    configurations or rounds.
+- **Graph.** One annotation node per unique package lists every answer as a
+  proposal, with per-edit answer indices. Proposals are associations, not
+  edges.
+  - Edges are deduplicated, and introduced warnings exist once per package.
+  - Graph schema version 5; versions 2–4 are read (v4 indices move to the
+    proposal).
+- **Rebuild of earlier evaluations (`evaluate-annotations --reuse-from`).**
+  - **Refusal.** Nothing is reused unless the earlier `answer-package-1`
+    evaluation has the same run, submission, snapshot hash, configuration
+    fingerprint, matcher and round. The new baseline's findings and checker
+    identity must also equal the earlier ones.
+  - **Mapping.** Earlier package IDs are mapped to merged IDs by exact edit
+    set and answer hash (`reuse/<earlier id>.json`).
+  - **Import.** A merged package imports a checker result only if every
+    complete earlier attempt of it has an equivalent result. Paths inside
+    each attempt's own directory are ignored when comparing.
+  - **Rewriting.** Workspace, diff and logs are copied. Introduced warnings
+    get fresh round IDs, and the old-to-new mapping is recorded in
+    `importedFrom`.
+  - **Conflicts** are reported and the package is evaluated again; results are
+    never chosen or combined.
+  - **Rejected and no-op results** are evaluated again (no checker run).
+  - **Read only.** The earlier directory is only read.
+
+Code:
+- `evaluation`:
+  - `Candidates`: `merge`, `Candidate`, `Origin`, `EditAssociation`,
+    `canonicalKey`, `sameEditSet`.
+  - `Evaluator`: key version 3, record version 4, origins in records,
+    edit-set check on resume, `imported`, reuse report.
+  - `PackageReuse` (new) and `EvaluationGraph` (proposals per origin, edge
+    deduplication).
+- `graph`: `AnnotationNode` (`Proposal.answerEditIndices` per edit,
+  `PackageEdit` without indices) and `WarningGraphJson` v5.
+- Also `DotExporter`, `cli.EvaluateAnnotationsCommand` and `Main`
+  (`--reuse-from`, options in any order).
+
+Verified by:
+- `CandidatesMergeTest` covers:
+  - four answers becoming one package with every origin;
+  - reordered and repeated edits;
+  - overlap and subset;
+  - every identity dimension (source root, file, class, member and
+    parameter types, parameter index, return, type-use path, action,
+    annotation);
+  - model normalization only;
+  - deterministic IDs and exact canonical keys.
+- `EquivalentPackagesTest` (fake checker, real applier) covers:
+  - four `clazz`-like answers giving one package, one checker run, one node
+    with four proposals and one set of five introduced warnings, with no
+    duplicate edges;
+  - provenance in records;
+  - warning filter;
+  - reordered and repeated edits;
+  - overlapping packages;
+  - isolation by baseline, configuration and round;
+  - resume;
+  - a record with another edit set never reused;
+  - `--reuse-from` from a synthesized one-package-per-answer evaluation:
+    import with a graph byte-identical to a fresh evaluation and the old
+    directory unchanged, a conflicting result evaluated again, and refusals
+    for round, configuration, single-edit evaluations, baseline findings and
+    candidate edit sets.
+- Updates in `EvaluateAnnotationsTest`, `PackageEvaluationTest`,
+  `WarningGraphJsonTest` (v5 shared packages, reading v4), `WarningIdMigrationTest`
+  and `MainTest`.
+
+On a scratch copy of the EventBus run:
+- the 39 answers gave 27 unique packages (30 edits); 8 packages are shared by
+  20 answers;
+- the `clazz` package (A0017) has 4 proposals, resolves W0024, W0028, W0030
+  and W0031, and introduces 5 warnings once; there are 19 introduced warning
+  nodes instead of 38;
+- `--reuse-from` on the T8b evaluation verified the baseline and imported all
+  27 results in about 7 s;
+- a fresh evaluation (27 checker runs, about 70 s) wrote a byte-identical
+  graph, and every `changes.diff` matched;
+- the earlier evaluation directory stayed byte-identical.
 
 ## T9 — Record attempts and state transitions · `todo`
 

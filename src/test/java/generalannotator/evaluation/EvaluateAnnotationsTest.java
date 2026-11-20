@@ -127,7 +127,7 @@ class EvaluateAnnotationsTest {
     }
 
     @Test
-    void eachAnswerIsOnePackageEvenWhenPackagesShareEdits() throws Exception {
+    void overlappingAnswersStaySeparatePackages() throws Exception {
         ProposalFixture fx = standard();
         FakeChecker checker = new FakeChecker(FakeChecker::nullness);
 
@@ -137,17 +137,20 @@ class EvaluateAnnotationsTest {
         Map<?, ?> candidates = json(dir.resolve(Candidates.FILE));
         assertEquals(Candidates.MODEL, candidates.get("candidateModel"));
         List<?> cs = (List<?>) candidates.get("candidates");
-        assertEquals(2, cs.size(), "one package per answer; the shared x edit is not merged across answers");
+        assertEquals(2, cs.size(), "{x} and {x, y} only overlap: two packages, the shared x edit is not split off");
         Map<?, ?> a1 = (Map<?, ?>) cs.get(0);
         assertEquals("A0001", a1.get("id"));
-        assertEquals("W0001", a1.get("warningId"));
+        assertEquals(List.of("W0001"), a1.get("warningIds"));
         assertEquals(1, ((List<?>) a1.get("edits")).size());
         Map<?, ?> a2 = (Map<?, ?>) cs.get(1);
-        assertEquals("W0002@1", a2.get("group"));
+        Map<?, ?> o2 = (Map<?, ?>) ((List<?>) a2.get("origins")).get(0);
+        assertEquals("W0002@1", o2.get("group"));
         assertEquals(2, ((List<?>) a2.get("edits")).size());
-        assertEquals(List.of(1L), ((Map<?, ?>) ((List<?>) a2.get("edits")).get(1)).get("answerEditIndices"));
-        assertEquals("because", ((Map<?, ?>) a2.get("proposal")).get("rationale"));
-        assertEquals("some", ((Map<?, ?>) a2.get("proposal")).get("uncertainty"));
+        assertEquals(List.of(1L), ((Map<?, ?>) ((List<?>) o2.get("edits")).get(1)).get("answerEditIndices"));
+        assertEquals("because", o2.get("rationale"));
+        assertEquals("some", o2.get("uncertainty"));
+        assertEquals(2L, candidates.get("importedProposals"));
+        assertEquals(2L, candidates.get("uniquePackages"));
         Map<?, ?> excluded = (Map<?, ?>) ((List<?>) candidates.get("excluded")).get(0);
         assertEquals("W0003", excluded.get("warningId"));
         assertEquals("FAILED", excluded.get("status"));
@@ -575,7 +578,7 @@ class EvaluateAnnotationsTest {
         WarningGraph g = WarningGraphJson.read(text);
 
         assertEquals(text, WarningGraphJson.write(g));
-        assertEquals(4L, json(evaluation(fx).resolve(Evaluator.GRAPH)).get("schemaVersion"));
+        assertEquals(5L, json(evaluation(fx).resolve(Evaluator.GRAPH)).get("schemaVersion"));
         String dot = DotExporter.toDot(g);
         assertTrue(dot.contains("\"A0001\" [id=\"A0001\", shape=ellipse"), dot);
         assertTrue(dot.contains("\"W1001\" [id=\"W1001\", label=\"W1001\""), dot);

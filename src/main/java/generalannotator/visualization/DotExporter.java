@@ -27,8 +27,9 @@ import java.util.List;
  *   <li>Evaluation graphs: warning nodes are rounded boxes; warnings of a result state (introduced
  *       by a package) have a dashed border. Annotation nodes (one per annotation package) are ellipses filled by outcome (green
  *       completed, grey unevaluated or no-op, red failed or rejected, yellow ambiguous), labeled
- *       with their ID, outcome and number of edits, with every edit of the package (and its applier
- *       outcome), the counts and the originating answer in the tooltip.
+ *       with their ID, outcome, number of edits and (when several answers share the package) number
+ *       of answers, with every edit of the package (and its applier outcome), the counts and every
+ *       originating answer in the tooltip.
  *       {@value GraphEdge#RESOLVED_BY} edges are green, {@value GraphEdge#INTRODUCES} edges red. Nodes
  *       are labeled with their IDs (introduced warnings carry their round's IDs, {@code W1001, ...}); the
  *       tooltips name the round.
@@ -73,7 +74,8 @@ public final class DotExporter {
                         .append(" [id=").append(id(a.id()))
                         .append(", shape=ellipse, style=filled")
                         .append(", label=").append(label(a.id() + "\n" + a.outcome() + "\n" + a.edits().size()
-                                + (a.edits().size() == 1 ? " edit" : " edits")))
+                                + (a.edits().size() == 1 ? " edit" : " edits")
+                                + (a.proposals().size() > 1 ? "\n" + a.proposals().size() + " answers" : "")))
                         .append(", tooltip=").append(tooltip(tooltipText(a)))
                         .append(", fillcolor=\"").append(fill(a)).append('"')
                         .append(", sortv=").append(i + 1)
@@ -130,10 +132,11 @@ public final class DotExporter {
                 .append(c.introduced()).append(", persisting ").append(c.persisting()).append(", ambiguous ")
                 .append(c.ambiguousBaseline()).append('/').append(c.ambiguousResult()));
         if (!node.proposals().isEmpty()) {
-            text.append("\nproposed for ");
+            text.append(node.proposals().size() == 1 ? "\nproposed by the answer for " : "\nproposed by "
+                    + node.proposals().size() + " answers, for ");
             text.append(String.join(", ", node.proposals().stream()
-                    .map(p -> p.warningId() + " (" + p.group() + (p.answerEditIndex().isPresent()
-                            ? " edit " + p.answerEditIndex().getAsInt() : "") + ")").toList()));
+                    .map(p -> p.warningId() + " (" + p.group() + ")").toList()));
+            text.append(" (associations, not resolutions)");
         }
         return text.toString();
     }

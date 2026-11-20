@@ -23,6 +23,7 @@ import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /** Command-line entry point. */
 public final class Main {
@@ -80,11 +81,14 @@ public final class Main {
                       Import the collected LLM proposal of one warning and apply its annotation edits,
                       all or nothing, to a fresh copy of the run snapshot in applications/<id>/
                       (application.json, changes.diff, workspace/). The checker is not rerun.
-              evaluate-annotations <submission dir> [--warning <ID>]
-                      Evaluate every candidate edit of the collected answers (or those proposed for
-                      <ID>) alone against one baseline analysis of the run snapshot: apply it to a
-                      fresh copy, rerun the checker on all source roots, match findings, and write
+              evaluate-annotations <submission dir> [--warning <ID>] [--reuse-from <evaluation dir>]
+                      Evaluate every unique annotation package of the collected answers (answers with
+                      the same complete edit set share one; or the package proposed for <ID>) alone
+                      against one baseline analysis of the run snapshot: apply it to a fresh copy,
+                      rerun the checker once on all source roots, match findings, and write
                       evaluations/<id>/ with attempts, summary.json and evaluation-graph.json.
+                      --reuse-from imports verified-equivalent results of an earlier
+                      one-package-per-answer evaluation (read only) instead of rerunning them.
                       Checker settings as for check (GA_CHECKER, GA_CHECKER_HOME, GA_TARGET_CLASSPATH,
                       ...); GA_TARGET_PROJECT and GA_TARGET_SOURCE_ROOTS are not used. The answers
                       are inference round 1; warnings introduced in round 1 are W1001, W1002, ...
@@ -98,11 +102,27 @@ public final class Main {
                         context: attribution impossible or a target FAILED;
                         inference: incomplete, refused or unknown; apply-proposal: no applicable
                         proposal or it was rejected; evaluate-annotations: nothing to evaluate,
-                        baseline failed, evaluation busy, needs migration or IDs exhausted;
+                        baseline failed, evaluation busy, needs migration, --reuse-from not
+                        equivalent or IDs exhausted;
                         migrate-warning-ids: refused), 4 internal error,
                         5 inference: the shared SSH connection is not available (reconnect).""";
 
     private Main() {}
+
+    /**
+     * Parses {@code --name value} pairs from {@code args[from]} on; empty if an option is unknown,
+     * repeated or has no value.
+     */
+    static Optional<Map<String, String>> options(String[] args, int from, Set<String> allowed) {
+        Map<String, String> options = new java.util.LinkedHashMap<>();
+        for (int i = from; i < args.length; i += 2) {
+            if (i + 1 >= args.length || !allowed.contains(args[i]) || options.containsKey(args[i])) {
+                return Optional.empty();
+            }
+            options.put(args[i], args[i + 1]);
+        }
+        return Optional.of(options);
+    }
 
     public static void main(String[] args) {
         System.exit(run(args, System.getenv(), System.out, System.err).code());
@@ -193,11 +213,13 @@ public final class Main {
                 return ExitCode.INTERNAL_ERROR;
             }
         }
-        if (args.length >= 2 && args[0].equals("evaluate-annotations")
-                && (args.length == 2 || (args.length == 4 && args[2].equals("--warning")))) {
+        Optional<Map<String, String>> evaluateOptions = args.length >= 2 && args[0].equals("evaluate-annotations")
+                ? options(args, 2, Set.of("--warning", "--reuse-from")) : Optional.empty();
+        if (evaluateOptions.isPresent()) {
             try {
-                return new EvaluateAnnotationsCommand(args[1], args.length == 4 ? Optional.of(args[3])
-                        : Optional.empty(), env, Path.of("").toAbsolutePath(), Path.of(System.getProperty("java.home")),
+                return new EvaluateAnnotationsCommand(args[1], Optional.ofNullable(evaluateOptions.get().get("--warning")),
+                        Optional.ofNullable(evaluateOptions.get().get("--reuse-from")), env,
+                        Path.of("").toAbsolutePath(), Path.of(System.getProperty("java.home")),
                         (config, e) -> Checkers.create(config, e, new ProcessCommandRunner()),
                         new JavaParserAnnotationApplier(), new AnchoredWarningMatcher(), 1, Clock.systemUTC(), out,
                         err).run();

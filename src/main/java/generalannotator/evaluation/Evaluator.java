@@ -44,13 +44,13 @@ import java.util.Set;
 import java.util.TreeMap;
 
 /**
- * Evaluates every candidate edit independently against one immutable baseline and records the results
+ * Evaluates every unique annotation package independently against one immutable baseline and records the results
  * as an expanded graph.
  *
  * <p>Layout of {@code runs/<run>/evaluations/<submission id>-<key>/}, where the key is a hash of
  * everything results depend on (run snapshot tree hash, checker configuration fingerprint, candidate
- * set and matching rule), so results are only ever reused for the same baseline, configuration and
- * edit:
+ * set and matching rule), so results are only ever reused for the same baseline, configuration, round
+ * and edit set:
  * <pre>
  * evaluation.json        the key material, settings, matching assumptions and limitations
  * lock                   held by the one writing process
@@ -68,10 +68,14 @@ import java.util.TreeMap;
  *   attempt.json         outcome, counts, resolved and introduced warnings, provenance
  * attempts/interrupted/<A0001>-<n>/   an attempt directory left without attempt.json, moved aside
  * evaluation-graph.json  the expanded graph (rebuilt from the records after every invocation)
- * summary.json           per-candidate outcomes and counts
+ * summary.json           per-candidate outcomes and counts, imported proposals and unique packages
+ * reuse/<earlier id>.json  with reuseFrom: the ID mapping and what was imported, conflicting or not reused
  * </pre>
- * One attempt is one annotation package ({@link Candidates.Candidate}): every edit of one answer is
- * applied together, all or nothing, and the checker runs once. Packages never accumulate: every attempt
+ * One attempt is one unique annotation package ({@link Candidates.Candidate}): one complete edit set,
+ * however many answers proposed it, applied together, all or nothing, and checked once. With {@code
+ * reuseFrom}, checker results of an earlier one-package-per-answer evaluation are imported where they
+ * are verified equivalent ({@link PackageReuse}); the attempt directory then also holds the copied
+ * workspace, diff and logs, and the record says where it came from. Packages never accumulate: every attempt
  * starts from {@code baseline/source}. The run's own
  * snapshot, its {@code warning-graph.json} and the inference artifacts are only read; the snapshot's
  * tree hash is checked again at the end.
@@ -88,24 +92,30 @@ public final class Evaluator {
     /** Version of baseline/result.json. */
     static final int SCHEMA_VERSION = 1;
     /**
-     * Version of the evaluation key. Version 2 adds the candidate model ({@value Candidates#MODEL}) and the
-     * round, so package evaluations never share a directory (or cached results) with the earlier single-edit
-     * evaluations (key version 1), which are kept as they are.
+     * Version of the evaluation key. Version 2 added the candidate model and the round; version 3 uses the
+     * merged model ({@value Candidates#MODEL}), so merged evaluations never share a directory (or cached
+     * results) with earlier evaluations, which are kept as they are.
      */
-    static final int KEY_SCHEMA_VERSION = 2;
+    static final int KEY_SCHEMA_VERSION = 3;
     /**
-     * Version of evaluation.json, attempt.json and summary.json for package evaluations. Version 1 records
-     * were single-edit records without rounds, version 2 single-edit records with rounds ({@link
-     * #EDIT_LEVEL_RECORD_SCHEMA_VERSION}, what {@link WarningIdMigration} produces); neither is reused.
+     * Version of evaluation.json, attempt.json and summary.json for merged package evaluations (records
+     * carry every originating answer). Version 1 records were single-edit records without rounds, version 2
+     * single-edit records with rounds ({@link #EDIT_LEVEL_RECORD_SCHEMA_VERSION}, what {@link
+     * WarningIdMigration} produces), version 3 one-package-per-answer records ({@link
+     * #ANSWER_PACKAGE_RECORD_SCHEMA_VERSION}). Earlier records are never reused directly; version 3 results
+     * can be imported through {@link PackageReuse}.
      */
-    public static final int RECORD_SCHEMA_VERSION = 3;
+    public static final int RECORD_SCHEMA_VERSION = 4;
+    /** The record version of one-package-per-answer evaluations (historical). */
+    public static final int ANSWER_PACKAGE_RECORD_SCHEMA_VERSION = 3;
     /** The record version of single-edit evaluations with rounds (historical). */
     public static final int EDIT_LEVEL_RECORD_SCHEMA_VERSION = 2;
 
     public static final List<String> LIMITATIONS = List.of(
-            "Each candidate is one answer's complete edit set, applied together and checked once. Packages are "
-                    + "evaluated alone against the same baseline and never accumulate, so the graph does not show "
-                    + "whether independently successful packages combine safely.",
+            "Each candidate is one complete edit set, applied together and checked once; answers proposing "
+                    + "exactly the same edit set share it. Packages are evaluated alone against the same baseline and "
+                    + "never accumulate, so the graph does not show whether independently successful packages combine "
+                    + "safely.",
             "Warnings introduced by a package are recorded, but no fixes are inferred for them.",
             "Warning identity across states is the provisional rule recorded with each comparison "
                     + "(project-spec §6.1); ambiguous findings support no resolution or introduction claim.",
@@ -158,7 +168,7 @@ public final class Evaluator {
         REFUSED
     }
 
-    /** One line of the per-candidate summary. */
+    /** One line of the per-candidate summary (for the line printed after the package description). */
     public record AttemptSummary(String candidateId, AttemptOutcome outcome, String detail,
             Optional<AnnotationNode.Counts> counts, String how, Path directory) {}
 
@@ -179,8 +189,16 @@ public final class Evaluator {
      * candidates only: the checker always analyzes every configured source root and comparisons use
      * every finding.
      */
-    @SuppressWarnings("try")
     public Result run(Optional<String> warningFilter) throws IOException {
+        return run(warningFilter, Optional.empty());
+    }
+
+    /**
+     * Like {@link #run(Optional)}, importing verified-equivalent checker results from the earlier
+     * one-package-per-answer evaluation {@code reuseFrom} (read only) for packages without a result.
+     */
+    @SuppressWarnings("try")
+    public Result run(Optional<String> warningFilter, Optional<Path> reuseFrom) throws IOException {
         String snapshotHash = EvaluationFiles.treeHash(candidates.snapshot());
         String candidatesJson = candidates.toJson();
         Map<String, Object> key = new LinkedHashMap<>();
@@ -198,14 +216,15 @@ public final class Evaluator {
         Path dir = candidates.runDir().resolve(DIR).resolve(evaluationId);
         try (EvaluationFiles.Lock lock = EvaluationFiles.lock(dir, "pid " + ProcessHandle.current().pid()
                 + " since " + clock.instant())) {
-            return locked(dir, evaluationId, key, keyJson, candidatesJson, snapshotHash, warningFilter);
+            return locked(dir, evaluationId, key, keyJson, candidatesJson, snapshotHash, warningFilter, reuseFrom);
         } catch (EvaluationFiles.BusyException e) {
             return new Result(Status.BUSY, dir, e.getMessage(), List.of());
         }
     }
 
     private Result locked(Path dir, String evaluationId, Map<String, Object> key, String keyJson,
-            String candidatesJson, String snapshotHash, Optional<String> warningFilter) throws IOException {
+            String candidatesJson, String snapshotHash, Optional<String> warningFilter, Optional<Path> reuseFrom)
+            throws IOException {
         Path record = dir.resolve(RECORD);
         if (Files.exists(dir.resolve(WarningIdMigration.MARKER))) {
             return refused(dir, "a warning-ID migration of " + dir + " did not finish; run migrate-warning-ids '" + dir
@@ -252,15 +271,21 @@ public final class Evaluator {
         for (Candidates.Candidate c : candidates.candidates()) {
             Path f = dir.resolve("attempts").resolve(c.id()).resolve(ATTEMPT);
             if (Files.exists(f) && !Long.valueOf(RECORD_SCHEMA_VERSION).equals(parse(f).get("schemaVersion"))) {
-                return refused(dir, f + " is not a package record (schema " + RECORD_SCHEMA_VERSION + "); results of "
-                        + "earlier single-edit evaluations are never reused as package results");
+                return refused(dir, f + " is not a merged package record (schema " + RECORD_SCHEMA_VERSION + "); "
+                        + "results of earlier evaluations are never reused directly");
             }
         }
 
-        out.println("  evaluation: " + dir + " (round " + round + ", one annotation package per answer)");
-        for (Path other : olderEvaluations(dir)) {
-            out.println("  kept, not reused: " + other + " (an earlier single-edit evaluation; its per-edit results "
-                    + "are never combined into package results)");
+        out.println("  evaluation: " + dir + " (round " + round + ", one annotation package per unique edit set)");
+        for (Map.Entry<Path, Object> other : olderEvaluations(dir).entrySet()) {
+            if (reuseFrom.isPresent() && other.getKey().equals(reuseFrom.get().toAbsolutePath().normalize())) {
+                continue;
+            }
+            out.println("  kept, not reused: " + other.getKey() + (Candidates.ANSWER_PACKAGE_MODEL.equals(other.getValue())
+                    ? " (an earlier one-package-per-answer evaluation; its checker results are reused only with "
+                            + "--reuse-from, where verified equivalent)"
+                    : other.getValue() == null ? " (an earlier single-edit evaluation; its per-edit results are never "
+                            + "combined into package results)" : " (candidate model " + other.getValue() + ")"));
         }
         Optional<Baseline> found = baseline(dir, evaluationId, snapshotHash);
         if (found.isEmpty()) {
@@ -295,18 +320,67 @@ public final class Evaluator {
             ids = new WarningIds.Allocator(round, taken, last);
         }
 
+        Optional<PackageReuse> reuse = Optional.empty();
+        if (reuseFrom.isPresent()) {
+            try {
+                PackageReuse r = PackageReuse.open(reuseFrom.get(), key, candidates);
+                r.checkBaseline(baseline.dir(), baseline.toolIdentity());
+                reuse = Optional.of(r);
+            } catch (PackageReuse.Refused e) {
+                return refused(dir, "nothing was reused from " + reuseFrom.get() + ": " + e.getMessage());
+            }
+            out.println("  reuse:      " + reuse.get().dir() + " (verified: same snapshot, configuration, matcher, round "
+                    + "and baseline findings; " + reuse.get().mapping().size() + " earlier package(s) map to "
+                    + new LinkedHashSet<>(reuse.get().mapping().values()).size() + " merged package(s))");
+        }
+
         List<AttemptSummary> summaries = new ArrayList<>();
+        Map<String, Object> reuseReport = new LinkedHashMap<>();
         for (Candidates.Candidate c : candidates.candidates()) {
             if (warningFilter.isPresent() && !c.proposedFor(warningFilter.get())) {
                 continue;
             }
-            AttemptSummary s = attempt(dir, evaluationId, baseline, c, ids);
-            summaries.add(s);
             out.println("  " + c.id() + "  " + c.canonical() + ":");
-            for (Candidates.PackageEdit pe : c.edits()) {
-                out.println("          " + pe.edit().canonical());
+            for (AnnotationEdit e : c.edits()) {
+                out.println("          " + e.canonical());
             }
+            AttemptSummary s;
+            Path recordFile = dir.resolve("attempts").resolve(c.id()).resolve(ATTEMPT);
+            if (reuse.isPresent() && !Files.exists(recordFile)) {
+                PackageReuse.Match match = reuse.get().match(c);
+                Map<String, Object> entry = new LinkedHashMap<>();
+                switch (match) {
+                    case PackageReuse.Import imp -> {
+                        s = imported(dir, evaluationId, c, imp, reuse.get(), ids);
+                        entry.put("status", "IMPORTED");
+                        entry.put("attempt", imp.attempt());
+                        entry.put("equivalentAttempts", imp.equivalents());
+                    }
+                    case PackageReuse.Conflict conflict -> {
+                        out.println("          conflict: the earlier results of " + String.join(", ", conflict.attempts())
+                                + " differ in " + String.join(", ", conflict.differences())
+                                + "; none is chosen, the package is evaluated again");
+                        s = attempt(dir, evaluationId, baseline, c, ids);
+                        entry.put("status", "CONFLICT");
+                        entry.put("attempts", conflict.attempts());
+                        entry.put("differences", conflict.differences());
+                    }
+                    case PackageReuse.NotReused none -> {
+                        s = attempt(dir, evaluationId, baseline, c, ids);
+                        entry.put("status", "NOT_REUSED");
+                        entry.put("attempts", none.attempts());
+                        entry.put("reason", none.reason());
+                    }
+                }
+                reuseReport.put(c.id(), entry);
+            } else {
+                s = attempt(dir, evaluationId, baseline, c, ids);
+            }
+            summaries.add(s);
             out.println("  " + line(s));
+        }
+        if (reuse.isPresent()) {
+            writeReuseReport(dir, reuse.get(), reuseReport);
         }
 
         if (!snapshotHash.equals(EvaluationFiles.treeHash(candidates.snapshot()))) {
@@ -468,11 +542,12 @@ public final class Evaluator {
         if (Files.exists(recordFile)) {
             Map<?, ?> r = parse(recordFile);
             if (!evaluationId.equals(r.get("evaluationId")) || !packageKey.equals(r.get("packageKey"))
-                    || !Long.valueOf(round).equals(r.get("round"))) {
+                    || !Long.valueOf(round).equals(r.get("round")) || !Candidates.sameEditSet(r.get("edits"), c)) {
                 throw new IOException(recordFile + " records another evaluation, round or package; remove the "
                         + "evaluation directory to start again");
             }
-            return summary(c.id(), r, "reused", adir);
+            return summary(c.id(), r, r.get("importedFrom") instanceof Map<?, ?> from ? "reused (imported from "
+                    + from.get("directory") + ")" : "reused", adir);
         }
         String how = "evaluated";
         if (Files.exists(adir, LinkOption.NOFOLLOW_LINKS)) {
@@ -482,18 +557,9 @@ public final class Evaluator {
         }
         Files.createDirectories(adir);
         Instant started = clock.instant();
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("schemaVersion", RECORD_SCHEMA_VERSION);
-        m.put("evaluationId", evaluationId);
-        m.put("round", round);
-        m.put("candidateId", c.id());
-        m.put("packageKey", packageKey);
-        m.put("canonical", c.canonical());
-        m.put("warningId", c.warningId());
-        m.put("group", c.group());
-        m.put("baselineState", BASELINE_STATE);
-        List<Object> editRecords = Candidates.editsJson(c);
-        m.put("edits", editRecords);
+        Map<String, Object> m = header(evaluationId, c);
+        @SuppressWarnings("unchecked")
+        List<Object> editRecords = (List<Object>) m.get("edits");
         m.put("startedAt", started.toString());
 
         AttemptOutcome outcome;
@@ -502,7 +568,7 @@ public final class Evaluator {
         List<String> suppressions = new ArrayList<>();
         for (int i = 0; i < c.edits().size(); i++) {
             int index = i;
-            suppression(c.edits().get(i).edit()).ifPresent(s -> suppressions.add("edit " + index + ": " + s));
+            suppression(c.edits().get(i)).ifPresent(s -> suppressions.add("edit " + index + ": " + s));
         }
         if (!suppressions.isEmpty()) {
             outcome = AttemptOutcome.REJECTED;
@@ -510,7 +576,7 @@ public final class Evaluator {
         } else {
             Path source = adir.resolve("source");
             SnapshotCopier.copy(baseline.dir().resolve("source"), source);
-            AnnotationApplier.ApplyResult applied = applier.apply(source, c.annotationEdits());
+            AnnotationApplier.ApplyResult applied = applier.apply(source, c.edits());
             int applies = 0;
             List<String> rejections = new ArrayList<>();
             for (int i = 0; i < applied.results().size(); i++) {
@@ -597,6 +663,148 @@ public final class Evaluator {
         return new AttemptSummary(c.id(), outcome, detail, Optional.ofNullable(counts), how, adir);
     }
 
+    /** The identity part of an attempt record: package, edits and every originating answer. */
+    private Map<String, Object> header(String evaluationId, Candidates.Candidate c) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("schemaVersion", RECORD_SCHEMA_VERSION);
+        m.put("evaluationId", evaluationId);
+        m.put("round", round);
+        m.put("candidateId", c.id());
+        m.put("packageKey", c.packageKey());
+        m.put("canonical", c.canonical());
+        m.put("warningIds", c.warningIds());
+        m.put("origins", candidates.originsJson(c));
+        m.put("baselineState", BASELINE_STATE);
+        m.put("edits", Candidates.editsJson(c));
+        return m;
+    }
+
+    /**
+     * Records an earlier attempt's verified-equivalent result as this package's attempt: copies its
+     * workspace, diff and logs, keeps its result fields, gives its introduced warnings the next IDs of the
+     * round (as a fresh evaluation would), and moves paths inside the earlier attempt directory to the new
+     * one. The recorded commands stay as they were run, in the earlier directory.
+     */
+    private AttemptSummary imported(Path dir, String evaluationId, Candidates.Candidate c, PackageReuse.Import imp,
+            PackageReuse reuse, WarningIds.Allocator ids) throws IOException {
+        Path adir = dir.resolve("attempts").resolve(c.id());
+        String how = "imported from " + imp.attemptDir();
+        if (Files.exists(adir, LinkOption.NOFOLLOW_LINKS)) {
+            Path aside = nextFree(dir.resolve("attempts").resolve("interrupted"), c.id());
+            moveAside(adir, aside);
+            how += " after an interrupted attempt (kept in " + dir.relativize(aside) + ")";
+        }
+        Files.createDirectories(adir);
+        Path from = imp.attemptDir();
+        for (String sub : List.of("source", "check")) {
+            if (Files.isDirectory(from.resolve(sub), LinkOption.NOFOLLOW_LINKS)) {
+                SnapshotCopier.copy(from.resolve(sub), adir.resolve(sub));
+            }
+        }
+        if (Files.isRegularFile(from.resolve("changes.diff"))) {
+            Files.copy(from.resolve("changes.diff"), adir.resolve("changes.diff"));
+        }
+        Map<?, ?> old = imp.record();
+        Map<String, Object> m = header(evaluationId, c);
+        @SuppressWarnings("unchecked")
+        List<Object> editRecords = (List<Object>) m.get("edits");
+        for (Object o : editRecords) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> em = (Map<String, Object>) o;
+            for (Object x : (List<?>) old.get("edits")) {
+                Map<?, ?> oe = (Map<?, ?>) x;
+                if (em.get("edit").equals(oe.get("edit"))) {
+                    em.put("applier", PackageReuse.normalize(oe.get("applier"), from, adir.toString()));
+                }
+            }
+        }
+        for (String field : List.of("startedAt", "appliedEdits", "noOpEdits", "workspace", "diff", "commands",
+                "coverage")) {
+            if (old.containsKey(field)) {
+                m.put(field, old.get(field));
+            }
+        }
+        m.put("resultState", BASELINE_STATE + "+" + c.id());
+        for (String field : List.of("failure", "toolIdentity", "findingCount", "resolved")) {
+            if (old.containsKey(field)) {
+                m.put(field, PackageReuse.normalize(old.get(field), from, adir.toString()));
+            }
+        }
+        List<Object> introduced = new ArrayList<>();
+        Map<String, String> renamed = new LinkedHashMap<>();
+        Map<String, String> byResult = new LinkedHashMap<>();
+        for (Map<?, ?> im : introduced(old)) {
+            String warningId = ids.next();
+            renamed.put(String.valueOf(im.get("warningId")), warningId);
+            byResult.put(String.valueOf(im.get("resultId")), warningId);
+            Map<String, Object> nm = new LinkedHashMap<>();
+            nm.put("warningId", warningId);
+            nm.put("round", round);
+            nm.put("resultId", im.get("resultId"));
+            nm.put("targetPath", im.get("targetPath"));
+            nm.put("diagnostic", PackageReuse.normalize(im.get("diagnostic"), from, adir.toString()));
+            introduced.add(nm);
+        }
+        if (old.containsKey("introduced")) {
+            m.put("introduced", introduced);
+        }
+        for (String field : List.of("ambiguous", "comparison")) {
+            if (old.containsKey(field)) {
+                m.put(field, old.get(field));
+            }
+        }
+        if (Files.isRegularFile(from.resolve(COMPARISON))) {
+            Map<String, Object> cmp = new LinkedHashMap<>();
+            PackageReuse.normalize(parse(from.resolve(COMPARISON)), from, adir.toString())
+                    .forEach((k, v) -> cmp.put(String.valueOf(k), v));
+            cmp.put("resultState", BASELINE_STATE + "+" + c.id());
+            List<Object> mapping = new ArrayList<>();
+            for (Object o : (List<?>) cmp.get("introducedWarnings")) {
+                String resultId = String.valueOf(((Map<?, ?>) o).get("resultId"));
+                mapping.add(introducedMapping(resultId, byResult.get(resultId), round));
+            }
+            cmp.put("introducedWarnings", mapping);
+            EvaluationFiles.writeAtomically(adir.resolve(COMPARISON), Json.write(cmp));
+        }
+        m.put("outcome", old.get("outcome"));
+        m.put("detail", PackageReuse.normalize(old.get("detail"), from, adir.toString()));
+        m.put("counts", old.get("counts"));
+        m.put("finishedAt", old.get("finishedAt"));
+        Map<String, Object> source = new LinkedHashMap<>();
+        source.put("evaluationId", reuse.evaluationId());
+        source.put("directory", reuse.dir().toString());
+        source.put("attempt", imp.attempt());
+        source.put("equivalentAttempts", imp.equivalents());
+        source.put("introducedWarningIds", renamed);
+        source.put("importedAt", clock.instant().toString());
+        source.put("note", "The checker ran once, in the earlier attempt directory; its commands are recorded as they "
+                + "ran. Every earlier attempt listed had an equivalent result for exactly this edit set, the same "
+                + "baseline, configuration and round.");
+        m.put("importedFrom", source);
+        EvaluationFiles.writeAtomically(adir.resolve(ATTEMPT), Json.write(m));
+        return summary(c.id(), m, how, adir);
+    }
+
+    /** Writes reuse/<earlier evaluation>.json: the ID mapping and what happened to each package. */
+    private void writeReuseReport(Path dir, PackageReuse reuse, Map<String, Object> decided) throws IOException {
+        Path file = dir.resolve(PackageReuse.REPORT_DIR).resolve(reuse.evaluationId() + ".json");
+        Map<String, Object> packages = new LinkedHashMap<>();
+        if (Files.isRegularFile(file) && parse(file).get("packages") instanceof Map<?, ?> earlier) {
+            earlier.forEach((k, v) -> packages.put(String.valueOf(k), v));
+        }
+        packages.putAll(decided);
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("schemaVersion", 1);
+        m.put("from", Map.of("evaluationId", reuse.evaluationId(), "directory", reuse.dir().toString(),
+                "candidateModel", Candidates.ANSWER_PACKAGE_MODEL));
+        m.put("candidateMapping", reuse.mapping());
+        m.put("packages", new TreeMap<>(packages));
+        m.put("note", "Earlier package IDs map to the merged package with exactly the same edit set. A result is "
+                + "imported only when every complete earlier attempt of the package had an equivalent result; "
+                + "otherwise the conflict is listed and the package was evaluated again.");
+        EvaluationFiles.writeAtomically(file, Json.write(m));
+    }
+
     private record Compared(WarningMatcher.Comparison comparison, AnnotationNode.Counts counts,
             List<Object> introduced, List<Object> ambiguous, Map<String, Object> json) {}
 
@@ -678,9 +886,12 @@ public final class Evaluator {
         return list;
     }
 
-    /** Sibling evaluation directories of the same submission written with an earlier candidate model. */
-    private List<Path> olderEvaluations(Path dir) throws IOException {
-        List<Path> older = new ArrayList<>();
+    /**
+     * Sibling evaluation directories of the same submission written with an earlier candidate model, with
+     * that model (null for single-edit evaluations, which recorded none).
+     */
+    private Map<Path, Object> olderEvaluations(Path dir) throws IOException {
+        Map<Path, Object> older = new LinkedHashMap<>();
         Path parent = dir.getParent();
         try (var entries = Files.list(parent)) {
             for (Path p : entries.sorted().toList()) {
@@ -690,8 +901,9 @@ public final class Evaluator {
                     continue;
                 }
                 Map<?, ?> r = parse(record);
-                if (!(r.get("key") instanceof Map<?, ?> k) || !Candidates.MODEL.equals(k.get("candidateModel"))) {
-                    older.add(p);
+                Object model = r.get("key") instanceof Map<?, ?> k ? k.get("candidateModel") : null;
+                if (!Candidates.MODEL.equals(model)) {
+                    older.put(p, model);
                 }
             }
         }
@@ -868,6 +1080,8 @@ public final class Evaluator {
         m.put("submissionId", candidates.submissionId());
         m.put("baselineState", BASELINE_STATE);
         m.put("baselineFindings", baseline.findings().size());
+        m.put("importedProposals", candidates.importedProposals());
+        m.put("uniquePackages", candidates.candidates().size());
         boolean identical = original.size() == baseline.nodes().size()
                 && original.entrySet().stream().allMatch(e -> e.getKey().equals(e.getValue()));
         Map<String, Object> o = new LinkedHashMap<>();
@@ -892,9 +1106,11 @@ public final class Evaluator {
             Map<String, Object> e = new LinkedHashMap<>();
             e.put("candidateId", c.id());
             e.put("canonical", c.canonical());
-            e.put("warningId", c.warningId());
-            e.put("group", c.group());
-            e.put("edits", c.edits().stream().map(pe -> pe.edit().canonical()).toList());
+            e.put("warningIds", c.warningIds());
+            e.put("origins", c.origins().stream().map(Candidates.Origin::group).toList());
+            e.put("edits", c.edits().stream().map(AnnotationEdit::canonical).toList());
+            e.put("importedFrom", r == null || !(r.get("importedFrom") instanceof Map<?, ?> from) ? null
+                    : Map.of("directory", from.get("directory"), "attempt", from.get("attempt")));
             e.put("outcome", outcome);
             e.put("detail", r == null ? null : r.get("detail"));
             e.put("counts", r == null ? null : r.get("counts"));

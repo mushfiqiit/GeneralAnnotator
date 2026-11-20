@@ -8,12 +8,13 @@ import java.util.Optional;
 import java.util.OptionalInt;
 
 /**
- * One annotation package evaluated (or still to be evaluated) against one baseline state: every edit
- * one validated answer proposed together for one warning, applied together and checked once.
+ * One annotation package evaluated (or still to be evaluated) against one baseline state: one complete
+ * edit set, applied together and checked once.
  *
- * <p>Identity: the complete package (the originating answer and its edit set) together with the
- * baseline state and round. Packages from answers about different warnings are different nodes even
- * when they share edits. Every package has a node, so a node without edges is never silent: its
+ * <p>Identity: the complete canonical edit set together with the baseline state, checker configuration
+ * and round. Answers about different warnings that propose exactly the same edit set share one node and
+ * are all listed in {@code proposals}; packages that only overlap are different nodes. Every package has
+ * a node, so a node without edges is never silent: its
  * {@code outcome} says whether it was not evaluated, changed nothing, was a no-op, was rejected, failed,
  * or could only be compared ambiguously.
  *
@@ -21,18 +22,18 @@ import java.util.OptionalInt;
  * means that the comparison found baseline warning W resolved in the state after the whole package A,
  * whether or not A was proposed for W.
  *
- * <p>Graphs written by earlier versions held one edit per node ({@code edits} has one entry and the
- * proposals carry the index of that edit in each answer).
+ * <p>Graphs written by earlier versions held one package per answer (one proposal) or one edit per node
+ * (one edit and one proposal); they are read into the same structure.
  *
  * @param id unique ID within the graph, for example {@code A0001}
  * @param canonical a one-line description of the package
- * @param edits the package's distinct edits, in answer order
+ * @param edits the package's distinct edits, in canonical order
  * @param baselineState the state the package was applied to, for example {@code S0}
  * @param resultState the state after the package ({@code S0+A0001}), present only if it was applied
  *     and checked
  * @param outcome the evaluation outcome, for example {@code COMPLETED} or {@code UNEVALUATED}
  * @param detail a human-readable explanation of the outcome
- * @param proposals the answer(s) that proposed it: one for a package
+ * @param proposals the answers that proposed exactly this package (possibly for different warnings)
  * @param counts the comparison counts, present only for a trustworthy comparison
  * @param round the inference round whose answer proposed the package; empty in graphs written before
  *     rounds were recorded
@@ -49,36 +50,34 @@ public record AnnotationNode(String id, String canonical, List<PackageEdit> edit
      * @param canonical a one-line description of the edit
      * @param fields the edit's identity fields (source root, file, class, member, position, action,
      *     annotation), in a fixed order
-     * @param answerEditIndices the indices in the answer's {@code edits} of every identical entry merged
-     *     into this edit (empty in graphs of earlier versions)
      * @param applierOutcome APPLIED, NO_OP or REJECTED once the package was applied
      * @param applierDetail the applier's explanation
      */
-    public record PackageEdit(String canonical, Map<String, String> fields, List<Integer> answerEditIndices,
-            Optional<String> applierOutcome, Optional<String> applierDetail) {
+    public record PackageEdit(String canonical, Map<String, String> fields, Optional<String> applierOutcome,
+            Optional<String> applierDetail) {
         public PackageEdit {
             Objects.requireNonNull(canonical, "canonical");
             fields = java.util.Collections.unmodifiableMap(new LinkedHashMap<>(fields));
-            answerEditIndices = List.copyOf(answerEditIndices);
             Objects.requireNonNull(applierOutcome, "applierOutcome");
             Objects.requireNonNull(applierDetail, "applierDetail");
         }
     }
 
     /**
-     * An answer that proposed the package (or, in earlier single-edit graphs, the edit).
+     * An answer that proposed the package. This is an association, not a resolution claim.
      *
      * @param warningId the warning (of the analyzed run) whose answer proposed it
      * @param group the answer ({@code <warning>@<attempt>})
-     * @param answerEditIndex the edit's index in the answer, for earlier single-edit nodes only
+     * @param answerEditIndices for every edit of the node (same order), the indices of the answer's
+     *     {@code edits} entries that proposed it; empty if not recorded
      * @param baselineWarningId the baseline warning node that warning corresponds to, if it was identified
      */
-    public record Proposal(String warningId, String group, OptionalInt answerEditIndex,
+    public record Proposal(String warningId, String group, List<List<Integer>> answerEditIndices,
             Optional<String> baselineWarningId) {
         public Proposal {
             Objects.requireNonNull(warningId, "warningId");
             Objects.requireNonNull(group, "group");
-            Objects.requireNonNull(answerEditIndex, "answerEditIndex");
+            answerEditIndices = answerEditIndices.stream().map(List::copyOf).toList();
             Objects.requireNonNull(baselineWarningId, "baselineWarningId");
         }
     }
@@ -112,6 +111,12 @@ public record AnnotationNode(String id, String canonical, List<PackageEdit> edit
         Objects.requireNonNull(outcome, "outcome");
         Objects.requireNonNull(detail, "detail");
         proposals = List.copyOf(proposals);
+        for (Proposal p : proposals) {
+            if (!p.answerEditIndices().isEmpty() && p.answerEditIndices().size() != edits.size()) {
+                throw new IllegalArgumentException("proposal " + p.group() + " must give answer indices for every "
+                        + "edit of " + id + " or none");
+            }
+        }
         Objects.requireNonNull(counts, "counts");
         Objects.requireNonNull(round, "round");
         if (round.isPresent() && round.getAsInt() < 1) {

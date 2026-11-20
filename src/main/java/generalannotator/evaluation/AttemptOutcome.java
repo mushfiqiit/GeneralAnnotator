@@ -1,7 +1,7 @@
 package generalannotator.evaluation;
 
 /**
- * The outcome of evaluating one candidate edit against the baseline. Only {@link #COMPLETED} and
+ * The outcome of evaluating one annotation package against the baseline. Only {@link #COMPLETED} and
  * {@link #AMBIGUOUS} come from a trustworthy comparison and carry counts; every other outcome means
  * there is no evidence about warnings (and never "zero warnings").
  */

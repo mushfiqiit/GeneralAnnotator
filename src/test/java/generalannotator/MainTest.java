@@ -96,8 +96,20 @@ class MainTest {
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "evaluate-annotations", "no-such-dir"));
         assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot evaluate annotations"));
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "evaluate-annotations", "dir", "--warning"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "evaluate-annotations", "dir",
+                "--reuse-from"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "evaluate-annotations", "dir",
+                "--warning", "W0001", "--warning", "W0002"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "evaluate-annotations", "dir",
+                "--unknown", "x"));
+        err.reset();
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "evaluate-annotations", "no-such-dir",
+                "--reuse-from", "old", "--warning", "W0001"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot evaluate annotations"),
+                "both options are accepted in any order and reach the command");
         assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
-        assertTrue(out.toString(StandardCharsets.UTF_8).contains("evaluate-annotations <submission dir> [--warning <ID>]"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains(
+                "evaluate-annotations <submission dir> [--warning <ID>] [--reuse-from <evaluation dir>]"));
     }
 
     @Test

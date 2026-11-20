@@ -1175,8 +1175,10 @@ APPLIED, and W0008 and W0011 were reported as failed results. Every one of the
 export GA_CHECKER=nullaway
 export GA_CHECKER_HOME=$HOME/Documents/NullAway
 export GA_TARGET_CLASSPATH=$HOME/.gradle/caches/modules-2/files-2.1/org.jspecify/jspecify/1.0.0/7425a601c1c7ec76645a78d22b8c6a627edee507/jspecify-1.0.0.jar
-$GA evaluate-annotations runs/<run id>/inference/<submission id>              # every candidate
+$GA evaluate-annotations runs/<run id>/inference/<submission id>              # every package
 $GA evaluate-annotations runs/<run id>/inference/<submission id> --warning W0007
+$GA evaluate-annotations runs/<run id>/inference/<submission id> \
+    --reuse-from runs/<run id>/evaluations/<earlier evaluation id>            # rebuild, see below
 $GA visualize runs/<run id>/evaluations/<evaluation id>                      # evaluation-graph.svg
 ```
 
@@ -1193,19 +1195,34 @@ applied edit ends as `COMPILATION_FAILED`.
 What it does:
 
 1. **Packages.** Every validated COMPLETED_PROPOSED answer of the submission
-   is imported (the same checks as `apply-proposal`) and becomes **one
-   annotation package** `A0001, ...`: the complete edit set the model proposed
-   together for one warning, with the warning, answer (`W0037@1`), provenance,
-   rationale and uncertainty.
-   - Identical entries within one answer (same source root, file, class,
-     member, exact position, action and annotation) are merged, keeping each
-     entry's index and uncertainty.
-   - Answers about different warnings stay separate packages, even when they
-     share edits.
-   - Failed, missing, invalid and insufficient-evidence answers are listed as
-     excluded, with the reason.
-   - `--warning` only selects which package to evaluate. The checker still
-     analyzes every source root, and the comparison uses every finding.
+   is imported (the same checks as `apply-proposal`). Its complete edit set is
+   an **annotation package**. Answers whose complete edit sets are equal share
+   **one package** `A0001, ...`, whatever warnings they were about.
+   - **Equivalence.** Two edits are equal when source root, source-relative
+     file, declaring class, member signature, exact position (including the
+     parameter index and type-use path), action and annotation name are all
+     equal. Edit sets are compared as sets, so edit order and repeated entries
+     don't matter.
+   - **What is normalized.** Only what the edit model already normalizes:
+     whitespace, annotations and `final` in parameter types, varargs as `[]`,
+     and a type-use path without steps as its root position. Names are not
+     resolved, so `String` and `java.lang.String` stay different. Rationale,
+     uncertainty, warning and provenance are not part of equivalence.
+   - **Only identical sets merge.** Packages that merely overlap, or where one
+     is a subset of another, stay separate. A package is never split.
+   - **Origins.** Every answer of a package is kept as an origin: warning,
+     answer (`W0037@1`), attempt, prompt hash, answer file and hash,
+     rationale, uncertainty, and for each edit the answer entries that
+     proposed it (indices and per-entry uncertainty).
+   - **Order.** A package's edits are kept in canonical order. Package IDs
+     follow the numeric order of each package's first warning.
+   - **Excluded answers.** Failed, missing, invalid and insufficient-evidence
+     answers are listed as excluded, with the reason.
+   - **`--warning`** selects the package any of whose answers was about that
+     warning; the package keeps all its origins. The checker still analyzes
+     every source root, and the comparison uses every finding.
+   - **Counts.** The output and `summary.json` report both the number of
+     imported proposals and the number of unique packages.
 2. **Baseline.** The run snapshot is copied explicitly into
    `baseline/source/` (a plain file copy: git is not consulted, so an ignored
    `runs/` directory or a parent repository cannot hide sources), and the
@@ -1243,52 +1260,59 @@ zero warnings.
 ```
 runs/<run>/evaluations/<submission id>-<key>/
   evaluation.json        key material, settings, matcher assumptions, limitations
-  candidates.json        packages (warning, answer provenance, rationale, uncertainty, every edit), excluded answers
+  candidates.json        unique packages (every edit, every originating answer with its provenance), excluded answers
   baseline/source/       full copy of the run snapshot (state S0); baseline/check/ logs
   baseline/result.json   baseline findings with IDs and structural anchors, tool identity
   attempts/<A>/          source/, changes.diff (every changed file), check/ (applied packages only),
                          comparison.json, attempt.json (package outcome, each edit's applier outcome,
-                         counts, resolved and introduced warnings)
+                         counts, resolved and introduced warnings, every origin)
   attempts/interrupted/<A>-<n>/   attempts found incomplete, moved aside before the rerun
-  evaluation-graph.json  expanded graph (schemaVersion 4); summary.json (with the round's warning-ID sequence)
+  evaluation-graph.json  expanded graph (schemaVersion 5); summary.json (with the round's warning-ID sequence)
+  reuse/<earlier id>.json   with --reuse-from: ID mapping and what was imported, conflicting or not reused
 ```
 
 The `<key>` hashes everything results depend on: the snapshot's tree hash, the
 checker configuration (including classpath file hashes and the JDK), the
-candidate model (`answer-package-1`), the round, the package set and the
-matching rule. Each attempt also records its package key: the answer and its
-complete edit set. A different configuration, round or package therefore gets
-a new evaluation directory or is refused. Results are reused only for the same
-baseline, configuration, round and package. Rerunning the command resumes. Completed attempts
+candidate model (`equivalent-package-1`), the round, the package set and the
+matching rule. Each attempt records its complete edit set, field by field,
+and a hash of it as an index. A recorded result is reused only if its edit set
+is equal field by field; an equal hash alone is not enough. A different
+configuration, round or package therefore gets a new evaluation directory or
+is refused. Results are reused only for the same baseline, configuration,
+round and package. Rerunning the command resumes. Completed attempts
 (those with `attempt.json`) are reused, incomplete ones are moved aside and
 rerun, and the graph is rebuilt from the records, so nothing is duplicated. A
 file lock refuses a second concurrent writer. The run snapshot,
 `warning-graph.json` and the inference artifacts are only read.
 
-**Graph** (`evaluation-graph.json`, `warning-graph.json` schemaVersion 4):
+**Graph** (`evaluation-graph.json`, `warning-graph.json` schemaVersion 5):
 
 - **Warning nodes.** Baseline warnings (`W0001`, ..., state `S0`, round 0,
   root, distance 0) are always kept. A warning introduced by package `A`
   becomes a new node with state `S0+A`, distance 1, and an ID from the
   inference round's sequence (see "Warning IDs by round" below). Introduced
   warnings of different attempts are always separate nodes.
-- **Annotation nodes.** Each package is one annotation node, applied to `S0`.
-  It holds **every edit** of the package (with answer indices and applier
-  outcome), its outcome and counts, and the answer that proposed it. The
-  originating answer is node data, not an edge. Edits never get nodes of their
-  own.
+- **Annotation nodes.** Each unique package is one annotation node, applied
+  to `S0`. It holds **every edit** of the package (with its applier outcome),
+  its outcome and counts, and **every answer** that proposed it (warning,
+  answer, and the answer indices of each edit). These proposal associations
+  are node data, not edges, so they are never confused with verified
+  resolutions. Edits never get nodes of their own. A package shared by four
+  answers has one node and one set of introduced warnings.
 - **Edges.** `W -> A` (`resolved-by`) for **every** baseline warning the
   comparison found resolved by the whole package, whether or not `A` was
   proposed for it. `A -> N` (`introduces`) for every introduced warning.
-  Resolution is never inferred from a lower count.
+  Resolution is never inferred from a lower count. Edges are never
+  duplicated.
 - **Nodes without edges.** An annotation node without edges states why in its
   outcome: unevaluated, no change, no-op, rejected, failed, or ambiguous.
 
 `visualize` draws warnings as boxes (introduced ones dashed) and annotations
 as ellipses coloured by outcome, with `resolved-by` edges green and
-`introduces` edges red. Annotation nodes show their outcome and number of edits;
-their tooltips list every edit with its applier outcome. All tooltips name the
-node's round.
+`introduces` edges red. Annotation nodes show their outcome, number of edits
+and, when shared, number of answers. Their tooltips list every edit with its
+applier outcome and every originating answer. All tooltips name the node's
+round.
 
 **Warning IDs by round.** A *round* is one iteration of LLM inference and
 evaluation. It is not one annotation attempt, and not a graph distance.
@@ -1365,21 +1389,67 @@ Limitations:
   independently successful packages combine safely.
 - **No per-edit attribution.** A package's result is that of its whole edit
   set; it doesn't say which edit caused which change.
-- **Shared edits are checked again.** Packages that share edits are evaluated
-  separately, so an edit proposed by several answers is checked once per
-  package, and any warnings it introduces appear once per package.
+- **Overlapping packages are checked separately.** Only identical edit sets
+  share a package. Packages that share some edits are evaluated separately,
+  so a common edit is checked once per package, and warnings it introduces
+  can appear once per package.
 - **Multi-field messages.** When NullAway lists several fields in one message
   (for example "initializer method does not guarantee @NonNull fields 'a',
   'b'"), a package that annotates only some of them changes the message. The
   rule then records one resolved and one introduced warning, not a narrowed
   one.
 
+**Rebuilding from an earlier one-package-per-answer evaluation
+(`--reuse-from`).** The previous version made one package per answer, so
+equivalent answers (for example the four EventBus answers that all add
+`@Nullable` to `SubscriberMethodFinder.FindState.clazz`) were evaluated four
+times. Such an evaluation has a different key and is kept as it is;
+`evaluate-annotations` lists it as "kept, not reused". To rebuild the merged
+evaluation from its checker results instead of rerunning them, pass it
+explicitly:
+
+```sh
+$GA evaluate-annotations runs/<run id>/inference/<submission id> \
+    --reuse-from runs/<run id>/evaluations/<earlier evaluation id>
+```
+
+What `--reuse-from` checks and does:
+
+- **Equivalence.** The earlier evaluation must be a one-package-per-answer
+  evaluation (`answer-package-1`). Its key must name the same run,
+  submission, snapshot tree hash, complete checker configuration, matcher and
+  round. Otherwise nothing is reused (exit 3). The baseline is rerun (or
+  reused from the new directory), and its findings and checker identity must
+  equal the earlier baseline's.
+- **Mapping.** Every earlier package is mapped to the merged package with
+  exactly the same edit set, compared field by field. Its answer must be one
+  of that package's origins, with the same answer hash. The mapping is
+  written to `reuse/<earlier id>.json`.
+- **Import.** A merged package's result is imported only if all of its
+  complete earlier attempts have equivalent results. Equivalent means the
+  same outcome, detail, counts, resolved, ambiguous and introduced findings,
+  per-edit applier outcomes, diff, comparison and checker identity; paths
+  inside each attempt's own directory are ignored.
+  - The import copies the workspace, diff and logs, and gives introduced
+    warnings the next IDs of the round, as a fresh evaluation would.
+  - It records `importedFrom` (the earlier attempt, the equivalent attempts
+    and the old-to-new warning IDs).
+  - Earlier diagnostic lists are never merged into new results.
+- **Conflict.** If earlier attempts of one package disagree, the conflict is
+  printed and recorded, and the package is evaluated again. No earlier result
+  is chosen.
+- **Rejected and no-op results** are not imported. They are evaluated again,
+  which runs no checker.
+- **Read only.** The earlier directory is never changed. Later runs without
+  `--reuse-from` simply resume.
+
 **Earlier single-edit evaluations.** Before packages, each distinct edit was
 evaluated alone; that split W0037's three-edit answer into three edits whose
 separate results said nothing about the answer as a whole. Such evaluation
 directories have a different key, so they are **kept as they are and never
 reused**. `evaluate-annotations` lists them as "kept, not reused" and evaluates
-every package afresh in a new directory. `migrate-warning-ids` still converts
+every package afresh in a new directory; `--reuse-from` refuses them.
+`migrate-warning-ids` still converts
 their IDs for viewing and keeps their single-edit meaning (one edit per
 annotation node, `candidateModel` marked historical). It never turns them into
 package results.
@@ -1388,24 +1458,27 @@ package results.
 |---|---|
 | 0 | Every selected package has a recorded outcome (which may be a failure of that attempt) |
 | 2 | Invalid arguments, configuration or inference artifacts |
-| 3 | Nothing to evaluate, the baseline analysis failed, another process is writing the evaluation, the evaluation must be migrated first (`migrate-warning-ids`), or the round's 999 warning IDs are used up |
+| 3 | Nothing to evaluate, the baseline analysis failed, another process is writing the evaluation, the evaluation must be migrated first (`migrate-warning-ids`), the `--reuse-from` evaluation is not equivalent, or the round's 999 warning IDs are used up |
 | 4 | Internal error (an interrupted attempt is moved aside and rerun next time) |
 
 On a scratch copy of the EventBus run (NullAway 0.14.2-SNAPSHOT checkout, JSpecify 1.0.0
 on the classpath), the baseline reproduced the run's 42 findings exactly.
-- **Packages.** The 39 proposed answers gave 39 packages with 42 edits in all
-  (W0035's answer had two edits and W0037's three); W0008 and W0011 were
-  excluded.
-- **Outcomes.** All 39 packages completed. 26 reduced the finding count, 8 kept
-  it with matched changes (resolved and introduced warnings), and 5 increased
-  it.
-- **W0037.** Its package (three `@Nullable` fields of
-  `AsyncExecutor.Builder`) resolved W0037 and introduced nothing. The earlier
-  single-edit evaluation could not show this: each edit alone only narrowed
-  the message.
-- **Timing.** The fresh evaluation took about 100 seconds (about 2.5 s per
-  package). A rerun with existing results reuses everything in about a second.
-- **Old directory.** The earlier single-edit evaluation directory was left
+- **Packages.** The 39 proposed answers gave **27 unique packages** with 30
+  edits in all; W0008 and W0011 were excluded. Eight packages are shared by
+  20 answers. The largest is the `FindState.clazz` edit, proposed for W0024,
+  W0028, W0030 and W0031.
+- **Outcomes.** All 27 packages completed. 17 reduced the finding count, 8
+  kept it with matched changes, and 2 increased it.
+- **Shared `clazz` package.** It became one annotation node (A0017): it
+  resolves W0024, W0028, W0030 and W0031 and introduces five warnings, now
+  once instead of four times. The graph has 19 introduced warning nodes, where
+  the one-package-per-answer evaluation had 38.
+- **W0037.** Its three-edit package resolves W0037 and introduces nothing.
+- **Rebuild.** `--reuse-from` on the earlier one-package-per-answer evaluation
+  verified the baseline (one checker run) and imported all 27 results in
+  about 7 seconds. A fresh evaluation (27 checker runs) took about 70 seconds
+  and wrote a byte-identical `evaluation-graph.json`.
+- **Old directories.** The earlier evaluation directories were left
   byte-identical.
 
 ## How the local NullAway checkout is used
@@ -1637,7 +1710,7 @@ src/main/java/generalannotator/
   edits/        annotation edit model (checker- and parser-independent), applier interface, diff
   edits/javaparser/  JavaParser-based declaration locator and annotation applier
   proposals/    import of collected proposals, application to a snapshot copy (applications/)
-  evaluation/   package import (one per answer), baseline and per-package attempts, resume and
+  evaluation/   package import (equivalent answers merged), baseline and per-package attempts, reuse, resume and
                 locking, expanded graph (evaluations/)
   evaluation/matching/  WarningMatcher interface, provisional anchored-1 rule, structural anchors
 src/main/resources/generalannotator/inference/ga_inference_worker.py   the GPU worker

@@ -264,11 +264,12 @@ class PackageEvaluationTest {
         Map<?, ?> r = attempt(fx);
         List<?> edits = (List<?>) r.get("edits");
         assertEquals(2, edits.size());
-        assertEquals(List.of(0L, 2L), ((Map<?, ?>) edits.get(0)).get("answerEditIndices"));
-        assertEquals(List.of("u-x", "u-x"), ((Map<?, ?>) edits.get(0)).get("uncertainties"));
+        List<?> associations = (List<?>) ((Map<?, ?>) ((List<?>) r.get("origins")).get(0)).get("edits");
+        assertEquals(List.of(0L, 2L), ((Map<?, ?>) associations.get(0)).get("answerEditIndices"));
+        assertEquals(List.of("u-x", "u-x"), ((Map<?, ?>) associations.get(0)).get("uncertainties"));
         assertEquals(List.of("APPLIED", "APPLIED"), applierOutcomes(r));
-        assertEquals(List.of(0, 2), ((AnnotationNode) graph(fx).node("A0001").orElseThrow()).edits().get(0)
-                .answerEditIndices());
+        assertEquals(List.of(0, 2), ((AnnotationNode) graph(fx).node("A0001").orElseThrow()).proposals().get(0)
+                .answerEditIndices().get(0));
     }
 
     @Test
