@@ -9,6 +9,7 @@ import generalannotator.evaluation.Candidates;
 import generalannotator.evaluation.EvaluationConfig;
 import generalannotator.evaluation.Evaluator;
 import generalannotator.evaluation.matching.WarningMatcher;
+import generalannotator.graph.WarningIds;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
@@ -27,9 +28,13 @@ import java.util.Optional;
  * the target and source roots are the run's own. {@code --warning} selects the candidates proposed for
  * that warning; it never narrows the checker's scope or the comparison.
  *
+ * <p>The candidates belong to one inference round ({@code round}, 1 for answers about the run's initial
+ * warnings); warnings introduced while evaluating them get that round's IDs ({@code W1001, ...}).
+ *
  * <p>Exit codes: 0 every selected candidate has a recorded outcome (which may be a failure of that
  * attempt); 2 invalid arguments, configuration or artifacts; 3 nothing to evaluate, the baseline
- * analysis failed, or another process is writing the evaluation; 4 internal error.
+ * analysis failed, another process is writing the evaluation, the evaluation must be migrated first, or
+ * the round's warning IDs are exhausted; 4 internal error.
  */
 public final class EvaluateAnnotationsCommand {
 
@@ -47,13 +52,14 @@ public final class EvaluateAnnotationsCommand {
     private final CheckerFactory checkers;
     private final AnnotationApplier applier;
     private final WarningMatcher matcher;
+    private final int round;
     private final Clock clock;
     private final PrintStream out;
     private final PrintStream err;
 
     public EvaluateAnnotationsCommand(String submissionArgument, Optional<String> warning, Map<String, String> env,
             Path workingDirectory, Path defaultJavaHome, CheckerFactory checkers, AnnotationApplier applier,
-            WarningMatcher matcher, Clock clock, PrintStream out, PrintStream err) {
+            WarningMatcher matcher, int round, Clock clock, PrintStream out, PrintStream err) {
         this.submissionArgument = submissionArgument;
         this.warning = warning;
         this.env = Map.copyOf(env);
@@ -62,6 +68,7 @@ public final class EvaluateAnnotationsCommand {
         this.checkers = checkers;
         this.applier = applier;
         this.matcher = matcher;
+        this.round = round;
         this.clock = clock;
         this.out = out;
         this.err = err;
@@ -88,24 +95,24 @@ public final class EvaluateAnnotationsCommand {
         }
         out.println("GeneralAnnotator evaluate-annotations (submission " + candidates.submissionId() + ", run "
                 + candidates.runId() + ")");
-        out.println("  candidates: " + candidates.candidates().size() + " distinct edit(s) from "
-                + candidates.groups().size() + " proposed answer(s); " + candidates.excluded().size()
-                + " answer(s) excluded");
+        out.println("  candidates: " + candidates.candidates().size() + " annotation package(s) (one per proposed "
+                + "answer, " + candidates.editCount() + " edit(s) in all; each package is applied as a whole and "
+                + "checked once); " + candidates.excluded().size() + " answer(s) excluded");
         candidates.excluded().forEach(x -> out.println("    excluded " + x.warningId() + " (" + x.status() + "): "
                 + firstLine(x.reason())));
         if (warning.isPresent()) {
             String w = warning.get();
-            boolean known = candidates.groups().stream().anyMatch(g -> g.warningId().equals(w))
+            boolean known = candidates.candidates().stream().anyMatch(c -> c.proposedFor(w))
                     || candidates.excluded().stream().anyMatch(x -> x.warningId().equals(w));
             if (!known) {
                 return usage("warning " + w + " is not in submission " + candidates.submissionId());
             }
             long selected = candidates.candidates().stream().filter(c -> c.proposedFor(w)).count();
             if (selected == 0) {
-                out.println("  Nothing to evaluate: the answer for " + w + " yielded no candidate edits.");
+                out.println("  Nothing to evaluate: the answer for " + w + " yielded no annotation package.");
                 return ExitCode.EXECUTION_FAILURE;
             }
-            out.println("  selected:   " + selected + " candidate(s) proposed for " + w + " (the checker still "
+            out.println("  selected:   the package proposed for " + w + " (the checker still "
                     + "analyzes every source root, and comparisons use every finding)");
         } else if (candidates.candidates().isEmpty()) {
             out.println("  Nothing to evaluate: no answer proposed an applicable edit.");
@@ -133,12 +140,20 @@ public final class EvaluateAnnotationsCommand {
 
         Evaluator.Result result;
         try {
-            result = new Evaluator(candidates, config, checker, applier, matcher, clock, out).run(warning);
+            result = new Evaluator(candidates, config, checker, applier, matcher, round, clock, out).run(warning);
+        } catch (WarningIds.AllocationException e) {
+            err.println("GeneralAnnotator: evaluation stopped: " + e.getMessage() + ". The attempt being recorded is "
+                    + "left incomplete; no ID was reused.");
+            return ExitCode.EXECUTION_FAILURE;
         } catch (IOException e) {
             err.println("GeneralAnnotator: evaluation failed: " + e.getMessage());
             return ExitCode.INTERNAL_ERROR;
         }
         switch (result.status()) {
+            case REFUSED -> {
+                err.println("GeneralAnnotator: evaluation refused: " + result.message());
+                return ExitCode.EXECUTION_FAILURE;
+            }
             case BUSY -> {
                 err.println("GeneralAnnotator: " + result.message());
                 return ExitCode.EXECUTION_FAILURE;
@@ -154,13 +169,14 @@ public final class EvaluateAnnotationsCommand {
         out.println("  outcomes:   " + counts);
         long reductions = result.attempts().stream().filter(a -> a.outcome().compared() && a.counts().isPresent()
                 && a.counts().get().resultFindings() < a.counts().get().baselineFindings()).count();
-        out.println("  " + reductions + " edit(s) reduced the finding count in a completed analysis; counts are not "
-                + "reported for incomplete analyses.");
+        out.println("  " + reductions + " package(s) reduced the finding count in a completed analysis; counts are "
+                + "not reported for incomplete analyses, and resolution is only claimed for matched warnings.");
         out.println("  graph:      " + result.directory().resolve(Evaluator.GRAPH));
         out.println("  summary:    " + result.directory().resolve(Evaluator.SUMMARY));
         out.println("  visualize:  ./gradlew run --args=\"visualize '" + result.directory() + "'\"");
-        out.println("  Each edit was evaluated alone; independently successful edits are not shown to combine "
-                + "safely, and no fixes were inferred for introduced warnings.");
+        out.println("  Each package was applied as a whole and evaluated alone against the baseline; independently "
+                + "successful packages are not shown to combine safely, and no fixes were inferred for introduced "
+                + "warnings.");
         return ExitCode.COMPLETED;
     }
 

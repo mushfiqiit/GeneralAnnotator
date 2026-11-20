@@ -54,6 +54,7 @@ class EvaluateAnnotationsTest {
     private final ByteArrayOutputStream out = new ByteArrayOutputStream();
     private final ByteArrayOutputStream err = new ByteArrayOutputStream();
     private final Map<String, String> env = new HashMap<>();
+    private int round = 1;
 
     private ProposalFixture fixture(int warnings) throws Exception {
         ProposalFixture fx = new ProposalFixture(temp, warnings);
@@ -69,7 +70,7 @@ class EvaluateAnnotationsTest {
         return new EvaluateAnnotationsCommand(fx.submission.toString(),
                 warning.length == 0 ? Optional.empty() : Optional.of(warning[0]), env, temp,
                 Path.of(System.getProperty("java.home")), (c, e) -> checker, new JavaParserAnnotationApplier(),
-                new AnchoredWarningMatcher(), PrepareInferenceCommandTest.CLOCK,
+                new AnchoredWarningMatcher(), round, PrepareInferenceCommandTest.CLOCK,
                 new PrintStream(out, true, StandardCharsets.UTF_8), new PrintStream(err, true, StandardCharsets.UTF_8))
                 .run();
     }
@@ -126,7 +127,7 @@ class EvaluateAnnotationsTest {
     }
 
     @Test
-    void resolvesAndIntroducesWithDeduplicatedCandidatesAndProposalGroups() throws Exception {
+    void eachAnswerIsOnePackageEvenWhenPackagesShareEdits() throws Exception {
         ProposalFixture fx = standard();
         FakeChecker checker = new FakeChecker(FakeChecker::nullness);
 
@@ -134,61 +135,66 @@ class EvaluateAnnotationsTest {
 
         Path dir = evaluation(fx);
         Map<?, ?> candidates = json(dir.resolve(Candidates.FILE));
+        assertEquals(Candidates.MODEL, candidates.get("candidateModel"));
         List<?> cs = (List<?>) candidates.get("candidates");
-        assertEquals(2, cs.size());
+        assertEquals(2, cs.size(), "one package per answer; the shared x edit is not merged across answers");
         Map<?, ?> a1 = (Map<?, ?>) cs.get(0);
         assertEquals("A0001", a1.get("id"));
-        assertEquals(List.of("W0001", "W0002"), ((List<?>) a1.get("associations")).stream()
-                .map(a -> ((Map<?, ?>) a).get("warningId")).toList());
-        assertEquals("W0002@1", ((Map<?, ?>) ((List<?>) a1.get("associations")).get(1)).get("group"));
+        assertEquals("W0001", a1.get("warningId"));
+        assertEquals(1, ((List<?>) a1.get("edits")).size());
         Map<?, ?> a2 = (Map<?, ?>) cs.get(1);
-        assertEquals(1L, ((Map<?, ?>) ((List<?>) a2.get("associations")).get(0)).get("answerEditIndex"));
+        assertEquals("W0002@1", a2.get("group"));
+        assertEquals(2, ((List<?>) a2.get("edits")).size());
+        assertEquals(List.of(1L), ((Map<?, ?>) ((List<?>) a2.get("edits")).get(1)).get("answerEditIndices"));
+        assertEquals("because", ((Map<?, ?>) a2.get("proposal")).get("rationale"));
+        assertEquals("some", ((Map<?, ?>) a2.get("proposal")).get("uncertainty"));
         Map<?, ?> excluded = (Map<?, ?>) ((List<?>) candidates.get("excluded")).get(0);
         assertEquals("W0003", excluded.get("warningId"));
         assertEquals("FAILED", excluded.get("status"));
-        Map<?, ?> group = (Map<?, ?>) ((List<?>) candidates.get("groups")).get(1);
-        assertEquals(List.of("A0001", "A0002"), group.get("candidates"));
-        assertEquals("because", group.get("rationale"));
-        assertEquals("some", group.get("uncertainty"));
-        assertTrue(((String) candidates.get("note")).contains("do not establish the effect of the complete edit set"));
 
-        // A0001: resolves W0001 (x) and introduces the return finding; the total stays 2.
+        // A0001 (x): resolves W0001 and introduces the return finding; the total stays 2.
         Map<?, ?> r1 = json(dir.resolve("attempts/A0001/attempt.json"));
         assertEquals("COMPLETED", r1.get("outcome"));
         assertEquals(List.of("W0001"), r1.get("resolved"));
         assertEquals(Map.of("baselineFindings", 2L, "resultFindings", 2L, "resolved", 1L, "persisting", 1L,
                 "introduced", 1L, "ambiguousBaseline", 0L, "ambiguousResult", 0L), r1.get("counts"));
-        assertTrue(((List<?>) r1.get("groupNotes")).get(0).toString().contains("does not establish the effect"));
-        // A0002: resolves W0002 (y) only.
+        // A0002 (x and y together): resolves both and introduces the return finding.
         Map<?, ?> r2 = json(dir.resolve("attempts/A0002/attempt.json"));
-        assertEquals(List.of("W0002"), r2.get("resolved"));
-        assertEquals(List.of(), r2.get("introduced"));
+        assertEquals(List.of("W0001", "W0002"), r2.get("resolved"));
+        assertEquals(2L, r2.get("appliedEdits"));
+        assertEquals("APPLIED", ((Map<?, ?>) ((Map<?, ?>) ((List<?>) r2.get("edits")).get(1)).get("applier"))
+                .get("outcome"));
 
         WarningGraph g = graph(fx);
-        assertEquals(List.of("W0001 -resolved-by-> A0001", "A0001 -introduces-> A0001-N1",
-                "W0002 -resolved-by-> A0002"), edges(g));
-        WarningNode n1 = (WarningNode) g.node("A0001-N1").orElseThrow();
+        assertEquals(List.of("W0001 -resolved-by-> A0001", "A0001 -introduces-> W1001",
+                "W0001 -resolved-by-> A0002", "W0002 -resolved-by-> A0002", "A0002 -introduces-> W1002"), edges(g));
+        WarningNode n1 = (WarningNode) g.node("W1001").orElseThrow();
         assertFalse(n1.root());
         assertEquals(1, n1.distance());
         assertEquals(Optional.of("S0+A0001"), n1.state());
         assertTrue(n1.diagnostic().message().startsWith("returning @Nullable"));
         assertEquals(Optional.of("S0"), ((WarningNode) g.node("W0001").orElseThrow()).state());
-        assertEquals(List.of("W0001", "W0002"), annotation(g, "A0001").proposals().stream()
-                .map(AnnotationNode.Proposal::warningId).toList());
+        AnnotationNode p2 = annotation(g, "A0002");
+        assertEquals(2, p2.edits().size());
+        assertEquals(List.of("W0002"), p2.proposals().stream().map(AnnotationNode.Proposal::warningId).toList());
 
         assertTrue(stdout().contains("A0001  COMPLETED  findings 2 -> 2 (0); resolved 1, introduced 1, persisting 1"),
                 stdout());
-        assertTrue(stdout().contains("A0002  COMPLETED  findings 2 -> 1 (-1); resolved 1, introduced 0"), stdout());
+        assertTrue(stdout().contains("A0002  package of 2 edit(s) proposed for W0002 (W0002@1):"), stdout());
+        assertTrue(stdout().contains("A0002  COMPLETED  findings 2 -> 1 (-1); resolved 2, introduced 1"), stdout());
         assertTrue(stdout().contains("excluded W0003 (FAILED)"), stdout());
-        assertTrue(stdout().contains("1 edit(s) reduced the finding count"), stdout());
+        assertTrue(stdout().contains("1 package(s) reduced the finding count"), stdout());
 
-        // One baseline plus one run per candidate, always over every source root.
+        // One baseline plus one checker run per package, always over every source root.
         assertEquals(3, checker.calls());
         checker.requests.forEach(r -> assertEquals(List.of(Path.of("src")), r.sourceRoots()));
-        // Edits do not accumulate: A0002's workspace has y annotated but not x.
+        // Packages do not accumulate: A0001's workspace has x only, A0002's both edits.
+        String a1Source = Files.readString(dir.resolve("attempts/A0001/source/src/p/A.java"));
+        assertTrue(a1Source.contains("@org.jspecify.annotations.Nullable Object x;"), a1Source);
+        assertTrue(a1Source.contains("    Object y;"), a1Source);
         String a2Source = Files.readString(dir.resolve("attempts/A0002/source/src/p/A.java"));
         assertTrue(a2Source.contains("@org.jspecify.annotations.Nullable Object y;"), a2Source);
-        assertTrue(a2Source.contains("    Object x; // x"), a2Source);
+        assertTrue(a2Source.contains("@org.jspecify.annotations.Nullable Object x;"), a2Source);
         assertEquals(ProposalFixture.SOURCE, Files.readString(dir.resolve("baseline/source/src/p/A.java")));
         assertTrue(Files.readString(dir.resolve("attempts/A0002/changes.diff")).contains("+    @org.jspecify"));
     }
@@ -225,7 +231,7 @@ class EvaluateAnnotationsTest {
 
         WarningGraph g = graph(fx);
         assertEquals(List.of("W0001 -resolved-by-> A0001", "W0002 -resolved-by-> A0001",
-                "A0001 -introduces-> A0001-N1", "A0001 -introduces-> A0001-N2"), edges(g));
+                "A0001 -introduces-> W1001", "A0001 -introduces-> W1002"), edges(g));
         assertEquals(2, annotation(g, "A0001").counts().orElseThrow().introduced());
     }
 
@@ -245,7 +251,7 @@ class EvaluateAnnotationsTest {
         assertEquals("COMPLETED", a.outcome());
         assertTrue(a.detail().contains("no finding changed"), a.detail());
         assertEquals(2, a.counts().orElseThrow().persisting());
-        assertTrue(stdout().contains("0 edit(s) reduced the finding count"), stdout());
+        assertTrue(stdout().contains("0 package(s) reduced the finding count"), stdout());
     }
 
     /** Overwrites the snapshot file (test-owned) with a method that repeats one statement. */
@@ -348,7 +354,7 @@ class EvaluateAnnotationsTest {
         WarningGraph g = graph(fx);
         assertEquals("NO_OP", annotation(g, "A0001").outcome());
         assertEquals("REJECTED", annotation(g, "A0002").outcome());
-        assertTrue(annotation(g, "A0002").detail().contains("rejected by the applier"));
+        assertTrue(annotation(g, "A0002").detail().contains("package rejected, nothing applied"));
         assertEquals("REJECTED", annotation(g, "A0003").outcome());
         assertTrue(annotation(g, "A0003").detail().contains("suppresses or disables checking"));
         assertEquals(List.of(), g.edges());
@@ -363,12 +369,12 @@ class EvaluateAnnotationsTest {
     void executionFailuresAreOutcomesNeverZeroWarnings() throws Exception {
         ProposalFixture fx = standard();
         FakeChecker checker = new FakeChecker(s -> {
-            if (s.annotated("Object x;")) {
-                return ExecutionFailure.before(FailureKind.TIMED_OUT, "javac timed out");
-            }
             if (s.annotated("Object y;")) {
                 return new ExecutionFailure(FailureKind.COMPILATION_FAILED, List.of("cannot find symbol Nullable"),
                         List.of(), List.of());
+            }
+            if (s.annotated("Object x;")) {
+                return ExecutionFailure.before(FailureKind.TIMED_OUT, "javac timed out");
             }
             return FakeChecker.nullness(s);
         });
@@ -381,7 +387,7 @@ class EvaluateAnnotationsTest {
         assertTrue(annotation(g, "A0002").counts().isEmpty());
         assertEquals(List.of(), g.edges());
         assertFalse(stdout().contains("findings 2 ->"), stdout());
-        assertTrue(stdout().contains("0 edit(s) reduced the finding count"), stdout());
+        assertTrue(stdout().contains("0 package(s) reduced the finding count"), stdout());
         Map<?, ?> r = json(evaluation(fx).resolve("attempts/A0002/attempt.json"));
         assertEquals("COMPILATION_FAILED", ((Map<?, ?>) r.get("failure")).get("kind"));
         assertEquals(null, r.get("counts"));
@@ -441,7 +447,7 @@ class EvaluateAnnotationsTest {
         assertTrue(Files.isDirectory(dir.resolve("attempts/interrupted/A0002-1")));
         WarningGraph g = graph(fx);
         assertEquals("COMPLETED", annotation(g, "A0002").outcome());
-        assertEquals(3, g.edges().size());
+        assertEquals(5, g.edges().size());
     }
 
     @Test
@@ -487,7 +493,7 @@ class EvaluateAnnotationsTest {
 
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(fx, checker, "W0042"), output());
         assertEquals(ExitCode.EXECUTION_FAILURE, run(fx, checker, "W0003"), output());
-        assertTrue(stdout().contains("yielded no candidate edits"), stdout());
+        assertTrue(stdout().contains("yielded no annotation package"), stdout());
     }
 
     @Test
@@ -569,19 +575,24 @@ class EvaluateAnnotationsTest {
         WarningGraph g = WarningGraphJson.read(text);
 
         assertEquals(text, WarningGraphJson.write(g));
-        assertEquals(2L, json(evaluation(fx).resolve(Evaluator.GRAPH)).get("schemaVersion"));
+        assertEquals(4L, json(evaluation(fx).resolve(Evaluator.GRAPH)).get("schemaVersion"));
         String dot = DotExporter.toDot(g);
         assertTrue(dot.contains("\"A0001\" [id=\"A0001\", shape=ellipse"), dot);
-        assertTrue(dot.contains("\"A0001-N1\" [id=\"A0001-N1\", label=\"A0001-N1\""), dot);
+        assertTrue(dot.contains("\"W1001\" [id=\"W1001\", label=\"W1001\""), dot);
+        assertTrue(dot.contains("state S0+A0001, introduced in round 1"), dot);
         assertTrue(dot.contains("style=\"rounded,filled,dashed\""), dot);
         assertTrue(dot.contains("\"W0001\" -> \"A0001\" [label=\"resolved-by\", color=\"#2e7d32\""), dot);
-        assertTrue(dot.contains("\"A0001\" -> \"A0001-N1\" [label=\"introduces\", color=\"#c62828\""), dot);
+        assertTrue(dot.contains("\"A0001\" -> \"W1001\" [label=\"introduces\", color=\"#c62828\""), dot);
         assertTrue(dot.contains("Evaluation graph: run run 1"), dot);
+        assertTrue(dot.contains("label=\"A0002\\nCOMPLETED\\n2 edits\""), dot);
+        assertTrue(dot.contains("A0002: package of 2 edit(s) proposed for W0002 (W0002@1)\\n  ADD @org.jspecify"
+                + ".annotations.Nullable at FIELD of p.A#x in src/p/A.java [APPLIED]\\n  ADD @org.jspecify.annotations"
+                + ".Nullable at FIELD of p.A#y in src/p/A.java [APPLIED]"), dot);
         List<String> kinds = new ArrayList<>();
         for (GraphNode n : g.nodes()) {
             kinds.add(n.kind());
         }
-        assertEquals(List.of("warning", "warning", "annotation", "warning", "annotation"), kinds);
+        assertEquals(List.of("warning", "warning", "annotation", "warning", "annotation", "warning"), kinds);
         assertTrue(g.edges().stream().allMatch(e -> e.kind().equals(GraphEdge.RESOLVED_BY)
                 || e.kind().equals(GraphEdge.INTRODUCES)));
     }

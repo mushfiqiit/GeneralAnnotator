@@ -101,6 +101,14 @@ class MainTest {
     }
 
     @Test
+    void migrateWarningIdsCommandIsDispatchedAndValidatesItsArgument() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "migrate-warning-ids", "no-such-dir"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot migrate warning IDs"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("migrate-warning-ids <evaluation dir>"));
+    }
+
+    @Test
     void checkWithoutConfigurationIsConfigurationError() {
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "check"));
         String text = err.toString(StandardCharsets.UTF_8);

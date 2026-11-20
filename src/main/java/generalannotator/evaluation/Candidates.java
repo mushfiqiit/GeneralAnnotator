@@ -21,79 +21,103 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * The candidate edits of one inference submission: every validated COMPLETED_PROPOSED answer is
- * imported through {@link ProposalImporter} (which reuses the collection's verification), and
- * identical edits are merged across answers.
+ * The candidate annotation packages of one inference submission. Every validated COMPLETED_PROPOSED
+ * answer is imported through {@link ProposalImporter} (which reuses the collection's verification)
+ * and becomes <b>one package</b>: the complete set of edits proposed together for one warning. A
+ * package is applied as a whole and checked once; its edits are never evaluated one by one.
  *
- * <p>Edit identity is {@link #editKey}: source root, file, declaring class, member, exact position,
- * action and annotation name. Each merged candidate keeps every originating association (warning,
- * proposal group and index in the answer). A proposal group is one answer: all of its edits were
- * proposed together, but each candidate is evaluated alone, so a candidate's result does not establish
- * the effect of its group's complete edit set.
- *
- * <p>Failed, missing, invalid and insufficient-evidence answers are listed in {@link #excluded()} with
- * the reason, never turned into empty proposals. Candidate IDs {@code A0001, ...} follow the first
- * occurrence in numeric warning order and answer edit order, so they do not depend on any filter.
+ * <p>Within a package, identical entries of the answer's {@code edits} are merged (identity: source
+ * root, file, class, member, exact position, action and annotation, {@link #editKey}), keeping every
+ * entry's index and uncertainty. Packages from answers about different warnings stay separate even if
+ * they share edits. Failed, missing, invalid and insufficient-evidence answers are listed in
+ * {@link #excluded()} with the reason, never turned into empty packages. Package IDs {@code A0001, ...}
+ * follow numeric warning order, so they do not depend on any filter.
  *
  * @param submissionId the inference submission
  * @param runId the analyzed run
  * @param runDir the run directory
  * @param snapshot the run's snapshot ({@code workspace/target}), read only
  * @param sourceRoots the run's configured source roots ({@code report.json})
- * @param candidates the distinct edits
- * @param groups the imported answers
- * @param excluded the answers that yielded no candidates, with reasons
+ * @param candidates the packages, one per proposed answer
+ * @param excluded the answers that yielded no package, with reasons
  */
 public record Candidates(String submissionId, String runId, Path runDir, Path snapshot, List<String> sourceRoots,
-        List<Candidate> candidates, List<Group> groups, List<Excluded> excluded) {
+        List<Candidate> candidates, List<Excluded> excluded) {
 
     public static final String FILE = "candidates.json";
-    public static final String GROUP_NOTE = "Each candidate is evaluated alone against the baseline. For an answer "
-            + "with several edits, the individual results do not establish the effect of the complete edit set, and "
-            + "independently successful edits are not shown to combine safely.";
+    /** The candidate model recorded in candidates.json and the evaluation key. */
+    public static final String MODEL = "answer-package-1";
+    public static final String NOTE = "Each candidate is one answer's complete edit set for one warning, applied "
+            + "together and checked once against the baseline. Packages are evaluated independently of each other; "
+            + "independently successful packages are not shown to combine safely.";
 
     public Candidates {
         sourceRoots = List.copyOf(sourceRoots);
         candidates = List.copyOf(candidates);
-        groups = List.copyOf(groups);
         excluded = List.copyOf(excluded);
     }
 
-    /** One distinct edit and every answer entry that proposed it. */
-    public record Candidate(String id, AnnotationEdit edit, List<Association> associations) {
-        public Candidate {
-            associations = List.copyOf(associations);
-        }
-
-        public boolean proposedFor(String warningId) {
-            return associations.stream().anyMatch(a -> a.warningId().equals(warningId));
-        }
-    }
-
     /**
-     * One answer entry that proposed a candidate.
+     * One package: the distinct edits of one answer, with its provenance.
      *
+     * @param id the package ID, {@code A0001, ...}
      * @param warningId the warning of the analyzed run the answer was about
-     * @param group the proposal group ID ({@code <warning>@<attempt>})
-     * @param answerEditIndex the index of the edit in the answer's {@code edits}
-     * @param uncertainty the per-edit uncertainty the model gave
-     */
-    public record Association(String warningId, String group, int answerEditIndex, Optional<String> uncertainty) {}
-
-    /**
-     * One imported answer: the edits proposed together for one warning, with provenance.
-     *
+     * @param group the answer ID ({@code <warning>@<attempt>})
      * @param answerFile the answer file, relative to the run directory
-     * @param candidateIds the candidates of its distinct edits, in answer order
+     * @param answerEdits the number of entries in the answer's {@code edits} (before merging)
+     * @param edits the distinct edits, in answer order
      */
-    public record Group(String id, String warningId, int attempt, String promptSha256, String answerFile,
-            String answerSha256, String rationale, String uncertainty, int answerEdits, List<String> candidateIds) {
-        public Group {
-            candidateIds = List.copyOf(candidateIds);
+    public record Candidate(String id, String warningId, String group, int attempt, String promptSha256,
+            String answerFile, String answerSha256, String rationale, String uncertainty, int answerEdits,
+            List<PackageEdit> edits) {
+        public Candidate {
+            edits = List.copyOf(edits);
+            if (edits.isEmpty()) {
+                throw new IllegalArgumentException("a package has at least one edit");
+            }
+        }
+
+        public boolean proposedFor(String warning) {
+            return warningId.equals(warning);
+        }
+
+        public List<AnnotationEdit> annotationEdits() {
+            return edits.stream().map(PackageEdit::edit).toList();
+        }
+
+        /**
+         * The identity of the package: its originating answer (warning, answer, answer hash) and its complete
+         * edit set in answer order. Used for resume together with the evaluation key (baseline,
+         * configuration and round).
+         */
+        public String packageKey() {
+            StringBuilder b = new StringBuilder(warningId).append('\n').append(group).append('\n').append(answerSha256);
+            for (PackageEdit e : edits) {
+                b.append("\n--\n").append(editKey(e.edit()));
+            }
+            return EvaluationFiles.sha256(b.toString());
+        }
+
+        /** A one-line description of the package. */
+        public String canonical() {
+            return "package of " + edits.size() + " edit(s) proposed for " + warningId + " (" + group + ")";
         }
     }
 
-    /** An answer without candidates: its collection or answer status and why. */
+    /**
+     * One distinct edit of a package.
+     *
+     * @param answerEditIndices the indices of every identical entry in the answer's {@code edits}
+     * @param uncertainties the per-entry uncertainty, in the same order
+     */
+    public record PackageEdit(AnnotationEdit edit, List<Integer> answerEditIndices, List<Optional<String>> uncertainties) {
+        public PackageEdit {
+            answerEditIndices = List.copyOf(answerEditIndices);
+            uncertainties = List.copyOf(uncertainties);
+        }
+    }
+
+    /** An answer without a package: its collection or answer status and why. */
     public record Excluded(String warningId, String status, String reason) {}
 
     /** The submission or run cannot be used at all. */
@@ -136,9 +160,7 @@ public record Candidates(String submissionId, String runId, Path runDir, Path sn
         }
 
         String submissionId = submission.getFileName().toString();
-        Map<String, List<Association>> byEdit = new LinkedHashMap<>();
-        Map<String, AnnotationEdit> edits = new LinkedHashMap<>();
-        List<Proposal> proposals = new ArrayList<>();
+        List<Candidate> candidates = new ArrayList<>();
         List<Excluded> excluded = new ArrayList<>();
         for (String id : ids) {
             ProposalImporter.Result result;
@@ -158,37 +180,20 @@ public record Candidates(String submissionId, String runId, Path runDir, Path sn
                 continue;
             }
             Proposal p = ((ProposalImporter.Ready) result).proposal();
-            proposals.add(p);
-            String group = group(p);
+            List<PackageEdit> edits = new ArrayList<>();
+            int answerEdits = 0;
             for (ProposedEdit pe : p.edits()) {
-                String key = editKey(pe.edit());
-                edits.putIfAbsent(key, pe.edit());
-                for (EditOrigin o : pe.origins()) {
-                    byEdit.computeIfAbsent(key, k -> new ArrayList<>())
-                            .add(new Association(o.warningId(), group, o.editIndex(), o.uncertainty()));
-                }
+                answerEdits += pe.origins().size();
+                edits.add(new PackageEdit(pe.edit(), pe.origins().stream().map(EditOrigin::editIndex).toList(),
+                        pe.origins().stream().map(EditOrigin::uncertainty).toList()));
             }
-        }
-        Map<String, String> idByKey = new LinkedHashMap<>();
-        List<Candidate> candidates = new ArrayList<>();
-        for (Map.Entry<String, AnnotationEdit> e : edits.entrySet()) {
-            String cid = String.format("A%04d", candidates.size() + 1);
-            idByKey.put(e.getKey(), cid);
-            candidates.add(new Candidate(cid, e.getValue(), byEdit.get(e.getKey())));
-        }
-        List<Group> groups = new ArrayList<>();
-        for (Proposal p : proposals) {
-            int answerEdits = p.edits().stream().mapToInt(pe -> pe.origins().size()).sum();
-            groups.add(new Group(group(p), p.source().warningId(), p.source().attempt(), p.source().promptSha256(),
+            candidates.add(new Candidate(String.format("A%04d", candidates.size() + 1), p.source().warningId(),
+                    p.source().warningId() + "@" + p.source().attempt(), p.source().attempt(),
+                    p.source().promptSha256(),
                     runDir.relativize(p.source().answerFile().toAbsolutePath().normalize()).toString(),
-                    p.source().answerSha256(), p.rationale(), p.uncertainty(), answerEdits,
-                    p.edits().stream().map(pe -> idByKey.get(editKey(pe.edit()))).toList()));
+                    p.source().answerSha256(), p.rationale(), p.uncertainty(), answerEdits, edits));
         }
-        return new Candidates(submissionId, runId, runDir, snapshot, roots, candidates, groups, excluded);
-    }
-
-    private static String group(Proposal p) {
-        return p.source().warningId() + "@" + p.source().attempt();
+        return new Candidates(submissionId, runId, runDir, snapshot, roots, candidates, excluded);
     }
 
     private static Map<?, ?> report(Path runDir) throws InvalidException, IOException {
@@ -225,54 +230,41 @@ public record Candidates(String submissionId, String runId, Path runDir, Path sn
         return m;
     }
 
-    public Optional<Group> group(String id) {
-        return groups.stream().filter(g -> g.id().equals(id)).findFirst();
+    public int editCount() {
+        return candidates.stream().mapToInt(c -> c.edits().size()).sum();
     }
 
     /** {@code candidates.json}: deterministic (no timestamps), so equal imports give equal files. */
     public String toJson() {
         Map<String, Object> root = new LinkedHashMap<>();
-        root.put("schemaVersion", 1);
+        root.put("schemaVersion", 2);
+        root.put("candidateModel", MODEL);
         root.put("submissionId", submissionId);
         root.put("runId", runId);
-        root.put("note", GROUP_NOTE);
+        root.put("note", NOTE);
         List<Object> cs = new ArrayList<>();
         for (Candidate c : candidates) {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("id", c.id());
-            m.put("canonical", c.edit().canonical());
-            m.put("edit", editFields(c.edit()));
-            List<Object> as = new ArrayList<>();
-            for (Association a : c.associations()) {
-                Map<String, Object> am = new LinkedHashMap<>();
-                am.put("warningId", a.warningId());
-                am.put("group", a.group());
-                am.put("answerEditIndex", a.answerEditIndex());
-                am.put("uncertainty", a.uncertainty().orElse(null));
-                as.add(am);
-            }
-            m.put("associations", as);
+            m.put("warningId", c.warningId());
+            m.put("group", c.group());
+            m.put("packageKey", c.packageKey());
+            m.put("canonical", c.canonical());
+            Map<String, Object> source = new LinkedHashMap<>();
+            source.put("submissionId", submissionId);
+            source.put("runId", runId);
+            source.put("attempt", c.attempt());
+            source.put("promptSha256", c.promptSha256());
+            source.put("answerFile", c.answerFile());
+            source.put("answerSha256", c.answerSha256());
+            source.put("rationale", c.rationale());
+            source.put("uncertainty", c.uncertainty());
+            source.put("answerEdits", c.answerEdits());
+            m.put("proposal", source);
+            m.put("edits", editsJson(c));
             cs.add(m);
         }
         root.put("candidates", cs);
-        List<Object> gs = new ArrayList<>();
-        for (Group g : groups) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("id", g.id());
-            m.put("warningId", g.warningId());
-            m.put("submissionId", submissionId);
-            m.put("runId", runId);
-            m.put("attempt", g.attempt());
-            m.put("promptSha256", g.promptSha256());
-            m.put("answerFile", g.answerFile());
-            m.put("answerSha256", g.answerSha256());
-            m.put("rationale", g.rationale());
-            m.put("uncertainty", g.uncertainty());
-            m.put("answerEdits", g.answerEdits());
-            m.put("candidates", g.candidateIds());
-            gs.add(m);
-        }
-        root.put("groups", gs);
         List<Object> xs = new ArrayList<>();
         for (Excluded x : excluded) {
             Map<String, Object> m = new LinkedHashMap<>();
@@ -283,5 +275,19 @@ public record Candidates(String submissionId, String runId, Path runDir, Path sn
         }
         root.put("excluded", xs);
         return Json.write(root);
+    }
+
+    /** The package's edits as JSON: canonical form, identity fields, answer indices and uncertainties. */
+    static List<Object> editsJson(Candidate c) {
+        List<Object> list = new ArrayList<>();
+        for (PackageEdit e : c.edits()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("canonical", e.edit().canonical());
+            m.put("edit", editFields(e.edit()));
+            m.put("answerEditIndices", e.answerEditIndices());
+            m.put("uncertainties", e.uncertainties().stream().map(u -> u.orElse(null)).toList());
+            list.add(m);
+        }
+        return list;
     }
 }

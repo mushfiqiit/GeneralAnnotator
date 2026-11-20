@@ -18,6 +18,7 @@ import generalannotator.graph.AnnotationNode;
 import generalannotator.graph.InitialWarningGraph;
 import generalannotator.graph.WarningGraph;
 import generalannotator.graph.WarningGraphJson;
+import generalannotator.graph.WarningIds;
 import generalannotator.graph.WarningNode;
 import generalannotator.isolation.SnapshotCopier;
 import generalannotator.report.Json;
@@ -60,16 +61,18 @@ import java.util.TreeMap;
  *   result.json          findings with IDs and anchors, tool identity, configuration
  * baseline-failed/<t>/   a failed baseline, kept for inspection (evaluation is blocked)
  * attempts/<A0001>/      complete only when attempt.json exists
- *   source/              baseline copy with exactly this one edit (APPLIED only)
- *   changes.diff         the edit as a unified diff (APPLIED only)
- *   check/               checker logs (APPLIED only)
+ *   source/              baseline copy with this package's complete edit set (applied packages only)
+ *   changes.diff         the package as a unified diff over every changed file (applied packages only)
+ *   check/               checker logs of the one checker run (applied packages only)
  *   comparison.json      matcher result (completed analyses only)
  *   attempt.json         outcome, counts, resolved and introduced warnings, provenance
  * attempts/interrupted/<A0001>-<n>/   an attempt directory left without attempt.json, moved aside
  * evaluation-graph.json  the expanded graph (rebuilt from the records after every invocation)
  * summary.json           per-candidate outcomes and counts
  * </pre>
- * Source edits never accumulate: every attempt starts from {@code baseline/source}. The run's own
+ * One attempt is one annotation package ({@link Candidates.Candidate}): every edit of one answer is
+ * applied together, all or nothing, and the checker runs once. Packages never accumulate: every attempt
+ * starts from {@code baseline/source}. The run's own
  * snapshot, its {@code warning-graph.json} and the inference artifacts are only read; the snapshot's
  * tree hash is checked again at the end.
  */
@@ -82,16 +85,32 @@ public final class Evaluator {
     public static final String ATTEMPT = "attempt.json";
     public static final String COMPARISON = "comparison.json";
     public static final String BASELINE_STATE = "S0";
+    /** Version of baseline/result.json. */
     static final int SCHEMA_VERSION = 1;
+    /**
+     * Version of the evaluation key. Version 2 adds the candidate model ({@value Candidates#MODEL}) and the
+     * round, so package evaluations never share a directory (or cached results) with the earlier single-edit
+     * evaluations (key version 1), which are kept as they are.
+     */
+    static final int KEY_SCHEMA_VERSION = 2;
+    /**
+     * Version of evaluation.json, attempt.json and summary.json for package evaluations. Version 1 records
+     * were single-edit records without rounds, version 2 single-edit records with rounds ({@link
+     * #EDIT_LEVEL_RECORD_SCHEMA_VERSION}, what {@link WarningIdMigration} produces); neither is reused.
+     */
+    public static final int RECORD_SCHEMA_VERSION = 3;
+    /** The record version of single-edit evaluations with rounds (historical). */
+    public static final int EDIT_LEVEL_RECORD_SCHEMA_VERSION = 2;
 
     public static final List<String> LIMITATIONS = List.of(
-            "Each candidate edit is evaluated alone against the same baseline; edits never accumulate, so the "
-                    + "graph does not show whether independently successful edits combine safely.",
-            "Warnings introduced by an edit are recorded, but no fixes are inferred for them.",
+            "Each candidate is one answer's complete edit set, applied together and checked once. Packages are "
+                    + "evaluated alone against the same baseline and never accumulate, so the graph does not show "
+                    + "whether independently successful packages combine safely.",
+            "Warnings introduced by a package are recorded, but no fixes are inferred for them.",
             "Warning identity across states is the provisional rule recorded with each comparison "
                     + "(project-spec §6.1); ambiguous findings support no resolution or introduction claim.",
-            "For an answer with several edits, individual results do not establish the effect of the complete "
-                    + "edit set.",
+            "A package's result is that of its whole edit set; it says nothing about which edit of the package "
+                    + "caused which change.",
             "An incomplete analysis (compilation failure, crash, timeout) gives no evidence about warnings; it never "
                     + "counts as zero warnings or as a resolution.");
 
@@ -103,12 +122,21 @@ public final class Evaluator {
     private final Checker checker;
     private final AnnotationApplier applier;
     private final WarningMatcher matcher;
+    private final int round;
     private final Clock clock;
     private final PrintStream out;
     private final ToolIdentity tools = new ToolIdentity();
 
+    /**
+     * @param round the inference round these candidates were proposed in (1 for answers about the
+     *     run's initial warnings); recorded in evaluation.json and on every node it creates
+     */
     public Evaluator(Candidates candidates, EvaluationConfig config, Checker checker, AnnotationApplier applier,
-            WarningMatcher matcher, Clock clock, PrintStream out) {
+            WarningMatcher matcher, int round, Clock clock, PrintStream out) {
+        if (round < 1) {
+            throw new IllegalArgumentException("round must be >= 1: " + round);
+        }
+        this.round = round;
         this.candidates = candidates;
         this.config = config;
         this.checker = checker;
@@ -125,7 +153,9 @@ public final class Evaluator {
         /** The baseline analysis failed; nothing was evaluated. */
         BASELINE_FAILED,
         /** Another process is writing the evaluation directory. */
-        BUSY
+        BUSY,
+        /** The evaluation directory cannot be continued as it is (for example it needs migration). */
+        REFUSED
     }
 
     /** One line of the per-candidate summary. */
@@ -154,7 +184,9 @@ public final class Evaluator {
         String snapshotHash = EvaluationFiles.treeHash(candidates.snapshot());
         String candidatesJson = candidates.toJson();
         Map<String, Object> key = new LinkedHashMap<>();
-        key.put("schemaVersion", SCHEMA_VERSION);
+        key.put("schemaVersion", KEY_SCHEMA_VERSION);
+        key.put("candidateModel", Candidates.MODEL);
+        key.put("round", round);
         key.put("runId", candidates.runId());
         key.put("submissionId", candidates.submissionId());
         key.put("snapshotTreeSha256", snapshotHash);
@@ -175,16 +207,31 @@ public final class Evaluator {
     private Result locked(Path dir, String evaluationId, Map<String, Object> key, String keyJson,
             String candidatesJson, String snapshotHash, Optional<String> warningFilter) throws IOException {
         Path record = dir.resolve(RECORD);
+        if (Files.exists(dir.resolve(WarningIdMigration.MARKER))) {
+            return refused(dir, "a warning-ID migration of " + dir + " did not finish; run migrate-warning-ids '" + dir
+                    + "' again to complete it");
+        }
         if (Files.exists(record)) {
             Map<?, ?> existing = parse(record);
             if (!keyJson.equals(Json.write(existing.get("key")))) {
                 throw new IOException(record + " belongs to a different baseline, configuration or candidate set");
             }
+            if (!(existing.get("round") instanceof Long recorded)) {
+                return refused(dir, dir + " was written before warning IDs recorded the inference round (introduced "
+                        + "warnings are named like A0001-N1). Convert it first, keeping a backup: migrate-warning-ids '"
+                        + dir + "'");
+            }
+            if (recorded != round) {
+                return refused(dir, dir + " records round " + recorded + ", not round " + round);
+            }
         } else {
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("schemaVersion", SCHEMA_VERSION);
+            m.put("schemaVersion", RECORD_SCHEMA_VERSION);
             m.put("evaluationId", evaluationId);
             m.put("createdAt", clock.instant().toString());
+            m.put("round", round);
+            m.put("warningIdScheme", WarningIds.SCHEME);
+            m.put("candidateModel", Candidates.MODEL);
             m.put("key", key);
             m.put("runDirectory", candidates.runDir().toString());
             m.put("snapshot", candidates.snapshot().toString());
@@ -202,7 +249,19 @@ public final class Evaluator {
             throw new IOException(candidatesFile + " was changed; it no longer matches the evaluation key");
         }
 
-        out.println("  evaluation: " + dir);
+        for (Candidates.Candidate c : candidates.candidates()) {
+            Path f = dir.resolve("attempts").resolve(c.id()).resolve(ATTEMPT);
+            if (Files.exists(f) && !Long.valueOf(RECORD_SCHEMA_VERSION).equals(parse(f).get("schemaVersion"))) {
+                return refused(dir, f + " is not a package record (schema " + RECORD_SCHEMA_VERSION + "); results of "
+                        + "earlier single-edit evaluations are never reused as package results");
+            }
+        }
+
+        out.println("  evaluation: " + dir + " (round " + round + ", one annotation package per answer)");
+        for (Path other : olderEvaluations(dir)) {
+            out.println("  kept, not reused: " + other + " (an earlier single-edit evaluation; its per-edit results "
+                    + "are never combined into package results)");
+        }
         Optional<Baseline> found = baseline(dir, evaluationId, snapshotHash);
         if (found.isEmpty()) {
             return new Result(Status.BASELINE_FAILED, dir, "the baseline analysis did not complete; see "
@@ -212,14 +271,41 @@ public final class Evaluator {
         out.println("  baseline:   " + (baseline.reused() ? "reused, " : "") + baseline.findings().size()
                 + " finding(s) in state " + BASELINE_STATE + " (" + baseline.dir() + ")");
         Map<String, String> original = originalMapping(baseline);
+        Optional<String> invalid = Optional.empty();
+        WarningIds.Allocator ids;
+        {
+            Set<String> taken = new LinkedHashSet<>();
+            baseline.nodes().forEach(n -> taken.add(n.id()));
+            int last = 0;
+            for (Map.Entry<String, Map<?, ?>> e : records(dir).entrySet()) {
+                for (Map<?, ?> im : introduced(e.getValue())) {
+                    String id = String.valueOf(im.get("warningId"));
+                    java.util.OptionalInt seq = WarningIds.sequence(id, round);
+                    if (!Long.valueOf(round).equals(im.get("round")) || seq.isEmpty() || !taken.add(id)) {
+                        invalid = Optional.of("attempt " + e.getKey() + " records introduced warning " + id + " (round "
+                                + im.get("round") + "), which is not a unique round-" + round + " ID");
+                    } else {
+                        last = Math.max(last, seq.getAsInt());
+                    }
+                }
+            }
+            if (invalid.isPresent()) {
+                return refused(dir, invalid.get());
+            }
+            ids = new WarningIds.Allocator(round, taken, last);
+        }
 
         List<AttemptSummary> summaries = new ArrayList<>();
         for (Candidates.Candidate c : candidates.candidates()) {
             if (warningFilter.isPresent() && !c.proposedFor(warningFilter.get())) {
                 continue;
             }
-            AttemptSummary s = attempt(dir, evaluationId, baseline, c);
+            AttemptSummary s = attempt(dir, evaluationId, baseline, c, ids);
             summaries.add(s);
+            out.println("  " + c.id() + "  " + c.canonical() + ":");
+            for (Candidates.PackageEdit pe : c.edits()) {
+                out.println("          " + pe.edit().canonical());
+            }
             out.println("  " + line(s));
         }
 
@@ -232,10 +318,10 @@ public final class Evaluator {
         Map<String, Map<?, ?>> records = records(dir);
         Set<String> interrupted = interrupted(dir, records.keySet());
         WarningGraph graph = EvaluationGraph.build(candidates, baseline.nodes(), records, interrupted, original,
-                config.analysis().checkerId());
+                config.analysis().checkerId(), round);
         EvaluationFiles.writeAtomically(dir.resolve(GRAPH), WarningGraphJson.write(graph));
         EvaluationFiles.writeAtomically(dir.resolve(SUMMARY), Json.write(summary(evaluationId, baseline, original,
-                records, interrupted, graph)));
+                records, interrupted, graph, ids)));
         return new Result(Status.COMPLETED, dir, "", summaries);
     }
 
@@ -260,7 +346,7 @@ public final class Evaluator {
                 ObservedFinding of = FindingJson.finding(f);
                 findings.add(of);
                 nodes.add(new WarningNode(of.id(), of.diagnostic(), Optional.ofNullable((String) f.get("targetPath")),
-                        true, 0, Optional.of(BASELINE_STATE)));
+                        true, 0, Optional.of(BASELINE_STATE), java.util.OptionalInt.of(0)));
             }
             return Optional.of(new Baseline(bdir, findings, nodes, (Map<?, ?>) r.get("toolIdentity"), recorded, true));
         }
@@ -302,7 +388,8 @@ public final class Evaluator {
         for (WarningNode n : graph.warningNodes()) {
             ObservedFinding f = observe(n.id(), n.diagnostic(), n.targetPath(), anchors);
             findings.add(f);
-            nodes.add(new WarningNode(n.id(), n.diagnostic(), n.targetPath(), true, 0, Optional.of(BASELINE_STATE)));
+            nodes.add(new WarningNode(n.id(), n.diagnostic(), n.targetPath(), true, 0, Optional.of(BASELINE_STATE),
+                    java.util.OptionalInt.of(0)));
             Map<String, Object> m = FindingJson.finding(f);
             m.put("targetPath", n.targetPath().orElse(null));
             findingJson.add(m);
@@ -373,16 +460,17 @@ public final class Evaluator {
     // ---------------------------------------------------------------------------------------------
     // Attempts
 
-    private AttemptSummary attempt(Path dir, String evaluationId, Baseline baseline, Candidates.Candidate c)
-            throws IOException {
+    private AttemptSummary attempt(Path dir, String evaluationId, Baseline baseline, Candidates.Candidate c,
+            WarningIds.Allocator ids) throws IOException {
         Path adir = dir.resolve("attempts").resolve(c.id());
         Path recordFile = adir.resolve(ATTEMPT);
-        String editKey = Candidates.editKey(c.edit());
+        String packageKey = c.packageKey();
         if (Files.exists(recordFile)) {
             Map<?, ?> r = parse(recordFile);
-            if (!evaluationId.equals(r.get("evaluationId")) || !editKey.equals(r.get("editKey"))) {
-                throw new IOException(recordFile + " records another evaluation or edit; remove the evaluation "
-                        + "directory to start again");
+            if (!evaluationId.equals(r.get("evaluationId")) || !packageKey.equals(r.get("packageKey"))
+                    || !Long.valueOf(round).equals(r.get("round"))) {
+                throw new IOException(recordFile + " records another evaluation, round or package; remove the "
+                        + "evaluation directory to start again");
             }
             return summary(c.id(), r, "reused", adir);
         }
@@ -395,40 +483,59 @@ public final class Evaluator {
         Files.createDirectories(adir);
         Instant started = clock.instant();
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("schemaVersion", SCHEMA_VERSION);
+        m.put("schemaVersion", RECORD_SCHEMA_VERSION);
         m.put("evaluationId", evaluationId);
+        m.put("round", round);
         m.put("candidateId", c.id());
-        m.put("editKey", editKey);
-        m.put("canonical", c.edit().canonical());
-        m.put("edit", Candidates.editFields(c.edit()));
+        m.put("packageKey", packageKey);
+        m.put("canonical", c.canonical());
+        m.put("warningId", c.warningId());
+        m.put("group", c.group());
         m.put("baselineState", BASELINE_STATE);
-        m.put("proposals", associations(c));
-        m.put("groupNotes", groupNotes(c));
+        List<Object> editRecords = Candidates.editsJson(c);
+        m.put("edits", editRecords);
         m.put("startedAt", started.toString());
 
         AttemptOutcome outcome;
         String detail;
         AnnotationNode.Counts counts = null;
-        Optional<String> suppression = suppression(c.edit());
-        if (suppression.isPresent()) {
+        List<String> suppressions = new ArrayList<>();
+        for (int i = 0; i < c.edits().size(); i++) {
+            int index = i;
+            suppression(c.edits().get(i).edit()).ifPresent(s -> suppressions.add("edit " + index + ": " + s));
+        }
+        if (!suppressions.isEmpty()) {
             outcome = AttemptOutcome.REJECTED;
-            detail = suppression.get();
-            m.put("applier", null);
+            detail = "package rejected, nothing applied: " + String.join("; ", suppressions);
         } else {
             Path source = adir.resolve("source");
             SnapshotCopier.copy(baseline.dir().resolve("source"), source);
-            AnnotationApplier.ApplyResult applied = applier.apply(source, List.of(c.edit()));
-            AnnotationApplier.EditResult er = applied.results().get(0);
-            Map<String, Object> am = new LinkedHashMap<>();
-            am.put("outcome", er.outcome().name());
-            am.put("detail", er.detail());
-            m.put("applier", am);
-            if (er.outcome() != AnnotationApplier.Outcome.APPLIED || !applied.committed()) {
+            AnnotationApplier.ApplyResult applied = applier.apply(source, c.annotationEdits());
+            int applies = 0;
+            List<String> rejections = new ArrayList<>();
+            for (int i = 0; i < applied.results().size(); i++) {
+                AnnotationApplier.EditResult er = applied.results().get(i);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> em = (Map<String, Object>) editRecords.get(i);
+                Map<String, Object> am = new LinkedHashMap<>();
+                am.put("outcome", er.outcome().name());
+                am.put("detail", er.detail());
+                em.put("applier", am);
+                if (er.outcome() == AnnotationApplier.Outcome.APPLIED) {
+                    applies++;
+                } else if (er.outcome() == AnnotationApplier.Outcome.REJECTED) {
+                    rejections.add("edit " + i + " (" + er.edit().canonical() + "): " + er.detail());
+                }
+            }
+            if (applied.rejected() || !applied.committed()) {
+                // all or nothing: a rejected or entirely no-op package leaves no workspace behind
                 EvaluationFiles.deleteTree(source);
-                outcome = er.outcome() == AnnotationApplier.Outcome.NO_OP ? AttemptOutcome.NO_OP
-                        : AttemptOutcome.REJECTED;
-                detail = (outcome == AttemptOutcome.NO_OP ? "no-op: " : "rejected by the applier: ") + er.detail();
+                outcome = applied.rejected() ? AttemptOutcome.REJECTED : AttemptOutcome.NO_OP;
+                detail = applied.rejected() ? "package rejected, nothing applied: " + String.join("; ", rejections)
+                        : "no-op: all " + c.edits().size() + " edit(s) of the package are already satisfied";
             } else {
+                m.put("appliedEdits", applies);
+                m.put("noOpEdits", c.edits().size() - applies);
                 StringBuilder diff = new StringBuilder();
                 for (AnnotationApplier.FileChange fc : applied.changes()) {
                     diff.append(UnifiedDiff.of(fc.path(), fc.before(), fc.after()));
@@ -467,7 +574,7 @@ public final class Evaluator {
                                 + " than the baseline; findings are not compared";
                         m.put("findingCount", completed.findings().size());
                     } else {
-                        Compared cmp = compare(baseline, completed, source, c.id());
+                        Compared cmp = compare(baseline, completed, source, c.id(), ids);
                         counts = cmp.counts();
                         outcome = cmp.comparison().ambiguous().isEmpty() ? AttemptOutcome.COMPLETED
                                 : AttemptOutcome.AMBIGUOUS;
@@ -493,7 +600,12 @@ public final class Evaluator {
     private record Compared(WarningMatcher.Comparison comparison, AnnotationNode.Counts counts,
             List<Object> introduced, List<Object> ambiguous, Map<String, Object> json) {}
 
-    private Compared compare(Baseline baseline, CompletedAnalysis completed, Path source, String candidateId) {
+    /**
+     * Matches the findings and gives every introduced finding the next ID of the round's sequence. Persisting
+     * findings keep their baseline IDs; resolved ones are baseline IDs; nothing else gets an ID.
+     */
+    private Compared compare(Baseline baseline, CompletedAnalysis completed, Path source, String candidateId,
+            WarningIds.Allocator ids) {
         WarningGraph sorted = InitialWarningGraph.build(candidates.runId(), checker.id(), completed, source);
         DeclarationAnchors anchors = new DeclarationAnchors(source);
         List<ObservedFinding> result = new ArrayList<>();
@@ -506,15 +618,18 @@ public final class Evaluator {
         }
         WarningMatcher.Comparison cmp = matcher.compare(baseline.findings(), result);
         List<Object> introduced = new ArrayList<>();
-        int k = 0;
+        List<Object> mapping = new ArrayList<>();
         for (String id : cmp.introduced()) {
             ObservedFinding f = result.stream().filter(r -> r.id().equals(id)).findFirst().orElseThrow();
+            String warningId = ids.next();
             Map<String, Object> im = new LinkedHashMap<>();
-            im.put("nodeId", candidateId + "-N" + (++k));
+            im.put("warningId", warningId);
+            im.put("round", round);
             im.put("resultId", id);
             im.put("targetPath", targetPaths.get(id).orElse(null));
             im.put("diagnostic", FindingJson.diagnostic(f.diagnostic()));
             introduced.add(im);
+            mapping.add(introducedMapping(id, warningId, round));
         }
         List<Object> ambiguous = new ArrayList<>();
         for (WarningMatcher.Ambiguity a : cmp.ambiguous()) {
@@ -535,6 +650,7 @@ public final class Evaluator {
         json.put("counts", countsJson(counts));
         json.put("resolved", cmp.resolved());
         json.put("introduced", cmp.introduced());
+        json.put("introducedWarnings", mapping);
         List<Object> pairs = new ArrayList<>();
         for (WarningMatcher.Pair p : cmp.persisting()) {
             pairs.add(Map.of("baseline", p.baselineId(), "result", p.resultId()));
@@ -543,6 +659,47 @@ public final class Evaluator {
         json.put("ambiguous", ambiguous);
         json.put("resultFindings", result.stream().map(FindingJson::finding).toList());
         return new Compared(cmp, counts, introduced, ambiguous, json);
+    }
+
+    static Map<String, Object> introducedMapping(String resultId, String warningId, int round) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("resultId", resultId);
+        m.put("warningId", warningId);
+        m.put("round", round);
+        return m;
+    }
+
+    /** The introduced-warning entries of an attempt record (empty if none). */
+    static List<Map<?, ?>> introduced(Map<?, ?> record) {
+        List<Map<?, ?>> list = new ArrayList<>();
+        if (record.get("introduced") instanceof List<?> l) {
+            l.forEach(o -> list.add((Map<?, ?>) o));
+        }
+        return list;
+    }
+
+    /** Sibling evaluation directories of the same submission written with an earlier candidate model. */
+    private List<Path> olderEvaluations(Path dir) throws IOException {
+        List<Path> older = new ArrayList<>();
+        Path parent = dir.getParent();
+        try (var entries = Files.list(parent)) {
+            for (Path p : entries.sorted().toList()) {
+                Path record = p.resolve(RECORD);
+                if (p.equals(dir) || !p.getFileName().toString().startsWith(candidates.submissionId())
+                        || !Files.isRegularFile(record)) {
+                    continue;
+                }
+                Map<?, ?> r = parse(record);
+                if (!(r.get("key") instanceof Map<?, ?> k) || !Candidates.MODEL.equals(k.get("candidateModel"))) {
+                    older.add(p);
+                }
+            }
+        }
+        return older;
+    }
+
+    private Result refused(Path dir, String message) {
+        return new Result(Status.REFUSED, dir, message, List.of());
     }
 
     private static ObservedFinding observe(String id, generalannotator.diagnostics.Diagnostic d,
@@ -609,30 +766,6 @@ public final class Evaluator {
         m.put("javaFilesOutsideSourceRoots", new TreeMap<>(run.coverage().javaFilesOutsideSourceRoots()));
         m.put("limitations", run.coverage().limitations());
         return m;
-    }
-
-    private static List<Object> associations(Candidates.Candidate c) {
-        List<Object> list = new ArrayList<>();
-        for (Candidates.Association a : c.associations()) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("warningId", a.warningId());
-            m.put("group", a.group());
-            m.put("answerEditIndex", a.answerEditIndex());
-            m.put("uncertainty", a.uncertainty().orElse(null));
-            list.add(m);
-        }
-        return list;
-    }
-
-    private List<String> groupNotes(Candidates.Candidate c) {
-        List<String> notes = new ArrayList<>();
-        for (Candidates.Association a : c.associations()) {
-            candidates.group(a.group()).filter(g -> g.candidateIds().size() > 1).ifPresent(g -> notes.add(
-                    c.id() + " is one of " + g.candidateIds().size() + " edits " + g.candidateIds() + " proposed "
-                            + "together by the answer for " + g.warningId() + "; this result does not establish the "
-                            + "effect of the complete edit set."));
-        }
-        return notes;
     }
 
     static Map<String, Object> countsJson(AnnotationNode.Counts c) {
@@ -719,10 +852,18 @@ public final class Evaluator {
     }
 
     private Map<String, Object> summary(String evaluationId, Baseline baseline, Map<String, String> original,
-            Map<String, Map<?, ?>> records, Set<String> interrupted, WarningGraph graph) {
+            Map<String, Map<?, ?>> records, Set<String> interrupted, WarningGraph graph, WarningIds.Allocator ids) {
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("schemaVersion", SCHEMA_VERSION);
+        m.put("schemaVersion", RECORD_SCHEMA_VERSION);
         m.put("evaluationId", evaluationId);
+        m.put("round", round);
+        Map<String, Object> seq = new LinkedHashMap<>();
+        seq.put("scheme", WarningIds.SCHEME);
+        seq.put("round", round);
+        seq.put("lastSequence", ids.lastSequence());
+        seq.put("next", ids.lastSequence() < WarningIds.MAX_PER_ROUND
+                ? WarningIds.introduced(round, ids.lastSequence() + 1) : null);
+        m.put("warningIdSequence", seq);
         m.put("runId", candidates.runId());
         m.put("submissionId", candidates.submissionId());
         m.put("baselineState", BASELINE_STATE);
@@ -750,14 +891,16 @@ public final class Evaluator {
             byOutcome.merge(outcome, 1, Integer::sum);
             Map<String, Object> e = new LinkedHashMap<>();
             e.put("candidateId", c.id());
-            e.put("canonical", c.edit().canonical());
-            e.put("proposedFor", c.associations().stream().map(Candidates.Association::warningId).distinct().toList());
+            e.put("canonical", c.canonical());
+            e.put("warningId", c.warningId());
+            e.put("group", c.group());
+            e.put("edits", c.edits().stream().map(pe -> pe.edit().canonical()).toList());
             e.put("outcome", outcome);
             e.put("detail", r == null ? null : r.get("detail"));
             e.put("counts", r == null ? null : r.get("counts"));
             e.put("resolved", r == null || r.get("resolved") == null ? List.of() : r.get("resolved"));
             e.put("introduced", r == null || !(r.get("introduced") instanceof List<?> l) ? List.of()
-                    : l.stream().map(x -> ((Map<?, ?>) x).get("nodeId")).toList());
+                    : l.stream().map(x -> ((Map<?, ?>) x).get("warningId")).toList());
             e.put("directory", "attempts/" + c.id());
             list.add(e);
         }

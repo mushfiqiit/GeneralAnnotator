@@ -7,6 +7,7 @@ import generalannotator.cli.ContextCommand;
 import generalannotator.cli.EvaluateAnnotationsCommand;
 import generalannotator.cli.ExitCode;
 import generalannotator.cli.InferenceCommand;
+import generalannotator.cli.MigrateWarningIdsCommand;
 import generalannotator.cli.PrepareInferenceCommand;
 import generalannotator.cli.PromptsCommand;
 import generalannotator.cli.SliceCommand;
@@ -85,7 +86,11 @@ public final class Main {
                       fresh copy, rerun the checker on all source roots, match findings, and write
                       evaluations/<id>/ with attempts, summary.json and evaluation-graph.json.
                       Checker settings as for check (GA_CHECKER, GA_CHECKER_HOME, GA_TARGET_CLASSPATH,
-                      ...); GA_TARGET_PROJECT and GA_TARGET_SOURCE_ROOTS are not used.
+                      ...); GA_TARGET_PROJECT and GA_TARGET_SOURCE_ROOTS are not used. The answers
+                      are inference round 1; warnings introduced in round 1 are W1001, W1002, ...
+              migrate-warning-ids <evaluation dir>
+                      Convert an evaluation written with candidate-local introduced-warning IDs
+                      (A0001-N1) to round IDs (W1001, ...), with a backup. Nothing is rerun.
 
             Exit codes: 0 success (check: analysis completed), 2 usage/configuration error,
                         3 execution failure (check: incomplete analysis; visualize: Graphviz
@@ -93,7 +98,8 @@ public final class Main {
                         context: attribution impossible or a target FAILED;
                         inference: incomplete, refused or unknown; apply-proposal: no applicable
                         proposal or it was rejected; evaluate-annotations: nothing to evaluate,
-                        baseline failed or evaluation busy), 4 internal error,
+                        baseline failed, evaluation busy, needs migration or IDs exhausted;
+                        migrate-warning-ids: refused), 4 internal error,
                         5 inference: the shared SSH connection is not available (reconnect).""";
 
     private Main() {}
@@ -193,8 +199,18 @@ public final class Main {
                 return new EvaluateAnnotationsCommand(args[1], args.length == 4 ? Optional.of(args[3])
                         : Optional.empty(), env, Path.of("").toAbsolutePath(), Path.of(System.getProperty("java.home")),
                         (config, e) -> Checkers.create(config, e, new ProcessCommandRunner()),
-                        new JavaParserAnnotationApplier(), new AnchoredWarningMatcher(), Clock.systemUTC(), out,
+                        new JavaParserAnnotationApplier(), new AnchoredWarningMatcher(), 1, Clock.systemUTC(), out,
                         err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length == 2 && args[0].equals("migrate-warning-ids")) {
+            try {
+                return new MigrateWarningIdsCommand(args[1], Path.of("").toAbsolutePath(), Clock.systemUTC(), out, err)
+                        .run();
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);

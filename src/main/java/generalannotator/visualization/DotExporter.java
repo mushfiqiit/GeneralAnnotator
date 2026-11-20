@@ -25,10 +25,13 @@ import java.util.List;
  *       {@code dot} layout, with packing.
  *   <li>An empty graph is rendered as a clear "No warnings" message.
  *   <li>Evaluation graphs: warning nodes are rounded boxes; warnings of a result state (introduced
- *       by an edit) have a dashed border. Annotation nodes are ellipses filled by outcome (green
+ *       by a package) have a dashed border. Annotation nodes (one per annotation package) are ellipses filled by outcome (green
  *       completed, grey unevaluated or no-op, red failed or rejected, yellow ambiguous), labeled
- *       with their ID and outcome, with the edit, counts and proposal associations in the tooltip.
- *       {@value GraphEdge#RESOLVED_BY} edges are green, {@value GraphEdge#INTRODUCES} edges red.
+ *       with their ID, outcome and number of edits, with every edit of the package (and its applier
+ *       outcome), the counts and the originating answer in the tooltip.
+ *       {@value GraphEdge#RESOLVED_BY} edges are green, {@value GraphEdge#INTRODUCES} edges red. Nodes
+ *       are labeled with their IDs (introduced warnings carry their round's IDs, {@code W1001, ...}); the
+ *       tooltips name the round.
  *       Proposal associations are not drawn as edges.
  * </ul>
  *
@@ -69,7 +72,8 @@ public final class DotExporter {
                 case AnnotationNode a -> out.append("  ").append(id(a.id()))
                         .append(" [id=").append(id(a.id()))
                         .append(", shape=ellipse, style=filled")
-                        .append(", label=").append(label(a.id() + "\n" + a.outcome()))
+                        .append(", label=").append(label(a.id() + "\n" + a.outcome() + "\n" + a.edits().size()
+                                + (a.edits().size() == 1 ? " edit" : " edits")))
                         .append(", tooltip=").append(tooltip(tooltipText(a)))
                         .append(", fillcolor=\"").append(fill(a)).append('"')
                         .append(", sortv=").append(i + 1)
@@ -101,7 +105,8 @@ public final class DotExporter {
         if (annotations > 0) {
             return "Evaluation graph: run " + graph.runId() + " (" + graph.checkerId() + ")\n"
                     + warnings + " warning node(s), " + annotations + " annotation node(s), " + graph.edges().size()
-                    + " edge(s) - each edit was evaluated alone against the baseline; hover for details";
+                    + " edge(s) - each annotation package was applied as a whole and evaluated alone against the "
+                    + "baseline; hover for details";
         }
         return "Warning graph: run " + graph.runId() + " (" + graph.checkerId() + ")\n"
                 + warnings + " warning node(s), " + graph.edges().size() + " edge(s)"
@@ -111,6 +116,12 @@ public final class DotExporter {
     /** Tooltip text of an annotation node: edit, states, outcome, counts and proposal associations. */
     public static String tooltipText(AnnotationNode node) {
         StringBuilder text = new StringBuilder(node.id()).append(": ").append(node.canonical()).append('\n');
+        for (AnnotationNode.PackageEdit e : node.edits()) {
+            text.append("  ").append(e.canonical());
+            e.applierOutcome().ifPresent(o -> text.append(" [").append(o).append(']'));
+            text.append('\n');
+        }
+        node.round().ifPresent(r -> text.append("round ").append(r).append(", "));
         text.append("applied to ").append(node.baselineState());
         node.resultState().ifPresent(s -> text.append(" -> ").append(s));
         text.append("\noutcome ").append(node.outcome()).append(": ").append(node.detail());
@@ -121,7 +132,8 @@ public final class DotExporter {
         if (!node.proposals().isEmpty()) {
             text.append("\nproposed for ");
             text.append(String.join(", ", node.proposals().stream()
-                    .map(p -> p.warningId() + " (" + p.group() + " edit " + p.answerEditIndex() + ")").toList()));
+                    .map(p -> p.warningId() + " (" + p.group() + (p.answerEditIndex().isPresent()
+                            ? " edit " + p.answerEditIndex().getAsInt() : "") + ")").toList()));
         }
         return text.toString();
     }
@@ -139,7 +151,9 @@ public final class DotExporter {
     public static String tooltipText(WarningNode node) {
         Diagnostic d = node.diagnostic();
         StringBuilder text = new StringBuilder(node.id());
-        node.state().ifPresent(s -> text.append(" (state ").append(s).append(')'));
+        node.state().ifPresent(s -> text.append(" (state ").append(s)
+                .append(node.round().isPresent() ? node.round().getAsInt() == 0 ? ", initial" : ", introduced in round "
+                        + node.round().getAsInt() : "").append(')'));
         text.append('\n');
         text.append(node.targetPath().orElse(d.sourcePath())).append(':').append(d.line());
         if (d.column().isPresent()) {

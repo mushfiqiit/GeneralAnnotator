@@ -23,16 +23,24 @@ import java.util.OptionalInt;
  * <p>Schema version {@value #SCHEMA_VERSION} ({@code warning-graph.json} of a run) holds warning
  * nodes only. It is still written for every graph that has nothing else, so initial graphs are
  * unchanged. Schema version {@value #EXPANDED_SCHEMA_VERSION} (an evaluation's
- * {@code evaluation-graph.json}) adds a {@code state} to warning nodes, annotation nodes and the
- * edge kinds of {@link GraphEdge}:
+ * {@code evaluation-graph.json}) adds a {@code state} and the inference {@code round} to warning
+ * nodes, annotation nodes holding a complete annotation package ({@code edits}), and the edge kinds of
+ * {@link GraphEdge}. Introduced warnings have IDs by round ({@link WarningIds}). Earlier expanded
+ * versions held one edit per annotation node ({@code "canonical"} and {@code "edit"}, proposals with an
+ * {@code answerEditIndex}): version {@value #LEGACY_EXPANDED_SCHEMA_VERSION} without rounds
+ * (introduced warnings named {@code A0001-N1}) and version {@value #EDIT_LEVEL_SCHEMA_VERSION} with
+ * rounds. Both are still read (into single-edit nodes) but never written.
  * <pre>
- *   { "id": "W0001", "kind": "warning", "state": "S0", ... as in version 1 }
- *   { "id": "A0001", "kind": "annotation", "baselineState": "S0", "resultState": "S0+A0001",
- *     "outcome": "COMPLETED", "detail": "...", "canonical": "...",
- *     "edit": { "sourceRoot": ..., "file": ..., "declaringClass": ..., "member": ..., "position": ...,
- *               "action": ..., "annotation": ... },
- *     "proposals": [ { "warningId": "W0001", "group": "W0001@1", "answerEditIndex": 0,
- *                      "baselineWarningId": "W0001" } ],
+ *   { "id": "W0001", "kind": "warning", "state": "S0", "round": 0, ... as in version 1 }
+ *   { "id": "W1001", "kind": "warning", "state": "S0+A0001", "round": 1, "root": false, "distance": 1, ... }
+ *   { "id": "A0001", "kind": "annotation", "round": 1, "baselineState": "S0", "resultState": "S0+A0001",
+ *     "outcome": "COMPLETED", "detail": "...", "canonical": "package of 3 edit(s) proposed for W0037",
+ *     "edits": [ { "canonical": "...",
+ *                  "edit": { "sourceRoot": ..., "file": ..., "declaringClass": ..., "member": ...,
+ *                            "position": ..., "action": ..., "annotation": ... },
+ *                  "answerEditIndices": [0], "applierOutcome": "APPLIED" | null, "applierDetail": ... } ],
+ *     "proposals": [ { "warningId": "W0037", "group": "W0037@1", "answerEditIndex": null,
+ *                      "baselineWarningId": "W0037" } ],
  *     "counts": { "baselineFindings": 42, "resultFindings": 41, "resolved": 1, "persisting": 41,
  *                 "introduced": 0, "ambiguousBaseline": 0, "ambiguousResult": 0 } | null }
  * </pre>
@@ -57,7 +65,9 @@ public final class WarningGraphJson {
 
     public static final String FILE_NAME = "warning-graph.json";
     public static final int SCHEMA_VERSION = 1;
-    public static final int EXPANDED_SCHEMA_VERSION = 2;
+    public static final int LEGACY_EXPANDED_SCHEMA_VERSION = 2;
+    public static final int EDIT_LEVEL_SCHEMA_VERSION = 3;
+    public static final int EXPANDED_SCHEMA_VERSION = 4;
     public static final String GRAPH_TYPE = "warning-graph";
 
     private WarningGraphJson() {}
@@ -102,18 +112,29 @@ public final class WarningGraphJson {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", a.id());
         m.put("kind", AnnotationNode.KIND);
+        m.put("round", a.round().isPresent() ? a.round().getAsInt() : null);
         m.put("baselineState", a.baselineState());
         m.put("resultState", a.resultState().orElse(null));
         m.put("outcome", a.outcome());
         m.put("detail", a.detail());
         m.put("canonical", a.canonical());
-        m.put("edit", a.edit());
+        List<Object> edits = new ArrayList<>();
+        for (AnnotationNode.PackageEdit e : a.edits()) {
+            Map<String, Object> em = new LinkedHashMap<>();
+            em.put("canonical", e.canonical());
+            em.put("edit", e.fields());
+            em.put("answerEditIndices", e.answerEditIndices());
+            em.put("applierOutcome", e.applierOutcome().orElse(null));
+            em.put("applierDetail", e.applierDetail().orElse(null));
+            edits.add(em);
+        }
+        m.put("edits", edits);
         List<Object> proposals = new ArrayList<>();
         for (AnnotationNode.Proposal p : a.proposals()) {
             Map<String, Object> pm = new LinkedHashMap<>();
             pm.put("warningId", p.warningId());
             pm.put("group", p.group());
-            pm.put("answerEditIndex", p.answerEditIndex());
+            pm.put("answerEditIndex", p.answerEditIndex().isPresent() ? p.answerEditIndex().getAsInt() : null);
             pm.put("baselineWarningId", p.baselineWarningId().orElse(null));
             proposals.add(pm);
         }
@@ -150,6 +171,7 @@ public final class WarningGraphJson {
         m.put("kind", WarningNode.KIND);
         if (expanded) {
             m.put("state", w.state().orElse(null));
+            m.put("round", w.round().isPresent() ? w.round().getAsInt() : null);
         }
         m.put("root", w.root());
         m.put("distance", w.distance());
@@ -166,7 +188,8 @@ public final class WarningGraphJson {
     public static WarningGraph read(String json) {
         Map<String, Object> root = object(JsonParser.parse(json), "graph");
         long version = integer(root, "schemaVersion", "graph");
-        if (version != SCHEMA_VERSION && version != EXPANDED_SCHEMA_VERSION) {
+        if (version != SCHEMA_VERSION && version != LEGACY_EXPANDED_SCHEMA_VERSION
+                && version != EDIT_LEVEL_SCHEMA_VERSION && version != EXPANDED_SCHEMA_VERSION) {
             throw new IllegalArgumentException("unsupported warning-graph schemaVersion " + version);
         }
         if (!GRAPH_TYPE.equals(string(root, "graphType", "graph"))) {
@@ -179,14 +202,15 @@ public final class WarningGraphJson {
         for (Object item : list(root, "nodes", "graph")) {
             Map<String, Object> n = object(item, "node");
             String kind = string(n, "kind", "node");
-            boolean annotation = version == EXPANDED_SCHEMA_VERSION && kind.equals(AnnotationNode.KIND);
+            boolean expanded = version != SCHEMA_VERSION;
+            boolean annotation = expanded && kind.equals(AnnotationNode.KIND);
             if (!kind.equals(WarningNode.KIND) && !annotation) {
                 throw new IllegalArgumentException("unknown node kind \"" + kind + "\"");
             }
             String id = string(n, "id", "node");
             String where = "node " + id;
             if (annotation) {
-                nodes.add(annotationNode(n, id, where));
+                nodes.add(annotationNode(n, id, where, version));
                 continue;
             }
             Map<String, Object> d = object(n.get("diagnostic"), where + " diagnostic");
@@ -199,10 +223,11 @@ public final class WarningGraphJson {
                     Optional.ofNullable(optionalString(d, "checker", where)),
                     string(d, "message", where),
                     Optional.ofNullable(optionalString(d, "sourceSnippet", where)));
-            Optional<String> state = version == EXPANDED_SCHEMA_VERSION
+            Optional<String> state = expanded
                     ? Optional.ofNullable(optionalString(n, "state", where)) : Optional.empty();
+            OptionalInt round = version >= EDIT_LEVEL_SCHEMA_VERSION ? round(n, where) : OptionalInt.empty();
             nodes.add(new WarningNode(id, diagnostic, Optional.ofNullable(optionalString(n, "targetPath", where)),
-                    bool(n, "root", where), Math.toIntExact(integer(n, "distance", where)), state));
+                    bool(n, "root", where), Math.toIntExact(integer(n, "distance", where)), state, round));
         }
         List<GraphEdge> edges = new ArrayList<>();
         for (Object item : list(root, "edges", "graph")) {
@@ -213,17 +238,48 @@ public final class WarningGraphJson {
         return new WarningGraph(runId, checker, nodes, edges);
     }
 
-    private static AnnotationNode annotationNode(Map<String, Object> n, String id, String where) {
+    private static OptionalInt round(Map<String, Object> n, String where) {
+        Long round = optionalInteger(n, "round", where);
+        return round == null ? OptionalInt.empty() : OptionalInt.of(Math.toIntExact(round));
+    }
+
+    private static Map<String, String> editFields(Map<String, Object> n, String where) {
         Map<String, Object> e = object(n.get("edit"), where + " edit");
         Map<String, String> edit = new LinkedHashMap<>();
         for (String key : e.keySet()) {
             edit.put(key, string(e, key, where + " edit"));
         }
+        return edit;
+    }
+
+    private static AnnotationNode annotationNode(Map<String, Object> n, String id, String where, long version) {
+        boolean packages = version == EXPANDED_SCHEMA_VERSION;
+        List<AnnotationNode.PackageEdit> edits = new ArrayList<>();
+        if (packages) {
+            for (Object item : list(n, "edits", where)) {
+                Map<String, Object> e = object(item, where + " edit");
+                List<Integer> indices = new ArrayList<>();
+                for (Object i : list(e, "answerEditIndices", where)) {
+                    if (!(i instanceof Long l)) {
+                        throw new IllegalArgumentException(where + ": answerEditIndices must hold integers");
+                    }
+                    indices.add(Math.toIntExact(l));
+                }
+                edits.add(new AnnotationNode.PackageEdit(string(e, "canonical", where), editFields(e, where), indices,
+                        Optional.ofNullable(optionalString(e, "applierOutcome", where)),
+                        Optional.ofNullable(optionalString(e, "applierDetail", where))));
+            }
+        } else {
+            edits.add(new AnnotationNode.PackageEdit(string(n, "canonical", where), editFields(n, where), List.of(),
+                    Optional.empty(), Optional.empty()));
+        }
         List<AnnotationNode.Proposal> proposals = new ArrayList<>();
         for (Object item : list(n, "proposals", where)) {
             Map<String, Object> p = object(item, where + " proposal");
+            Long index = packages ? optionalInteger(p, "answerEditIndex", where) : (Long) integer(p, "answerEditIndex",
+                    where);
             proposals.add(new AnnotationNode.Proposal(string(p, "warningId", where), string(p, "group", where),
-                    Math.toIntExact(integer(p, "answerEditIndex", where)),
+                    index == null ? OptionalInt.empty() : OptionalInt.of(Math.toIntExact(index)),
                     Optional.ofNullable(optionalString(p, "baselineWarningId", where))));
         }
         if (!n.containsKey("counts")) {
@@ -237,9 +293,10 @@ public final class WarningGraphJson {
                     count(c, "introduced", where), count(c, "ambiguousBaseline", where),
                     count(c, "ambiguousResult", where)));
         }
-        return new AnnotationNode(id, string(n, "canonical", where), edit, string(n, "baselineState", where),
+        return new AnnotationNode(id, string(n, "canonical", where), edits, string(n, "baselineState", where),
                 Optional.ofNullable(optionalString(n, "resultState", where)), string(n, "outcome", where),
-                string(n, "detail", where), proposals, counts);
+                string(n, "detail", where), proposals, counts,
+                version >= EDIT_LEVEL_SCHEMA_VERSION ? round(n, where) : OptionalInt.empty());
     }
 
     private static int count(Map<String, Object> m, String key, String where) {

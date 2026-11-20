@@ -94,38 +94,61 @@ class WarningGraphJsonTest {
         assertTrue(loaded.warningNodes().getFirst().diagnostic().sourcePath().startsWith(ROOT.toString()));
     }
 
+    private static java.util.Map<String, String> fields(String member) {
+        java.util.Map<String, String> edit = new java.util.LinkedHashMap<>();
+        edit.put("sourceRoot", "src");
+        edit.put("file", "p/Queue.java");
+        edit.put("member", member);
+        edit.put("annotation", "org.jspecify.annotations.Nullable");
+        return edit;
+    }
+
+    /** A package of three edits (one entry merged from two answer indices), and an unevaluated package. */
     private static WarningGraph expanded() {
         WarningGraph g = graph();
         List<GraphNode> nodes = new java.util.ArrayList<>();
         for (WarningNode w : g.warningNodes()) {
-            nodes.add(new WarningNode(w.id(), w.diagnostic(), w.targetPath(), true, 0, Optional.of("S0")));
+            nodes.add(new WarningNode(w.id(), w.diagnostic(), w.targetPath(), true, 0, Optional.of("S0"),
+                    java.util.OptionalInt.of(0)));
         }
-        java.util.Map<String, String> edit = new java.util.LinkedHashMap<>();
-        edit.put("sourceRoot", "src");
-        edit.put("file", "p/Queue.java");
-        edit.put("annotation", "org.jspecify.annotations.Nullable");
-        nodes.add(new AnnotationNode("A0001", "ADD @x at FIELD of p.Queue#head in src/p/Queue.java", edit, "S0",
+        List<AnnotationNode.PackageEdit> edits = List.of(
+                new AnnotationNode.PackageEdit("ADD @x at FIELD of p.Queue#head", fields("head"), List.of(0, 2),
+                        Optional.of("APPLIED"), Optional.of("added")),
+                new AnnotationNode.PackageEdit("ADD @x at FIELD of p.Queue#tail", fields("tail"), List.of(1),
+                        Optional.of("NO_OP"), Optional.of("already present")),
+                new AnnotationNode.PackageEdit("ADD @x at FIELD of p.Queue#size", fields("size"), List.of(3),
+                        Optional.of("APPLIED"), Optional.of("added")));
+        nodes.add(new AnnotationNode("A0001", "package of 3 edit(s) proposed for W0001 (W0001@1)", edits, "S0",
                 Optional.of("S0+A0001"), "COMPLETED", "findings 4 -> 4", List.of(new AnnotationNode.Proposal("W0001",
-                "W0001@1", 0, Optional.of("W0001"))), Optional.of(new AnnotationNode.Counts(4, 4, 1, 3, 1, 0, 0))));
+                "W0001@1", java.util.OptionalInt.empty(), Optional.of("W0001"))),
+                Optional.of(new AnnotationNode.Counts(4, 4, 1, 3, 1, 0, 0)), java.util.OptionalInt.of(1)));
         WarningNode n = g.warningNodes().get(0);
-        nodes.add(new WarningNode("A0001-N1", n.diagnostic(), n.targetPath(), false, 1, Optional.of("S0+A0001")));
-        nodes.add(new AnnotationNode("A0002", "REMOVE ...", edit, "S0", Optional.empty(), "UNEVALUATED",
-                "not evaluated yet", List.of(), Optional.empty()));
+        nodes.add(new WarningNode("W1001", n.diagnostic(), n.targetPath(), false, 1, Optional.of("S0+A0001"),
+                java.util.OptionalInt.of(1)));
+        nodes.add(new AnnotationNode("A0002", "package of 1 edit(s) proposed for W0002 (W0002@1)",
+                List.of(new AnnotationNode.PackageEdit("REMOVE ...", fields("head"), List.of(0), Optional.empty(),
+                        Optional.empty())), "S0", Optional.empty(), "UNEVALUATED", "not evaluated yet",
+                List.of(new AnnotationNode.Proposal("W0002", "W0002@1", java.util.OptionalInt.empty(),
+                        Optional.empty())), Optional.empty(), java.util.OptionalInt.of(1)));
         return new WarningGraph(g.runId(), g.checkerId(), nodes, List.of(
                 new GraphEdge("W0002", "A0001", GraphEdge.RESOLVED_BY),
-                new GraphEdge("A0001", "A0001-N1", GraphEdge.INTRODUCES)));
+                new GraphEdge("W0003", "A0001", GraphEdge.RESOLVED_BY),
+                new GraphEdge("A0001", "W1001", GraphEdge.INTRODUCES)));
     }
 
     @Test
-    void expandedGraphsUseSchemaVersionTwoAndRoundTrip() {
+    void expandedGraphsUseSchemaVersionFourWithPackagesAndRoundsAndRoundTrip() {
         WarningGraph original = expanded();
         String json = WarningGraphJson.write(original);
 
-        assertTrue(json.contains("\"schemaVersion\": 2"), json);
-        assertTrue(json.contains("\"state\": \"S0+A0001\""), json);
-        assertTrue(json.contains("\"kind\": \"annotation\""), json);
+        assertTrue(json.contains("\"schemaVersion\": 4"), json);
+        assertTrue(json.contains("\"id\": \"W1001\",\n      \"kind\": \"warning\",\n      \"state\": \"S0+A0001\",\n"
+                + "      \"round\": 1"), json);
+        assertTrue(json.contains("\"answerEditIndices\": [\n            0,\n            2\n          ]"), json);
+        assertTrue(json.contains("\"applierOutcome\": \"NO_OP\""), json);
         WarningGraph loaded = WarningGraphJson.read(json);
         assertEquals(original, loaded);
+        assertEquals(3, ((AnnotationNode) loaded.node("A0001").orElseThrow()).edits().size());
         assertEquals(json, WarningGraphJson.write(loaded));
         // Initial graphs keep version 1 without a state field.
         String initial = WarningGraphJson.write(graph());
@@ -133,13 +156,47 @@ class WarningGraphJsonTest {
     }
 
     @Test
-    void annotationNodesAreRejectedInVersionOneAndValidatedInVersionTwo() {
+    void annotationNodesAreRejectedInVersionOneAndValidatedInLaterVersions() {
         String json = WarningGraphJson.write(expanded());
         assertThrows(IllegalArgumentException.class,
-                () -> WarningGraphJson.read(json.replace("\"schemaVersion\": 2", "\"schemaVersion\": 1")));
+                () -> WarningGraphJson.read(json.replace("\"schemaVersion\": 4", "\"schemaVersion\": 1")));
         assertThrows(IllegalArgumentException.class,
                 () -> WarningGraphJson.read(json.replace("\"outcome\": \"COMPLETED\",", "")));
         assertThrows(IllegalArgumentException.class,
-                () -> WarningGraphJson.read(json.replace("\"schemaVersion\": 2", "\"schemaVersion\": 3")));
+                () -> WarningGraphJson.read(json.replace("\"schemaVersion\": 4", "\"schemaVersion\": 5")));
+        // a package needs at least one edit; a round that contradicts the node kind is rejected
+        assertThrows(IllegalArgumentException.class,
+                () -> WarningGraphJson.read(json.replaceFirst("(?s)\"edits\": \\[.*?\"proposals\"",
+                        "\"edits\": [],\n      \"proposals\"")));
+        assertThrows(IllegalArgumentException.class,
+                () -> WarningGraphJson.read(json.replaceFirst("\"round\": 0", "\"round\": 2")));
+    }
+
+    /** An annotation node as earlier single-edit versions (2 and 3) wrote it. */
+    private static String singleEditNode(boolean rounds) {
+        return """
+                { "id": "A0001", "kind": "annotation", %s"baselineState": "S0", "resultState": "S0+A0001",
+                  "outcome": "COMPLETED", "detail": "d", "canonical": "ADD @x at FIELD of p.Queue#head",
+                  "edit": { "sourceRoot": "src", "file": "p/Queue.java" },
+                  "proposals": [ { "warningId": "W0001", "group": "W0001@1", "answerEditIndex": 2,
+                                   "baselineWarningId": "W0001" } ],
+                  "counts": null }""".formatted(rounds ? "\"round\": 1, " : "");
+    }
+
+    @Test
+    void earlierSingleEditGraphsAreReadAsOneEditNodes() {
+        for (int version : List.of(2, 3)) {
+            String json = "{ \"schemaVersion\": " + version + ", \"graphType\": \"warning-graph\", \"runId\": \"r\", "
+                    + "\"checker\": \"nullaway\", \"nodes\": [" + singleEditNode(version == 3) + "], \"edges\": [] }";
+            WarningGraph g = WarningGraphJson.read(json);
+
+            AnnotationNode a = (AnnotationNode) g.node("A0001").orElseThrow();
+            assertEquals(1, a.edits().size());
+            assertEquals("ADD @x at FIELD of p.Queue#head", a.edits().get(0).canonical());
+            assertEquals(java.util.OptionalInt.of(2), a.proposals().get(0).answerEditIndex());
+            assertEquals(version == 3 ? java.util.OptionalInt.of(1) : java.util.OptionalInt.empty(), a.round());
+            // re-saving writes the current version, never an earlier one
+            assertTrue(WarningGraphJson.write(g).contains("\"schemaVersion\": 4"));
+        }
     }
 }

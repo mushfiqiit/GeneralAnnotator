@@ -272,7 +272,9 @@ matcher.
   edges for every resolved baseline warning, and new nodes `A-N<k>` (state
   `S0+A`, distance 1) with `A -> N` introduces edges. The graph is saved as
   `evaluation-graph.json` (`warning-graph.json` schemaVersion 2), and
-  `visualize` distinguishes the node kinds.
+  `visualize` distinguishes the node kinds. (T8a replaced `A-N<k>` with round
+  IDs and schema version 3; T8b replaced single-edit candidates with one
+  package per answer and schema version 4.)
 - **Persistence.** Atomic writes and an OS file lock. Completed attempts are
   reused; incomplete ones are moved to `attempts/interrupted/` and rerun. The
   graph and `summary.json` are rebuilt from the records. The original
@@ -328,6 +330,125 @@ on the classpath):
   unexplained 6-minute idle pause in one attempt, outside the checker
   commands, which did not recur;
 - the real run directory was not touched.
+
+## T8a — Warning IDs by inference round · `done`
+
+Introduced warnings are named by the inference round that introduced them,
+not by attempt.
+- Initial warnings keep `W0001...`. Round 1 introduces `W1001, W1002, ...`,
+  round 2 `W2001...`, round 12 `W12001...`.
+- **Explicit rounds.** `evaluation.json`, `attempt.json`, `summary.json` and
+  every graph node (`round`, 0 for initial warnings) store the round. The
+  graph is schema version 3.
+- **Allocation.** `WarningIds.Allocator` allocates in recording order,
+  resuming after the highest ID in the completed attempt records. It refuses
+  overflow past 999 and collisions with existing IDs.
+- **Who gets IDs.** Persisting warnings keep their baseline IDs. Only
+  introduced occurrences get new IDs, and `comparison.json` maps each to its
+  result finding (`introducedWarnings`).
+- **Rounds produced today.** `evaluate-annotations` evaluates round 1, and an
+  evaluation recording another round is refused.
+- **Migration.** Older evaluations are refused until
+  `migrate-warning-ids <evaluation dir>` converts them. The migration:
+  - backs up every changed file, then renames in candidate order;
+  - updates records, comparisons, summary, graph and DOT, and removes the
+    stale SVG;
+  - establishes round 1 only when every candidate was proposed for an initial
+    warning of the run, and otherwise refuses;
+  - completes an interrupted run from its marker.
+
+Code:
+- `graph`: `WarningIds`, plus the `round` component of `WarningNode` and
+  `AnnotationNode`, and `WarningGraphJson` v3 (v2 still read).
+- `evaluation`: `Evaluator` (round, `RECORD_SCHEMA_VERSION` 2, allocation,
+  refusals), `EvaluationGraph` and `WarningIdMigration`.
+- Also `cli.MigrateWarningIdsCommand`, `EvaluateAnnotationsCommand`,
+  `DotExporter` tooltips and `Main`.
+
+Verified by:
+- `WarningIdsTest` covers formats, multi-digit rounds, reading the sequence
+  only together with the round, disjoint rounds, resume, overflow and
+  collisions.
+- `WarningIdRoundsTest` (fake checker) covers:
+  - several attempts sharing one round with consistent edges, records,
+    comparisons, summary and rounds;
+  - persisting warnings keeping their IDs;
+  - filtered-then-full resume without renumbering, determinism of fresh runs,
+    and no duplicate after an interrupted attempt;
+  - rounds 2 and 12, refusal of a different round, and overflow at the 1000th
+    warning;
+  - migration: equal to a fresh graph, backup contents, refusal before
+    migration, resume without checker runs, idempotence, an unestablishable
+    round, a recorded round, a disagreeing graph, and completion of an
+    interrupted migration.
+- `WarningGraphJsonTest` covers v3 and legacy v2.
+- `EvaluateAnnotationsTest` and `MainTest`.
+
+On a scratch copy of the earlier EventBus evaluation:
+- `evaluate-annotations` refused the legacy directory;
+- `migrate-warning-ids` renamed the 23 introduced warnings to `W1001`–`W1023`,
+  with a backup;
+- the evaluation then resumed with all 30 attempts reused, no checker run, and
+  a byte-identical graph;
+- a second migration reported the directory as current.
+
+## T8b — One annotation package per proposal · `done`
+
+The complete `edits` array of one validated answer is now one candidate, an
+**annotation package**. T8 had split answers into distinct edits, so W0037's
+three `@Nullable` fields became A0024–A0026 and were evaluated separately.
+- **Package contents.** A package keeps its warning, answer provenance,
+  rationale, uncertainty and every edit. Identical entries within the answer
+  are merged, keeping their indices and uncertainties. Answers about different
+  warnings stay separate packages even when they share edits.
+- **Applying and checking.** Each package is applied all or nothing in one
+  fresh copy of the baseline, and NullAway runs once:
+  - any rejected, conflicting or suppressing edit rejects the package and
+    keeps no workspace;
+  - a mix of NO_OP and applied edits is applied and checked;
+  - a package whose edits are all NO_OP is reported without a check.
+- **Graph.** One annotation node per package holds all its edits with their
+  applier outcomes. Edges come from the package's own comparison (`W -> A`,
+  `A -> N`). The graph is schema version 4; versions 2 and 3 are still read as
+  single-edit nodes.
+- **Resume identity.** The evaluation key adds the candidate model
+  (`answer-package-1`) and the round; each attempt records its package key
+  (answer plus complete edit set). Earlier single-edit evaluations are
+  therefore never reused. They are listed as "kept, not reused" and left
+  untouched, and `migrate-warning-ids` keeps their single-edit meaning.
+- **Output.** CLI output, `summary.json`, tooltips and labels list every
+  package's edits. `changes.diff` covers every changed file.
+
+Code:
+- `evaluation`: `Candidates` (packages), `Evaluator` (package attempts, key
+  version 2, record version 3, older evaluations noted), `EvaluationGraph` and
+  `WarningIdMigration` (edit-level record version 2).
+- `graph`: `AnnotationNode` (`edits`, `PackageEdit`, optional
+  `answerEditIndex`) and `WarningGraphJson` v4.
+- Also `DotExporter` and `cli.EvaluateAnnotationsCommand`.
+
+Verified by:
+- `PackageEvaluationTest` covers:
+  - a W0037-like three-field package as one candidate, one workspace, one
+    checker call and one node with resolution and introduction edges;
+  - resume;
+  - a partial package that narrows the message;
+  - multi-file packages and atomic rejection;
+  - conflicts, duplicates, and mixed or all-NO_OP packages.
+- `EvaluateAnnotationsTest` covers shared edits in separate packages, package
+  edges and workspace isolation, plus the earlier scenarios.
+- `WarningIdMigrationTest` (hand-built single-edit evaluation) covers the
+  migration cases, and a package evaluation that leaves the single-edit
+  directory untouched and evaluates afresh.
+- `WarningGraphJsonTest` covers v4 packages and reading v2/v3.
+- `WarningIdRoundsTest` covers a different round getting its own directory.
+
+On a scratch copy of the EventBus run:
+- 39 packages (42 edits) were all COMPLETED in about 100 s;
+- W0037's package (A0034) resolved W0037 and introduced nothing;
+- 26 packages reduced the count, 8 kept it with matched changes, and 5
+  increased it;
+- the earlier single-edit evaluation directory stayed byte-identical.
 
 ## T9 — Record attempts and state transitions · `todo`
 

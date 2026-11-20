@@ -8,9 +8,9 @@ prompt-unit assembly without LLM calls (T13a), and the first half of Wulver
 inference (T13b): an immutable Slurm submission and the GPU worker. Upload,
 submission, monitoring and collection (T13c, T13e) have been used on Wulver.
 Collected proposals can be applied to a fresh copy of the run snapshot (T6,
-`apply-proposal`). Each distinct proposed edit can be evaluated alone against
-one baseline with the checker, and the results recorded as an expanded graph
-(T8, `evaluate-annotations`). Annotation sequences, an append-only transition
+`apply-proposal`). Each proposal's complete edit set can be evaluated as one
+annotation package against one baseline with the checker, and the results
+recorded as an expanded graph (T8, T8b, `evaluate-annotations`). Annotation sequences, an append-only transition
 log and search are not implemented.
 
 ## 1. Purpose
@@ -18,7 +18,8 @@ log and search are not implemented.
 GeneralAnnotator is a Java research tool for studying how pluggable type checkers'
 warnings can be resolved by adding type annotations. It runs a checker on a
 Java repository, asks a proposer (first a human, later an LLM) for annotation
-edits, applies each edit in an isolated repository state, reruns the checker,
+edits, applies each proposal (its edit set, as one package) in an isolated
+repository state, reruns the checker,
 and records how warnings change. That record supports exploring and choosing
 sequences of annotations.
 
@@ -54,7 +55,8 @@ In scope for the first milestones:
   pipeline logic.
 - Manual annotation proposals (human-authored edit files) before any real LLM
   integration.
-- Applying one annotation edit at a time, each in an isolated repository state.
+- Applying one proposal's annotation edits at a time (one package), each in an
+  isolated repository state.
 
 Out of scope for now:
 
@@ -99,13 +101,15 @@ Out of scope for now:
 | **Proposal** | A set of candidate annotation edits from a proposer (manual or LLM) for a given warning and context. |
 | **Proposer** | The component that makes proposals: manual (file-based) first, LLM later. |
 | **Repository state** | An identified, immutable snapshot of the target's source after a specific sequence of annotation edits. |
-| **Attempt** | Applying one edit (or later, a batch) to a repository state in isolation, then rerunning the checker. |
+| **Attempt** | Applying one annotation package (all edits of one proposal, together; later perhaps a batch of packages) to a repository state in isolation, then rerunning the checker once. |
+| **Annotation package** | The complete edit set one validated answer proposed together for one warning, with its provenance. It is applied all or nothing and evaluated as a unit; its edits are never evaluated separately (T8b). |
 | **State transition** | The link from a source state to a result state through an attempt, together with the attempt's outcome. |
 | **Resolution** | The effect of an attempt on a warning: for example resolved, persisting, or newly introduced. Depends on warning identity. |
 | **Annotation sequence** | An ordered series of edits leading from the initial state to a later state. |
-| **Warning graph** | Per-run graph of warning nodes and (later) other nodes and edges. The initial graph is built from a completed analysis only: one root warning node per finding, no edges. Saved as `warning-graph.json`. An evaluation's expanded graph (`evaluation-graph.json`, schema version 2) adds annotation nodes, result-state warning nodes and `resolved-by` / `introduces` edges. |
+| **Warning graph** | Per-run graph of warning nodes and (later) other nodes and edges. The initial graph is built from a completed analysis only: one root warning node per finding, no edges. Saved as `warning-graph.json`. An evaluation's expanded graph (`evaluation-graph.json`, schema version 4) adds annotation nodes (one per package), result-state warning nodes and `resolved-by` / `introduces` edges. |
+| **Round** | One iteration of LLM inference and evaluation (not one annotation attempt, not a graph distance). Round 1 evaluates answers about the initial warnings. Introduced warnings carry their round's IDs (`W1001, ...` for round 1, `W2001, ...` for round 2), and the round is stored explicitly on nodes and records. |
 | **Baseline state** | `S0`: an evaluation's immutable copy of the run snapshot, checked once; every attempt starts from it. The state after edit `A` is `S0+A`. |
-| **Annotation node** | One concrete edit evaluated (or still to be evaluated) against one baseline state, with an explicit outcome and its proposal associations. |
+| **Annotation node** | One annotation package evaluated (or still to be evaluated) against one baseline state, holding all its edits, an explicit outcome and its originating answer. |
 | **Warning node** | A graph node for one checker finding observed in one run. Its ID (`W0001`, ...) identifies that *occurrence within the run*, not a warning identity across runs. It holds the complete diagnostic. |
 | **Root / distance** | Initial and baseline warning nodes are roots with distance 0. Provisionally (T8), a warning node's distance is the number of edits applied to the baseline in the state where it was observed, so warnings introduced by one evaluated edit have distance 1. Distance across longer sequences is not defined yet (§6). |
 | **Batch** | A set of edits attempted together because they are believed to be independent. *Criteria unresolved* (§6). |
@@ -325,22 +329,61 @@ interface or in one named class), labeled provisional, and noted here.
 
 - Warning-graph expansion. **Provisional (T8), in `evaluation.EvaluationGraph`:**
   - Baseline warning nodes (state `S0`) are kept.
-  - Each candidate edit evaluated against a baseline is one annotation node.
-    Its identity is the edit plus the baseline; its ID `A0001, ...` follows the
-    first occurrence over all answers. Every node has an explicit outcome:
-    UNEVALUATED, INTERRUPTED, COMPLETED, AMBIGUOUS, NO_OP, REJECTED, a failure
-    kind, or NOT_COMPARABLE.
+  - **Annotation packages (T8b):**
+    - Each validated answer is one package: its complete edit set, deduplicated
+      within the answer (provenance kept), applied all or nothing in one
+      workspace and checked once.
+    - Each package is one annotation node, holding every edit with its applier
+      outcome. Its identity is the originating answer and edit set plus the
+      baseline, configuration and round (evaluation key `answer-package-1`
+      and the per-attempt package key). Its ID `A0001, ...` follows numeric
+      warning order.
+    - Packages from different answers stay separate even when they share edits.
+    - Every node has an explicit outcome: UNEVALUATED, INTERRUPTED, COMPLETED,
+      AMBIGUOUS, NO_OP (all edits already satisfied), REJECTED (any edit
+      rejected or conflicting, or a suppressing edit), a failure kind, or
+      NOT_COMPARABLE.
+    - Earlier evaluations (T8) treated each distinct edit as its own
+      candidate. That split multi-edit answers (W0037's three fields) into
+      edits whose separate results do not establish the answer's effect. They
+      keep a different evaluation key, so they are never reused or combined
+      into package results.
   - `W -> A` (`resolved-by`) is added for every baseline warning a trustworthy
-    comparison found resolved, proposed or not.
-  - Each introduced finding gets a new warning node `A-N<k>` (state `S0+A`,
-    distance 1) and `A -> N` (`introduces`). Introduced findings of different
-    attempts are never merged.
-  - Proposal associations are node data, not edges.
+    comparison of the whole package found resolved, proposed or not. Never from
+    a count reduction alone.
+  - Each introduced finding gets a new warning node (state `S0+A`, distance 1,
+    the evaluation's round) and `A -> N` (`introduces`). Introduced findings of
+    different attempts are never merged.
+  - **Warning IDs by round (T8a), in `graph.WarningIds`:**
+    - IDs: initial `W0001...`; round `r` uses `"W" + r + 3-digit sequence`.
+    - Every attempt of a round shares the round's sequence. IDs are allocated
+      when an attempt is recorded, after the highest ID in the completed
+      records, so they are never renumbered and an interrupted attempt leaves
+      none behind.
+    - The order follows evaluation order: candidate order for an unfiltered
+      run, and filtered candidates first otherwise.
+    - The round is metadata on nodes and records, never parsed from the ID
+      alone, because `W1001` is also a valid initial ID.
+    - Overflow past 999 and collisions with existing IDs (more than 999 initial
+      warnings) are refused.
+    - `evaluate-annotations` always evaluates round 1. Where round 2 comes from
+      (inference on introduced warnings, and which state it starts from) is
+      open, together with annotation sequences (§6.3, §6.4).
+    - Legacy evaluations (`A0003-N1`, records schema 1, graph schema 2) are
+      converted only by `migrate-warning-ids`, with a backup. It establishes
+      round 1 only when every candidate was proposed for an initial warning of
+      the run; otherwise it refuses.
+  - The originating answer is node data, not an edge.
   - The graph is rebuilt from per-attempt records after every invocation.
 
   Open:
-  - how nodes of states after several edits relate, and what distance means
+  - how nodes of states after several packages relate, and what distance means
     there (§6.3, §6.4);
+  - whether identical packages, or packages sharing edits, should share one
+    checker run (they are evaluated separately now, so shared edits are checked
+    again and their introduced warnings appear once per package);
+  - whether per-edit attribution inside a package is wanted (it is not
+    attempted);
   - whether introduced warnings of different attempts should ever be
     identified with each other.
 - Isolation mechanism for *multiple* repository states (copy per state, `git
@@ -436,14 +479,14 @@ interface or in one named class), labeled provisional, and noted here.
 | Build skeleton (Gradle Wrapper, JUnit) | Implemented |
 | 1. Check (NullAway) | Implemented: `check` command on configured source roots of one target, verified on fixtures and on EventBus core (`EventBus/src`) |
 | Initial warning graph | Implemented: root warning nodes (distance 0), no edges, `warning-graph.json` save/load. |
-| Graph expansion | Implemented provisionally (T8): baseline, annotation and introduced-warning nodes, `resolved-by` and `introduces` edges, `evaluation-graph.json` (schema version 2). Single edits only. |
+| Graph expansion | Implemented provisionally (T8): baseline, annotation and introduced-warning nodes, `resolved-by` and `introduces` edges, `evaluation-graph.json` (schema version 4), introduced warnings with round IDs (`W1001, ...`; T8a), one annotation node per proposal package (T8b). Single packages only; no sequences. |
 | Graph visualization | Implemented: `visualize` command (Graphviz DOT/SVG, hover tooltips). |
 | 2. Slice: target identification | Implemented: Specimin target member per warning (`warning-targets.json`, `targets` command). |
 | 2. Slice: generation | Implemented: `slice` command runs Specimin per warning into `slices/<ID>/` (`slice-results.json`). Reproduction is NOT_VALIDATED. |
 | 2. Slice: reproduction validation | Not implemented (T10b). |
 | 3. Extract context | Implemented for symbol usages: `context` command writes `context/<ID>.json`/`.txt` (one hop, symbol-based, no safe/unsafe policy). Unsafe-region usages (T12) blocked on §6.2. |
 | 4. Propose (manual / LLM) | Prompt units (`prompts`), Wulver submissions with a GPU worker (`prepare-inference`), and upload, submission, monitoring, collection and retry over one shared SSH connection (`inference`), with a submit, disconnect, reconnect and collect workflow (T13e). Used on Wulver (jobs 1628816 and 1629432); the T13e health check and stale-connection recovery are tested with fakes only. Proposals are applied by `apply-proposal` and evaluated by `evaluate-annotations`. |
-| 5. Apply and recheck | `apply-proposal` applies a proposal's edits, all or nothing, to a snapshot copy (`applications/`). `evaluate-annotations` applies each distinct edit alone to a copy of one baseline, reruns NullAway on all source roots and compares findings with the provisional `anchored-1` rule (T8). Verified with fakes and manually on EventBus (30 attempts, all completed). |
+| 5. Apply and recheck | `apply-proposal` applies a proposal's edits, all or nothing, to a snapshot copy (`applications/`). `evaluate-annotations` applies each proposal's complete edit set as one package to a copy of one baseline, reruns NullAway once on all source roots and compares findings with the provisional `anchored-1` rule (T8, T8b). Verified with fakes and manually on EventBus (39 packages, all completed). |
 | 6. Record | Partly: per-attempt records, summary and the expanded graph (T8). No append-only state-transition log (T9). |
 | 7. Explore and select | Not implemented; blocked on §6 decisions |
 | 8. Batch | Not implemented; blocked on §6 decisions |

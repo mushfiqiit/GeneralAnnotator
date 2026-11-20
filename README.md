@@ -28,11 +28,12 @@ they are not checker-validated. `apply-proposal` turns one collected proposal
 into validated annotation edits and applies them, all or nothing, to a fresh copy
 of the run snapshot; it does not rerun the checker, so it says nothing about
 whether a warning is resolved. `evaluate-annotations` does rerun it: it applies
-each distinct proposed edit **alone** to a fresh copy of one baseline, runs
-NullAway on all source roots, compares the findings with a provisional matching
-rule, and records an **expanded graph** (baseline warnings, annotation nodes,
-`resolved-by` and `introduces` edges). Edits are never combined, and no fixes
-are inferred for introduced warnings. Slice validation, cumulative annotation
+each answer's complete edit set as **one annotation package** to a fresh copy of
+one baseline, runs NullAway once on all source roots, compares the findings with
+a provisional matching rule, and records an **expanded graph** (baseline
+warnings, one annotation node per package, `resolved-by` and `introduces`
+edges). Different packages are never combined, and no fixes are inferred for
+introduced warnings. Slice validation, cumulative annotation
 sequences, search and batching are not implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
 
@@ -1043,9 +1044,9 @@ edits to a **fresh copy of the run snapshot** (`workspace/target`). The
 original project, the snapshot, the Specimin slices and the inference
 artifacts are only read. Neither the LLM nor the checker is run, and the
 warning graph is not changed. An applied edit is a source change, not evidence
-that the warning is resolved, or even that the code compiles. To recheck edits with
-the checker, use `evaluate-annotations` (next section), which evaluates each edit
-of a proposal separately.
+that the warning is resolved, or even that the code compiles. To recheck proposals with
+the checker, use `evaluate-annotations` (next section), which evaluates every
+proposal's complete edit set as one package.
 
 **Import.** The result used is the one `remote/collection.json` selected. It is
 verified again with the collection's own checks:
@@ -1191,25 +1192,38 @@ applied edit ends as `COMPILATION_FAILED`.
 
 What it does:
 
-1. **Candidates.** Every validated COMPLETED_PROPOSED answer of the submission
-   is imported (the same checks as `apply-proposal`). Identical edits (same
-   source root, file, class, member, exact position, action and annotation) are
-   merged into one candidate `A0001, ...`, which keeps every originating
-   warning, proposal group (one answer = one group, `W0007@1`) and index in the
-   answer. Failed, missing, invalid and insufficient-evidence answers are listed
-   as excluded, with the reason. `--warning` only selects which candidates to
-   evaluate. The checker still analyzes every source root, and the comparison
-   uses every finding.
+1. **Packages.** Every validated COMPLETED_PROPOSED answer of the submission
+   is imported (the same checks as `apply-proposal`) and becomes **one
+   annotation package** `A0001, ...`: the complete edit set the model proposed
+   together for one warning, with the warning, answer (`W0037@1`), provenance,
+   rationale and uncertainty.
+   - Identical entries within one answer (same source root, file, class,
+     member, exact position, action and annotation) are merged, keeping each
+     entry's index and uncertainty.
+   - Answers about different warnings stay separate packages, even when they
+     share edits.
+   - Failed, missing, invalid and insufficient-evidence answers are listed as
+     excluded, with the reason.
+   - `--warning` only selects which package to evaluate. The checker still
+     analyzes every source root, and the comparison uses every finding.
 2. **Baseline.** The run snapshot is copied explicitly into
    `baseline/source/` (a plain file copy: git is not consulted, so an ignored
    `runs/` directory or a parent repository cannot hide sources), and the
    checker runs on it. A failed baseline blocks the evaluation. It is kept in
    `baseline-failed/<time>/` and retried next time.
-3. **Attempts.** For each candidate, in ID order: copy `baseline/source/` to
-   `attempts/<A>/source/`, apply **exactly that one edit** with the AST applier,
-   and run the checker with identical settings. Edits that would suppress or
-   switch off checking (`@SuppressWarnings`, `@NullUnmarked`, removing
-   `@NullMarked`) are not evaluated.
+3. **Attempts.** For each package, in ID order:
+   - Copy `baseline/source/` to `attempts/<A>/source/`.
+   - Apply **all of its edits together** with the AST applier, which validates
+     every edit before writing any file. If one edit is rejected or two edits
+     conflict, the whole package is REJECTED and no workspace is kept. A
+     mixture of NO_OP and applied edits is applied; a package whose edits are
+     all NO_OP is reported as NO_OP without a checker run.
+   - Run the checker **once** with identical settings.
+   - A package containing an edit that would suppress or switch off checking
+     (`@SuppressWarnings`, `@NullUnmarked`, removing `@NullMarked`) is not
+     evaluated.
+   - Each package starts from the same baseline; packages never see each
+     other's edits.
 4. **Comparison.** For a completed analysis with the same checker build and
    annotated packages as the baseline, the findings are matched by the
    provisional rule `anchored-1` (project-spec §6.1). The rule uses the path,
@@ -1218,81 +1232,181 @@ What it does:
    annotations do not break it. Each finding ends up **resolved**,
    **persisting**, **introduced**, or **ambiguous** (no claim).
 
-Outcomes per candidate: `COMPLETED`, `AMBIGUOUS` (compared, but some findings
+Outcomes per package: `COMPLETED`, `AMBIGUOUS` (compared, but some findings
 undecidable), `NO_OP`, `REJECTED`, `COMPILATION_FAILED`, `TIMED_OUT`, `CRASHED`,
 `EXECUTION_FAILED`, `NOT_COMPARABLE` (different checker build or scope). In the
-graph only, a candidate can also be `INTERRUPTED` or `UNEVALUATED`. Counts are
+graph only, a package can also be `INTERRUPTED` or `UNEVALUATED`. Each edit's own
+applier outcome (APPLIED, NO_OP, REJECTED) is recorded as well. Counts are
 printed only for `COMPLETED` and `AMBIGUOUS`. An incomplete analysis is never
 zero warnings.
 
 ```
 runs/<run>/evaluations/<submission id>-<key>/
   evaluation.json        key material, settings, matcher assumptions, limitations
-  candidates.json        candidates, proposal groups (rationale, uncertainty, provenance), excluded answers
+  candidates.json        packages (warning, answer provenance, rationale, uncertainty, every edit), excluded answers
   baseline/source/       full copy of the run snapshot (state S0); baseline/check/ logs
   baseline/result.json   baseline findings with IDs and structural anchors, tool identity
-  attempts/<A>/          source/, changes.diff, check/ (applied edits only), comparison.json,
-                         attempt.json (outcome, counts, resolved and introduced warnings)
+  attempts/<A>/          source/, changes.diff (every changed file), check/ (applied packages only),
+                         comparison.json, attempt.json (package outcome, each edit's applier outcome,
+                         counts, resolved and introduced warnings)
   attempts/interrupted/<A>-<n>/   attempts found incomplete, moved aside before the rerun
-  evaluation-graph.json  expanded graph (schemaVersion 2); summary.json
+  evaluation-graph.json  expanded graph (schemaVersion 4); summary.json (with the round's warning-ID sequence)
 ```
 
-The `<key>` hashes everything results depend on: the snapshot's tree hash,
-the checker configuration (including classpath file hashes and the JDK), the
-candidate set and the matching rule. A different configuration therefore gets a
-new evaluation directory, and results are reused only for the same baseline,
-configuration and edit. Rerunning the command resumes. Completed attempts
+The `<key>` hashes everything results depend on: the snapshot's tree hash, the
+checker configuration (including classpath file hashes and the JDK), the
+candidate model (`answer-package-1`), the round, the package set and the
+matching rule. Each attempt also records its package key: the answer and its
+complete edit set. A different configuration, round or package therefore gets
+a new evaluation directory or is refused. Results are reused only for the same
+baseline, configuration, round and package. Rerunning the command resumes. Completed attempts
 (those with `attempt.json`) are reused, incomplete ones are moved aside and
 rerun, and the graph is rebuilt from the records, so nothing is duplicated. A
 file lock refuses a second concurrent writer. The run snapshot,
 `warning-graph.json` and the inference artifacts are only read.
 
-**Graph** (`evaluation-graph.json`, `warning-graph.json` schemaVersion 2):
+**Graph** (`evaluation-graph.json`, `warning-graph.json` schemaVersion 4):
 
-- **Warning nodes.** Baseline warnings (`W0001`, ..., state `S0`, root,
-  distance 0) are always kept. A warning introduced by edit `A` becomes a new
-  node `A-N1`, ... with state `S0+A` and distance 1. Introduced warnings of
-  different attempts are always separate nodes.
-- **Annotation nodes.** Each candidate is one annotation node, applied to `S0`,
-  with its outcome, counts and the answers that proposed it. Proposal
-  associations are node data, not edges.
+- **Warning nodes.** Baseline warnings (`W0001`, ..., state `S0`, round 0,
+  root, distance 0) are always kept. A warning introduced by package `A`
+  becomes a new node with state `S0+A`, distance 1, and an ID from the
+  inference round's sequence (see "Warning IDs by round" below). Introduced
+  warnings of different attempts are always separate nodes.
+- **Annotation nodes.** Each package is one annotation node, applied to `S0`.
+  It holds **every edit** of the package (with answer indices and applier
+  outcome), its outcome and counts, and the answer that proposed it. The
+  originating answer is node data, not an edge. Edits never get nodes of their
+  own.
 - **Edges.** `W -> A` (`resolved-by`) for **every** baseline warning the
-  comparison found resolved, whether or not `A` was proposed for it.
-  `A -> N` (`introduces`) for every introduced warning.
+  comparison found resolved by the whole package, whether or not `A` was
+  proposed for it. `A -> N` (`introduces`) for every introduced warning.
+  Resolution is never inferred from a lower count.
 - **Nodes without edges.** An annotation node without edges states why in its
   outcome: unevaluated, no change, no-op, rejected, failed, or ambiguous.
 
 `visualize` draws warnings as boxes (introduced ones dashed) and annotations
 as ellipses coloured by outcome, with `resolved-by` edges green and
-`introduces` edges red.
+`introduces` edges red. Annotation nodes show their outcome and number of edits;
+their tooltips list every edit with its applier outcome. All tooltips name the
+node's round.
 
-Limitations: each edit is evaluated alone, so the graph does not show whether
-independently successful edits combine safely. For an answer with several
-edits, the individual results do not establish the effect of the whole set.
-When NullAway lists several fields in one message (for example "initializer
-method does not guarantee @NonNull fields 'a', 'b'"), annotating one field
-changes the message. The rule then records one resolved and one introduced
-warning, not a narrowed one.
+**Warning IDs by round.** A *round* is one iteration of LLM inference and
+evaluation. It is not one annotation attempt, and not a graph distance.
+
+- **Initial warnings** keep `W0001`, `W0002`, ...
+- **Introduced warnings.** Round 1 introduces `W1001`, `W1002`, ...; round 2
+  starts at `W2001`; round 12 at `W12001`. That is `W`, the round number, and a
+  three-digit sequence.
+- **Shared sequence.** All attempts of a round draw from the round's one
+  sequence. A warning gets a new ID only when the comparison finds it
+  introduced. Persisting warnings keep their baseline IDs.
+- **Round metadata.** The round is stored explicitly: `round` in
+  `evaluation.json`, `attempt.json` and `summary.json`, and on every graph node
+  (0 for initial warnings). It is never read from the ID, because the ID alone
+  is ambiguous: `W1001` would also be the 1001st initial warning.
+- **Allocation.** An ID is allocated when an attempt is recorded, continuing
+  after the highest ID in the completed attempt records. IDs are therefore
+  never renumbered on resume, and an interrupted attempt leaves no ID behind.
+  An unfiltered evaluation numbers in candidate order. When `--warning` runs
+  some candidates first, they get the earlier numbers.
+- **Comparison records.** `comparison.json` maps each introduced result
+  finding to its warning ID (`introducedWarnings`).
+- **Limits.** A round holds at most 999 introduced warnings. The 1000th stops
+  the evaluation (exit 3) rather than produce an ID of another round. An ID
+  already in the graph, which happens if there are more than 999 initial
+  warnings, is refused the same way.
+
+`evaluate-annotations` always evaluates round 1: answers about the run's
+initial warnings. Inference on introduced warnings, which would make round 2,
+is not implemented. Later rounds exist only as a parameter of the evaluation
+code and its tests.
+
+**Migrating older evaluations.** Evaluations written before rounds were
+recorded name introduced warnings `A0003-N1`. `evaluate-annotations` refuses
+to continue them (exit 3) instead of rewriting them silently. Convert one
+explicitly; nothing is rerun:
+
+```sh
+$GA migrate-warning-ids runs/<run id>/evaluations/<evaluation id>
+$GA visualize runs/<run id>/evaluations/<evaluation id>     # the old SVG is removed
+```
+
+How the migration works:
+
+- **Round.** It takes the round recorded in `evaluation.json`. Otherwise it
+  establishes round 1 only if the evaluation started from the run snapshot
+  and every candidate was proposed for an initial warning of the run (a root
+  node of its `warning-graph.json`). Anything else is refused as ambiguous,
+  and nothing is changed.
+- **Renaming.** Introduced warnings are renamed in candidate order, then in
+  their recorded order (`A0001-N1, A0001-N2, A0002-N1, ...` become `W1001,
+  W1002, W1003, ...`). That is the order a fresh evaluation would use. Edges,
+  attempt records, comparisons and the summary are updated. Baseline and
+  annotation IDs stay the same.
+- **Backup.** Every file it changes is first copied to
+  `warning-id-migration-backup-<time>/` and verified.
+- **Refusals.** It refuses overflow, IDs not in the old format, and a graph
+  that disagrees with the attempt records.
+- **Interruption.** The plan is kept in `.warning-id-migration.json` until
+  the migration finishes. An interrupted migration blocks
+  `evaluate-annotations` and is completed by running the command again.
+- **Rerunning it** on a migrated directory reports that it is already
+  current and changes nothing.
+
+| Exit | `migrate-warning-ids` meaning |
+|---|---|
+| 0 | Migrated, or already current |
+| 2 | Not an evaluation directory |
+| 3 | Refused (round not established, overflow, inconsistent records) or another process is writing the directory |
+| 4 | Internal error (rerunning completes an interrupted migration; the backup holds the originals) |
+
+Limitations:
+- **Packages are evaluated alone.** The graph does not show whether
+  independently successful packages combine safely.
+- **No per-edit attribution.** A package's result is that of its whole edit
+  set; it doesn't say which edit caused which change.
+- **Shared edits are checked again.** Packages that share edits are evaluated
+  separately, so an edit proposed by several answers is checked once per
+  package, and any warnings it introduces appear once per package.
+- **Multi-field messages.** When NullAway lists several fields in one message
+  (for example "initializer method does not guarantee @NonNull fields 'a',
+  'b'"), a package that annotates only some of them changes the message. The
+  rule then records one resolved and one introduced warning, not a narrowed
+  one.
+
+**Earlier single-edit evaluations.** Before packages, each distinct edit was
+evaluated alone; that split W0037's three-edit answer into three edits whose
+separate results said nothing about the answer as a whole. Such evaluation
+directories have a different key, so they are **kept as they are and never
+reused**. `evaluate-annotations` lists them as "kept, not reused" and evaluates
+every package afresh in a new directory. `migrate-warning-ids` still converts
+their IDs for viewing and keeps their single-edit meaning (one edit per
+annotation node, `candidateModel` marked historical). It never turns them into
+package results.
 
 | Exit | `evaluate-annotations` meaning |
 |---|---|
-| 0 | Every selected candidate has a recorded outcome (which may be a failure of that attempt) |
+| 0 | Every selected package has a recorded outcome (which may be a failure of that attempt) |
 | 2 | Invalid arguments, configuration or inference artifacts |
-| 3 | Nothing to evaluate, the baseline analysis failed, or another process is writing the evaluation |
+| 3 | Nothing to evaluate, the baseline analysis failed, another process is writing the evaluation, the evaluation must be migrated first (`migrate-warning-ids`), or the round's 999 warning IDs are used up |
 | 4 | Internal error (an interrupted attempt is moved aside and rerun next time) |
 
 On a scratch copy of the EventBus run (NullAway 0.14.2-SNAPSHOT checkout, JSpecify 1.0.0
-on the classpath), the baseline reproduced the run's 42 findings exactly. The
-39 proposed answers gave 30 distinct candidates, and all 30 attempts completed.
-Fifteen reduced the finding count, 12 resolved one warning but introduced
-another (for example a dereference of the newly `@Nullable` field), 2 increased
-it, and 1 changed nothing. A fresh evaluation took about 75 seconds
-(about 2.5 s per attempt, half of it NullAway's Gradle setup) and was
-reproducible: a second fresh evaluation gave the same evaluation ID and a
-byte-identical graph. A rerun with existing results reused everything in about a
-second. In one earlier run, a single attempt paused for about 6 minutes outside
-the checker commands while the process was idle. It did not recur and its cause
-is unknown.
+on the classpath), the baseline reproduced the run's 42 findings exactly.
+- **Packages.** The 39 proposed answers gave 39 packages with 42 edits in all
+  (W0035's answer had two edits and W0037's three); W0008 and W0011 were
+  excluded.
+- **Outcomes.** All 39 packages completed. 26 reduced the finding count, 8 kept
+  it with matched changes (resolved and introduced warnings), and 5 increased
+  it.
+- **W0037.** Its package (three `@Nullable` fields of
+  `AsyncExecutor.Builder`) resolved W0037 and introduced nothing. The earlier
+  single-edit evaluation could not show this: each edit alone only narrowed
+  the message.
+- **Timing.** The fresh evaluation took about 100 seconds (about 2.5 s per
+  package). A rerun with existing results reuses everything in about a second.
+- **Old directory.** The earlier single-edit evaluation directory was left
+  byte-identical.
 
 ## How the local NullAway checkout is used
 
@@ -1523,7 +1637,7 @@ src/main/java/generalannotator/
   edits/        annotation edit model (checker- and parser-independent), applier interface, diff
   edits/javaparser/  JavaParser-based declaration locator and annotation applier
   proposals/    import of collected proposals, application to a snapshot copy (applications/)
-  evaluation/   candidate import and deduplication, baseline and per-edit attempts, resume and
+  evaluation/   package import (one per answer), baseline and per-package attempts, resume and
                 locking, expanded graph (evaluations/)
   evaluation/matching/  WarningMatcher interface, provisional anchored-1 rule, structural anchors
 src/main/resources/generalannotator/inference/ga_inference_worker.py   the GPU worker

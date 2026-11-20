@@ -21,10 +21,14 @@ import java.util.Optional;
  * @param state the repository state the warning was observed in (for example {@code S0} for an
  *     evaluation baseline, {@code S0+A0003} for the state after edit {@code A0003}); empty in an
  *     initial warning graph, where every node belongs to the run's single analyzed state
+ * @param round the inference round that introduced the warning: 0 for initial and baseline warnings,
+ *     {@code r >= 1} for a warning introduced while evaluating round {@code r}'s proposals; empty in an
+ *     initial warning graph and in graphs written before rounds were recorded. The ID format depends
+ *     on it ({@link WarningIds}), but the round is never derived from the ID.
  */
 public record WarningNode(
         String id, Diagnostic diagnostic, Optional<String> targetPath, boolean root, int distance,
-        Optional<String> state)
+        Optional<String> state, java.util.OptionalInt round)
         implements GraphNode {
 
     public static final String KIND = "warning";
@@ -37,6 +41,11 @@ public record WarningNode(
         Objects.requireNonNull(diagnostic, "diagnostic");
         Objects.requireNonNull(targetPath, "targetPath");
         Objects.requireNonNull(state, "state");
+        Objects.requireNonNull(round, "round");
+        if (round.isPresent() && (round.getAsInt() < 0 || root != (round.getAsInt() == 0))) {
+            throw new IllegalArgumentException("round " + round.getAsInt() + " does not fit a " + (root ? "root" : "non-root")
+                    + " warning node (initial warnings are round 0, introduced ones round >= 1)");
+        }
         if (distance < 0) {
             throw new IllegalArgumentException("distance must be >= 0: " + distance);
         }
@@ -47,7 +56,7 @@ public record WarningNode(
 
     /** A node of an initial warning graph (no state label). */
     public WarningNode(String id, Diagnostic diagnostic, Optional<String> targetPath, boolean root, int distance) {
-        this(id, diagnostic, targetPath, root, distance, Optional.empty());
+        this(id, diagnostic, targetPath, root, distance, Optional.empty(), java.util.OptionalInt.empty());
     }
 
     @Override

@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 
 /**
@@ -17,17 +18,20 @@ import java.util.Set;
  * edges.
  *
  * <ul>
- *   <li>Baseline warnings: root nodes of state {@code S0}, distance 0, kept whether or not anything
- *       resolves them.
- *   <li>One annotation node per candidate edit, with its outcome ({@link AttemptOutcome}), so a node
- *       without edges always says why: unevaluated, interrupted, no change, no-op, rejected, failed, not
- *       comparable or ambiguous.
+ *   <li>Baseline warnings: root nodes of state {@code S0}, round 0, distance 0, kept whether or not
+ *       anything resolves them.
+ *   <li>One annotation node per package (one answer's complete edit set), holding every edit with
+ *       its applier outcome, and the package's outcome ({@link AttemptOutcome}), so a node without edges
+ *       always says why: unevaluated, interrupted, no change, no-op, rejected, failed, not comparable or
+ *       ambiguous. Edits of a package never get nodes of their own.
  *   <li>Only a trustworthy comparison (COMPLETED or AMBIGUOUS) adds edges: {@code W -> A}
- *       ({@value GraphEdge#RESOLVED_BY}) for every resolved baseline warning W, whether or not A was
- *       proposed for W; and for every introduced finding a new warning node {@code A-N<k>} of state
- *       {@code S0+A} with distance 1, plus {@code A -> N} ({@value GraphEdge#INTRODUCES}). Introduced
- *       findings of different attempts are always distinct nodes, even if they look identical.
- *   <li>Proposal associations stay on the annotation node; they are never edges.
+ *       ({@value GraphEdge#RESOLVED_BY}) for every baseline warning W resolved by the whole package, whether
+ *       or not A was proposed for W; and for every introduced finding a new warning node of state {@code S0+A}, distance
+ *       1 and the evaluation's round, plus {@code A -> N} ({@value GraphEdge#INTRODUCES}). Its ID was
+ *       allocated from the round's sequence when the attempt was recorded ({@code W1001, W1002, ...} for
+ *       round 1, see {@link generalannotator.graph.WarningIds}). Introduced findings of different attempts
+ *       are always distinct nodes, even if they look identical.
+ *   <li>The originating answer stays on the annotation node; it is never an edge.
  * </ul>
  */
 final class EvaluationGraph {
@@ -35,7 +39,7 @@ final class EvaluationGraph {
     private EvaluationGraph() {}
 
     static WarningGraph build(Candidates candidates, List<WarningNode> baseline, Map<String, Map<?, ?>> records,
-            Set<String> interrupted, Map<String, String> originalToBaseline, String checkerId) {
+            Set<String> interrupted, Map<String, String> originalToBaseline, String checkerId, int round) {
         List<GraphNode> nodes = new ArrayList<>(baseline);
         List<GraphEdge> edges = new ArrayList<>();
         for (Candidates.Candidate c : candidates.candidates()) {
@@ -61,21 +65,29 @@ final class EvaluationGraph {
                     for (Object w : (List<?>) r.get("resolved")) {
                         edges.add(new GraphEdge((String) w, c.id(), GraphEdge.RESOLVED_BY));
                     }
-                    for (Object o : (List<?>) r.get("introduced")) {
-                        Map<?, ?> im = (Map<?, ?>) o;
-                        String id = (String) im.get("nodeId");
+                    for (Map<?, ?> im : Evaluator.introduced(r)) {
+                        String id = (String) im.get("warningId");
                         introduced.add(new WarningNode(id, FindingJson.diagnostic((Map<?, ?>) im.get("diagnostic")),
-                                Optional.ofNullable((String) im.get("targetPath")), false, 1, resultState));
+                                Optional.ofNullable((String) im.get("targetPath")), false, 1, resultState,
+                                OptionalInt.of(Math.toIntExact((Long) im.get("round")))));
                         edges.add(new GraphEdge(c.id(), id, GraphEdge.INTRODUCES));
                     }
                 }
             }
-            List<AnnotationNode.Proposal> proposals = c.associations().stream()
-                    .map(a -> new AnnotationNode.Proposal(a.warningId(), a.group(), a.answerEditIndex(),
-                            Optional.ofNullable(originalToBaseline.get(a.warningId()))))
-                    .toList();
-            nodes.add(new AnnotationNode(c.id(), c.edit().canonical(), Candidates.editFields(c.edit()),
-                    Evaluator.BASELINE_STATE, resultState, outcome, detail, proposals, counts));
+            List<AnnotationNode.PackageEdit> edits = new ArrayList<>();
+            List<?> recorded = r != null && r.get("edits") instanceof List<?> l ? l : List.of();
+            for (int i = 0; i < c.edits().size(); i++) {
+                Candidates.PackageEdit pe = c.edits().get(i);
+                Map<?, ?> applier = i < recorded.size() && ((Map<?, ?>) recorded.get(i)).get("applier") instanceof Map<?, ?> a
+                        ? a : Map.of();
+                edits.add(new AnnotationNode.PackageEdit(pe.edit().canonical(), Candidates.editFields(pe.edit()),
+                        pe.answerEditIndices(), Optional.ofNullable((String) applier.get("outcome")),
+                        Optional.ofNullable((String) applier.get("detail"))));
+            }
+            List<AnnotationNode.Proposal> proposals = List.of(new AnnotationNode.Proposal(c.warningId(), c.group(),
+                    OptionalInt.empty(), Optional.ofNullable(originalToBaseline.get(c.warningId()))));
+            nodes.add(new AnnotationNode(c.id(), c.canonical(), edits, Evaluator.BASELINE_STATE, resultState, outcome,
+                    detail, proposals, counts, OptionalInt.of(round)));
             nodes.addAll(introduced);
         }
         return new WarningGraph(candidates.runId(), checkerId, nodes, edges);
