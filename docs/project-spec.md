@@ -5,9 +5,13 @@ Status: draft. Stage 1 (*Check*) is implemented for NullAway (tasks T1–T4a in
 Specimin target members (T4d), Specimin slice generation without reproduction
 validation (T10a), one-hop usage-context extraction (T11, T11a), and LLM
 prompt-unit assembly without LLM calls (T13a), and the first half of Wulver
-inference (T13b): an immutable Slurm submission and the GPU worker, tested
-with fakes only. Upload, job submission, result download, applying proposals,
-rechecking, recording and search are not implemented.
+inference (T13b): an immutable Slurm submission and the GPU worker. Upload,
+submission, monitoring and collection (T13c, T13e) have been used on Wulver.
+Collected proposals can be applied to a fresh copy of the run snapshot (T6,
+`apply-proposal`). Each distinct proposed edit can be evaluated alone against
+one baseline with the checker, and the results recorded as an expanded graph
+(T8, `evaluate-annotations`). Annotation sequences, an append-only transition
+log and search are not implemented.
 
 ## 1. Purpose
 
@@ -86,7 +90,7 @@ Out of scope for now:
 | **Warning** | A diagnostic that reports a potential type error (for NullAway, a nullability error). Used loosely as a synonym for a checker finding. |
 | **Checker finding** | A diagnostic produced by a checker run that completed. |
 | **Execution failure** | A run that did not produce a trustworthy set of findings, such as a build-tool error, an unrelated compilation error, a crash, a timeout, or a missing tool. |
-| **Warning identity** | The rule that decides whether a diagnostic in one state is "the same warning" as one in another state. *Unresolved* (§6). |
+| **Warning identity** | The rule that decides whether a diagnostic in one state is "the same warning" as one in another state. *Unresolved* (§6); T8 uses the provisional rule `anchored-1` behind `WarningMatcher`. |
 | **Slice** | A reduced, compilable program Specimin produces that keeps the code needed to reproduce a target warning. |
 | **Symbol usage** | A source location that references a symbol (field, method, parameter, local, or type) relevant to a warning. |
 | **Enclosing region** | A syntactic region (for example a method or class body) that contains a diagnostic or a usage. |
@@ -99,9 +103,11 @@ Out of scope for now:
 | **State transition** | The link from a source state to a result state through an attempt, together with the attempt's outcome. |
 | **Resolution** | The effect of an attempt on a warning: for example resolved, persisting, or newly introduced. Depends on warning identity. |
 | **Annotation sequence** | An ordered series of edits leading from the initial state to a later state. |
-| **Warning graph** | Per-run graph of warning nodes and (later) other nodes and edges. The initial graph is built from a completed analysis only: one root warning node per finding, no edges. Saved as `warning-graph.json`. |
+| **Warning graph** | Per-run graph of warning nodes and (later) other nodes and edges. The initial graph is built from a completed analysis only: one root warning node per finding, no edges. Saved as `warning-graph.json`. An evaluation's expanded graph (`evaluation-graph.json`, schema version 2) adds annotation nodes, result-state warning nodes and `resolved-by` / `introduces` edges. |
+| **Baseline state** | `S0`: an evaluation's immutable copy of the run snapshot, checked once; every attempt starts from it. The state after edit `A` is `S0+A`. |
+| **Annotation node** | One concrete edit evaluated (or still to be evaluated) against one baseline state, with an explicit outcome and its proposal associations. |
 | **Warning node** | A graph node for one checker finding observed in one run. Its ID (`W0001`, ...) identifies that *occurrence within the run*, not a warning identity across runs. It holds the complete diagnostic. |
-| **Root / distance** | Initial warning nodes are roots with distance 0. How distance grows for nodes added later (for example per annotation step) is not defined yet (§6). |
+| **Root / distance** | Initial and baseline warning nodes are roots with distance 0. Provisionally (T8), a warning node's distance is the number of edits applied to the baseline in the state where it was observed, so warnings introduced by one evaluated edit have distance 1. Distance across longer sequences is not defined yet (§6). |
 | **Batch** | A set of edits attempted together because they are believed to be independent. *Criteria unresolved* (§6). |
 
 ## 6. Unresolved design decisions
@@ -119,6 +125,27 @@ interface or in one named class), labeled provisional, and noted here.
    line, enclosing element plus message key, or AST-anchored positions that survive
    line shifts caused by edits. This decision determines what counts as
    "resolved" and "introduced".
+   **Provisional (T8), isolated in `evaluation.matching.AnchoredWarningMatcher`
+   (`anchored-1`) behind the `WarningMatcher` interface:**
+   - The primary key is the normalized project-relative path, checker,
+     severity, whitespace-collapsed message, enclosing declaration and source
+     line with annotations, `final` and whitespace removed.
+   - The declaration is the innermost member, initializer, enum constant or
+     type whose JavaParser range contains the finding. It is identified by its
+     type chain and member signature, with annotations removed from parameter
+     types (`DeclarationAnchors`).
+   - Equal multiplicity per key means persisting. One empty side means
+     resolved or introduced.
+   - Different non-zero multiplicities are paired by line offset within the
+     declaration, but only if every anchor is resolved and the offsets are
+     unique; otherwise the group is ambiguous and supports no claim.
+   - Counts, run-local IDs and raw line/column are never identity.
+   - Assumption: edits insert no line breaks (the AST applier splices inline).
+   - Known consequence: a message that lists several fields changes when one
+     field is annotated. On EventBus W0037 this was recorded as resolved plus
+     introduced, not as a narrowed warning.
+   - A key that occurs equally often before and after persists, even if one
+     occurrence was resolved and an indistinguishable one introduced.
 2. **Definition of safe/unsafe enclosing regions.** Which region granularity
    is used (statement, method, class), and which diagnostics make a region
    unsafe?
@@ -161,8 +188,9 @@ interface or in one named class), labeled provisional, and noted here.
 - **JSON.** `report.json` and `warning-graph.json` are written by a small
   in-house writer (`report.Json`). They are read back by a small, strict
   in-house RFC 8259 parser (`report.JsonParser`), added for graph save/load.
-  The project still has no runtime dependencies. Revisit this if proposal files
-  need richer JSON handling.
+  The only runtime dependency is JavaParser 3.28.2 (T6, the annotation
+  applier); JSON stays in-house. Revisit this if proposal files need richer
+  JSON handling.
 - **Initial warning graph.** It is built only from a `CompletedAnalysis`; a
   failed run writes no graph, and `report.json` says why. IDs `W0001`, ... are
   assigned after a deterministic sort (target path, line, column, severity,
@@ -295,23 +323,89 @@ interface or in one named class), labeled provisional, and noted here.
 
 ### Engineering decisions (open, to be settled by the task that needs them)
 
-- Warning-graph expansion: which node kinds (for example annotation actions,
-  warnings observed in later states) and edge kinds are added, what "distance"
-  measures for non-root nodes, and how nodes from different runs or states
-  relate. This depends on §6.1 and §6.3.
+- Warning-graph expansion. **Provisional (T8), in `evaluation.EvaluationGraph`:**
+  - Baseline warning nodes (state `S0`) are kept.
+  - Each candidate edit evaluated against a baseline is one annotation node.
+    Its identity is the edit plus the baseline; its ID `A0001, ...` follows the
+    first occurrence over all answers. Every node has an explicit outcome:
+    UNEVALUATED, INTERRUPTED, COMPLETED, AMBIGUOUS, NO_OP, REJECTED, a failure
+    kind, or NOT_COMPARABLE.
+  - `W -> A` (`resolved-by`) is added for every baseline warning a trustworthy
+    comparison found resolved, proposed or not.
+  - Each introduced finding gets a new warning node `A-N<k>` (state `S0+A`,
+    distance 1) and `A -> N` (`introduces`). Introduced findings of different
+    attempts are never merged.
+  - Proposal associations are node data, not edges.
+  - The graph is rebuilt from per-attempt records after every invocation.
+
+  Open:
+  - how nodes of states after several edits relate, and what distance means
+    there (§6.3, §6.4);
+  - whether introduced warnings of different attempts should ever be
+    identified with each other.
 - Isolation mechanism for *multiple* repository states (copy per state, `git
-  worktree`, overlay, etc.) and how states are identified.
+  worktree`, overlay, etc.) and how states are identified. **Provisional (T8):**
+  - Each attempt is an explicit file copy of the baseline copy
+    (`SnapshotCopier`; symlinks skipped and reported; no git).
+  - States are named `S0` and `S0+<candidate>`; edits never accumulate.
+  - An evaluation directory is keyed by a hash of the snapshot tree, the
+    checker configuration fingerprint (including classpath content hashes and
+    the JDK `release` file), the candidate set and the matcher. Results are
+    reused only under the same key.
+  - The built checker is identified after each run (`ToolIdentity`: version,
+    processor-path jar hashes, annotated packages). An attempt with a
+    different identity is NOT_COMPARABLE.
+- Evaluation policy (T8, provisional, in `Evaluator.suppression`): adding
+  `@SuppressWarnings` or `@NullUnmarked`, or removing `@NullMarked`, is not
+  evaluated (REJECTED), because it switches checking off instead of annotating
+  types. Open questions:
+  - Whether other annotations (for example `@Generated` with NullAway's
+    TreatGeneratedAsUnannotated option, or `@Initializer`) need the same
+    treatment.
+  - NO_OP edits are not checked, because their state equals the baseline.
+  - The baseline is always rerun; the run's original check is never reused,
+    because the run records no source hashes and its classpath may differ. The
+    baseline is compared with the run's `warning-graph.json` only to map
+    warning IDs.
+  - Every attempt reruns NullAway's Gradle setup (about 1 s on EventBus, plus
+    about 1.5 s of javac). Caching the processor path is an optimization that
+    has not been done.
 - Supporting targets whose sources need dependency resolution or generated
   code, for example by extracting the classpath from the target's build.
 - Which nullability annotation library edits use (JSpecify, or the target's
   existing annotations). **Provisional (T13a):** the prompt template's
   NullAway guidance (`prompts.PromptTemplate.CHECKERS`, the only place it is
   encoded) asks for the annotations the project already uses and otherwise
-  `org.jspecify.annotations.Nullable`. Edits are not applied yet, so nothing
-  else depends on this.
-- How proposals are mapped to edits (T6, T7, T13). The worker checks
-  answers against the response format (T13b), but whether a proposal's file,
-  member and position exist in the original project is not checked yet.
+  `org.jspecify.annotations.Nullable`. `apply-proposal` writes whatever
+  annotation a proposal names, fully qualified, without adding imports or
+  dependencies, so compiling the edited copy needs the library on the
+  classpath (`GA_TARGET_CLASSPATH` for `evaluate-annotations`; otherwise every
+  applied edit is COMPILATION_FAILED).
+- **Annotation edits and their application (T6), provisional choices:**
+  - Edits are applied to a fresh copy of the run snapshot, never to slices.
+  - The source root comes from `warning-targets.json` (the package root the
+    prompt named).
+  - Rewriting uses token-anchored text splices from JavaParser's tokens, not
+    `LexicalPreservingPrinter`. In 3.28.2 that printer ignored in-place
+    field-type changes, and after a replacement it produced invalid
+    `@Anullableint`.
+  - Placement follows the `edits.AnnotationKinds` table (type-use versus
+    declaration annotations; unknown annotations only on simple types),
+    together with its nullness-family conflict rules.
+  - Parameter types match after normalization; raw versus parameterized forms
+    match only when one side has no type arguments.
+  - Multi-variable fields, C-style arrays and varargs parameters are rejected.
+  - Existing annotations count only when their name is written qualified or
+    single-type imported.
+
+  Open questions:
+  - whether to split multi-variable fields;
+  - whether to resolve annotation `@Target`s from the classpath instead of the
+    table;
+  - how to detect a snapshot changed after the check (the run records no
+    source hashes);
+  - how applied proposals feed repository states (T5); T8 evaluates each
+    edit separately rather than a proposal's whole edit set.
 - Whether the worker should retry transient HTTP errors itself (it doesn't;
   `inference retry` resubmits failed prompts as new attempts).
 - Whether a managed master that ignores `ssh -O exit` should ever be stopped
@@ -341,14 +435,15 @@ interface or in one named class), labeled provisional, and noted here.
 |-------|--------|
 | Build skeleton (Gradle Wrapper, JUnit) | Implemented |
 | 1. Check (NullAway) | Implemented: `check` command on configured source roots of one target, verified on fixtures and on EventBus core (`EventBus/src`) |
-| Initial warning graph | Implemented: root warning nodes (distance 0), no edges, `warning-graph.json` save/load. No expansion. |
+| Initial warning graph | Implemented: root warning nodes (distance 0), no edges, `warning-graph.json` save/load. |
+| Graph expansion | Implemented provisionally (T8): baseline, annotation and introduced-warning nodes, `resolved-by` and `introduces` edges, `evaluation-graph.json` (schema version 2). Single edits only. |
 | Graph visualization | Implemented: `visualize` command (Graphviz DOT/SVG, hover tooltips). |
 | 2. Slice: target identification | Implemented: Specimin target member per warning (`warning-targets.json`, `targets` command). |
 | 2. Slice: generation | Implemented: `slice` command runs Specimin per warning into `slices/<ID>/` (`slice-results.json`). Reproduction is NOT_VALIDATED. |
 | 2. Slice: reproduction validation | Not implemented (T10b). |
 | 3. Extract context | Implemented for symbol usages: `context` command writes `context/<ID>.json`/`.txt` (one hop, symbol-based, no safe/unsafe policy). Unsafe-region usages (T12) blocked on §6.2. |
-| 4. Propose (manual / LLM) | Prompt units (`prompts`), Wulver submissions with a GPU worker (`prepare-inference`), and upload, submission, monitoring, collection and retry over one shared SSH connection (`inference`), with a submit, disconnect, reconnect and collect workflow (T13e). Used on Wulver (jobs 1628816 and 1629432); the T13e health check and stale-connection recovery are tested with fakes only. Proposals are not applied. |
-| 5. Apply and recheck | Not implemented |
-| 6. Record | Not implemented |
+| 4. Propose (manual / LLM) | Prompt units (`prompts`), Wulver submissions with a GPU worker (`prepare-inference`), and upload, submission, monitoring, collection and retry over one shared SSH connection (`inference`), with a submit, disconnect, reconnect and collect workflow (T13e). Used on Wulver (jobs 1628816 and 1629432); the T13e health check and stale-connection recovery are tested with fakes only. Proposals are applied by `apply-proposal` and evaluated by `evaluate-annotations`. |
+| 5. Apply and recheck | `apply-proposal` applies a proposal's edits, all or nothing, to a snapshot copy (`applications/`). `evaluate-annotations` applies each distinct edit alone to a copy of one baseline, reruns NullAway on all source roots and compares findings with the provisional `anchored-1` rule (T8). Verified with fakes and manually on EventBus (30 attempts, all completed). |
+| 6. Record | Partly: per-attempt records, summary and the expanded graph (T8). No append-only state-transition log (T9). |
 | 7. Explore and select | Not implemented; blocked on §6 decisions |
 | 8. Batch | Not implemented; blocked on §6 decisions |

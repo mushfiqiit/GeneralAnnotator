@@ -14,14 +14,18 @@ import java.nio.file.Path;
 import java.util.Map;
 
 /**
- * {@code visualize <warning-graph.json | run directory>}: load a saved warning graph (no checker
- * run), write {@code <name>.dot} beside it and render {@code <name>.svg} with Graphviz.
+ * {@code visualize <warning-graph.json | evaluation-graph.json | run or evaluation directory>}: load a
+ * saved graph (no checker run), write {@code <name>.dot} beside it and render {@code <name>.svg} with
+ * Graphviz.
  *
  * <p>Exit codes: 0 rendered; 2 bad argument, unreadable or invalid graph file, or invalid {@value
  * GraphvizRenderer#DOT_ENV}; 3 Graphviz missing or rendering failed (the JSON and DOT files are kept);
  * 4 internal error such as failing to write the DOT file.
  */
 public final class VisualizeCommand {
+
+    /** The graph file of an evaluation directory ({@code evaluate-annotations}). */
+    public static final String EVALUATION_GRAPH = generalannotator.evaluation.Evaluator.GRAPH;
 
     private final String argument;
     private final Map<String, String> env;
@@ -60,7 +64,14 @@ public final class VisualizeCommand {
                 return usage(given + " does not exist. Pass a warning-graph.json file or a run directory, "
                         + "for example runs/<run id> (list them with: ls runs).");
             }
-            graphFile = Files.isDirectory(given) ? given.resolve(WarningGraphJson.FILE_NAME) : given;
+            graphFile = given;
+            if (Files.isDirectory(given)) {
+                // a run directory holds warning-graph.json; an evaluation directory holds evaluation-graph.json
+                graphFile = given.resolve(WarningGraphJson.FILE_NAME);
+                if (!Files.exists(graphFile) && Files.isRegularFile(given.resolve(EVALUATION_GRAPH))) {
+                    graphFile = given.resolve(EVALUATION_GRAPH);
+                }
+            }
         } catch (InvalidPathException e) {
             return usage("'" + argument + "' is not a valid path.");
         }
@@ -96,8 +107,10 @@ public final class VisualizeCommand {
         }
 
         out.println("GeneralAnnotator visualize");
-        out.println("  graph:  " + graphFile + " (run " + graph.runId() + ", " + graph.nodes().size()
-                + " warning node(s), " + graph.edges().size() + " edge(s))");
+        long annotations = graph.nodes().size() - graph.warningNodes().size();
+        out.println("  graph:  " + graphFile + " (run " + graph.runId() + ", " + graph.warningNodes().size()
+                + " warning node(s), " + (annotations > 0 ? annotations + " annotation node(s), " : "")
+                + graph.edges().size() + " edge(s))");
         out.println("  dot:    " + dotFile);
         if (!result.rendered()) {
             out.println("  svg:    not rendered");

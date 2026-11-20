@@ -93,4 +93,53 @@ class WarningGraphJsonTest {
         assertEquals(Optional.empty(), loaded.warningNodes().getFirst().targetPath());
         assertTrue(loaded.warningNodes().getFirst().diagnostic().sourcePath().startsWith(ROOT.toString()));
     }
+
+    private static WarningGraph expanded() {
+        WarningGraph g = graph();
+        List<GraphNode> nodes = new java.util.ArrayList<>();
+        for (WarningNode w : g.warningNodes()) {
+            nodes.add(new WarningNode(w.id(), w.diagnostic(), w.targetPath(), true, 0, Optional.of("S0")));
+        }
+        java.util.Map<String, String> edit = new java.util.LinkedHashMap<>();
+        edit.put("sourceRoot", "src");
+        edit.put("file", "p/Queue.java");
+        edit.put("annotation", "org.jspecify.annotations.Nullable");
+        nodes.add(new AnnotationNode("A0001", "ADD @x at FIELD of p.Queue#head in src/p/Queue.java", edit, "S0",
+                Optional.of("S0+A0001"), "COMPLETED", "findings 4 -> 4", List.of(new AnnotationNode.Proposal("W0001",
+                "W0001@1", 0, Optional.of("W0001"))), Optional.of(new AnnotationNode.Counts(4, 4, 1, 3, 1, 0, 0))));
+        WarningNode n = g.warningNodes().get(0);
+        nodes.add(new WarningNode("A0001-N1", n.diagnostic(), n.targetPath(), false, 1, Optional.of("S0+A0001")));
+        nodes.add(new AnnotationNode("A0002", "REMOVE ...", edit, "S0", Optional.empty(), "UNEVALUATED",
+                "not evaluated yet", List.of(), Optional.empty()));
+        return new WarningGraph(g.runId(), g.checkerId(), nodes, List.of(
+                new GraphEdge("W0002", "A0001", GraphEdge.RESOLVED_BY),
+                new GraphEdge("A0001", "A0001-N1", GraphEdge.INTRODUCES)));
+    }
+
+    @Test
+    void expandedGraphsUseSchemaVersionTwoAndRoundTrip() {
+        WarningGraph original = expanded();
+        String json = WarningGraphJson.write(original);
+
+        assertTrue(json.contains("\"schemaVersion\": 2"), json);
+        assertTrue(json.contains("\"state\": \"S0+A0001\""), json);
+        assertTrue(json.contains("\"kind\": \"annotation\""), json);
+        WarningGraph loaded = WarningGraphJson.read(json);
+        assertEquals(original, loaded);
+        assertEquals(json, WarningGraphJson.write(loaded));
+        // Initial graphs keep version 1 without a state field.
+        String initial = WarningGraphJson.write(graph());
+        assertTrue(initial.contains("\"schemaVersion\": 1") && !initial.contains("\"state\""), initial);
+    }
+
+    @Test
+    void annotationNodesAreRejectedInVersionOneAndValidatedInVersionTwo() {
+        String json = WarningGraphJson.write(expanded());
+        assertThrows(IllegalArgumentException.class,
+                () -> WarningGraphJson.read(json.replace("\"schemaVersion\": 2", "\"schemaVersion\": 1")));
+        assertThrows(IllegalArgumentException.class,
+                () -> WarningGraphJson.read(json.replace("\"outcome\": \"COMPLETED\",", "")));
+        assertThrows(IllegalArgumentException.class,
+                () -> WarningGraphJson.read(json.replace("\"schemaVersion\": 2", "\"schemaVersion\": 3")));
+    }
 }

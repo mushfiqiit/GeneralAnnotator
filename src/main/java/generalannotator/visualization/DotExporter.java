@@ -1,6 +1,7 @@
 package generalannotator.visualization;
 
 import generalannotator.diagnostics.Diagnostic;
+import generalannotator.graph.AnnotationNode;
 import generalannotator.graph.GraphEdge;
 import generalannotator.graph.GraphNode;
 import generalannotator.graph.WarningGraph;
@@ -23,6 +24,12 @@ import java.util.List;
  *       and last component (observed with Graphviz 12.1). Graphs with edges use the hierarchical
  *       {@code dot} layout, with packing.
  *   <li>An empty graph is rendered as a clear "No warnings" message.
+ *   <li>Evaluation graphs: warning nodes are rounded boxes; warnings of a result state (introduced
+ *       by an edit) have a dashed border. Annotation nodes are ellipses filled by outcome (green
+ *       completed, grey unevaluated or no-op, red failed or rejected, yellow ambiguous), labeled
+ *       with their ID and outcome, with the edit, counts and proposal associations in the tooltip.
+ *       {@value GraphEdge#RESOLVED_BY} edges are green, {@value GraphEdge#INTRODUCES} edges red.
+ *       Proposal associations are not drawn as edges.
  * </ul>
  *
  * <p>Escaping (verified against Graphviz 12.1): inside double-quoted DOT strings, {@code "} becomes
@@ -56,13 +63,27 @@ public final class DotExporter {
                         .append(", label=").append(label(w.id()))
                         .append(", tooltip=").append(tooltip(tooltipText(w)))
                         .append(", fillcolor=\"").append(fill(w)).append('"')
+                        .append(w.root() ? "" : ", style=\"rounded,filled,dashed\"")
+                        .append(", sortv=").append(i + 1)
+                        .append("];\n");
+                case AnnotationNode a -> out.append("  ").append(id(a.id()))
+                        .append(" [id=").append(id(a.id()))
+                        .append(", shape=ellipse, style=filled")
+                        .append(", label=").append(label(a.id() + "\n" + a.outcome()))
+                        .append(", tooltip=").append(tooltip(tooltipText(a)))
+                        .append(", fillcolor=\"").append(fill(a)).append('"')
                         .append(", sortv=").append(i + 1)
                         .append("];\n");
             }
         }
         for (GraphEdge e : graph.edges()) {
+            String color = switch (e.kind()) {
+                case GraphEdge.RESOLVED_BY -> ", color=\"#2e7d32\", fontcolor=\"#2e7d32\"";
+                case GraphEdge.INTRODUCES -> ", color=\"#c62828\", fontcolor=\"#c62828\"";
+                default -> "";
+            };
             out.append("  ").append(id(e.source())).append(" -> ").append(id(e.target()))
-                    .append(" [label=").append(label(e.kind()))
+                    .append(" [label=").append(label(e.kind())).append(color)
                     .append(", tooltip=").append(tooltip(e.source() + " -> " + e.target() + " (" + e.kind() + ")"))
                     .append("];\n");
         }
@@ -76,15 +97,50 @@ public final class DotExporter {
                     + "): the completed analysis reported no findings";
         }
         int warnings = graph.warningNodes().size();
+        long annotations = graph.nodes().stream().filter(AnnotationNode.class::isInstance).count();
+        if (annotations > 0) {
+            return "Evaluation graph: run " + graph.runId() + " (" + graph.checkerId() + ")\n"
+                    + warnings + " warning node(s), " + annotations + " annotation node(s), " + graph.edges().size()
+                    + " edge(s) - each edit was evaluated alone against the baseline; hover for details";
+        }
         return "Warning graph: run " + graph.runId() + " (" + graph.checkerId() + ")\n"
                 + warnings + " warning node(s), " + graph.edges().size() + " edge(s)"
                 + " - hover over a node for its location and message";
     }
 
+    /** Tooltip text of an annotation node: edit, states, outcome, counts and proposal associations. */
+    public static String tooltipText(AnnotationNode node) {
+        StringBuilder text = new StringBuilder(node.id()).append(": ").append(node.canonical()).append('\n');
+        text.append("applied to ").append(node.baselineState());
+        node.resultState().ifPresent(s -> text.append(" -> ").append(s));
+        text.append("\noutcome ").append(node.outcome()).append(": ").append(node.detail());
+        node.counts().ifPresent(c -> text.append("\nfindings ").append(c.baselineFindings()).append(" -> ")
+                .append(c.resultFindings()).append("; resolved ").append(c.resolved()).append(", introduced ")
+                .append(c.introduced()).append(", persisting ").append(c.persisting()).append(", ambiguous ")
+                .append(c.ambiguousBaseline()).append('/').append(c.ambiguousResult()));
+        if (!node.proposals().isEmpty()) {
+            text.append("\nproposed for ");
+            text.append(String.join(", ", node.proposals().stream()
+                    .map(p -> p.warningId() + " (" + p.group() + " edit " + p.answerEditIndex() + ")").toList()));
+        }
+        return text.toString();
+    }
+
+    private static String fill(AnnotationNode node) {
+        return switch (node.outcome()) {
+            case "COMPLETED" -> "#d4edda";
+            case "AMBIGUOUS" -> "#fff3cd";
+            case "UNEVALUATED", "NO_OP", "INTERRUPTED" -> "#e2e3e5";
+            default -> "#f5c6cb";
+        };
+    }
+
     /** Tooltip text: ID, location, severity and checker, then the complete message. */
     public static String tooltipText(WarningNode node) {
         Diagnostic d = node.diagnostic();
-        StringBuilder text = new StringBuilder(node.id()).append('\n');
+        StringBuilder text = new StringBuilder(node.id());
+        node.state().ifPresent(s -> text.append(" (state ").append(s).append(')'));
+        text.append('\n');
         text.append(node.targetPath().orElse(d.sourcePath())).append(':').append(d.line());
         if (d.column().isPresent()) {
             text.append(':').append(d.column().getAsInt());

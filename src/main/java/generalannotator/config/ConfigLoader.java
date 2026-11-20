@@ -58,11 +58,55 @@ public final class ConfigLoader {
         Path checkerHome = requiredDirectory(CHECKER_HOME);
         Path target = requiredDirectory(TARGET_PROJECT);
         List<Path> sourceRoots = sourceRoots(target);
+        return finish(checker, checkerHome, target, sourceRoots, outputDirectory(target));
+    }
+
+    /**
+     * The configuration for checking an existing snapshot, such as a run's isolated copy: the target
+     * and its source roots are given (for example from the run's {@code report.json}) instead of being
+     * read from {@value #TARGET_PROJECT} and {@value #TARGET_SOURCE_ROOTS}, which are ignored. Every
+     * other setting is read and validated exactly as by {@link #load()}; relative classpath entries
+     * are resolved against {@code snapshot}.
+     *
+     * @param sourceRoots source roots relative to {@code snapshot}; each must be a directory in it
+     * @param outputDirectory where results go (outside {@code snapshot})
+     */
+    public AnalysisConfig loadForSnapshot(Path snapshot, List<String> sourceRoots, Path outputDirectory)
+            throws ConfigurationException {
+        problems.clear();
+        String checker = checkerId();
+        Path checkerHome = requiredDirectory(CHECKER_HOME);
+        Path target = snapshot.toAbsolutePath().normalize();
+        List<Path> roots = new ArrayList<>();
+        for (String raw : sourceRoots) {
+            Path relative = toPath("source root", raw);
+            if (relative == null) {
+                continue;
+            }
+            relative = relative.normalize();
+            if (relative.isAbsolute() || relative.toString().isEmpty() || relative.startsWith("..")
+                    || !Files.isDirectory(target.resolve(relative))) {
+                problems.add("source root '" + raw + "' is not a directory inside " + target + ".");
+                continue;
+            }
+            roots.add(relative);
+        }
+        if (roots.isEmpty() && problems.stream().noneMatch(p -> p.startsWith("source root"))) {
+            problems.add("no source roots were given for " + target + ".");
+        }
+        Path output = outputDirectory.toAbsolutePath().normalize();
+        if (output.startsWith(target)) {
+            problems.add("The output directory " + output + " is inside the checked snapshot " + target + ".");
+        }
+        return finish(checker, checkerHome, target, roots, output);
+    }
+
+    private AnalysisConfig finish(String checker, Path checkerHome, Path target, List<Path> sourceRoots, Path output)
+            throws ConfigurationException {
         List<ClasspathEntry> classpath = classpath(target);
         Path javaHome = javaHome();
         OptionalInt release = javacRelease();
         Duration timeout = timeout();
-        Path output = outputDirectory(target);
 
         if (!problems.isEmpty()) {
             throw new ConfigurationException(problems);

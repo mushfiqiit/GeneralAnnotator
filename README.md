@@ -24,8 +24,16 @@ password-and-Duo login) and submit one Slurm array job. You can then disconnect
 and later check status and collect the results. They have been used on Wulver;
 the reconnection safeguards added since are tested with fakes only, and the
 GPU settings are not yet tuned. Inference results are proposals;
-they are not applied or checker-validated. No other pipeline stage (slice validation, applying proposals, editing, graph
-expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
+they are not checker-validated. `apply-proposal` turns one collected proposal
+into validated annotation edits and applies them, all or nothing, to a fresh copy
+of the run snapshot; it does not rerun the checker, so it says nothing about
+whether a warning is resolved. `evaluate-annotations` does rerun it: it applies
+each distinct proposed edit **alone** to a fresh copy of one baseline, runs
+NullAway on all source roots, compares the findings with a provisional matching
+rule, and records an **expanded graph** (baseline warnings, annotation nodes,
+`resolved-by` and `introduces` edges). Edits are never combined, and no fixes
+are inferred for introduced warnings. Slice validation, cumulative annotation
+sequences, search and batching are not implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
 
 ## Requirements
@@ -130,6 +138,10 @@ a run directory or the JSON file itself:
 ./gradlew run --args="visualize runs/20261118T000930Z-nullaway/warning-graph.json"
 open runs/20261118T000930Z-nullaway/warning-graph.svg     # macOS; or open it in any browser
 ```
+
+An evaluation directory (`runs/<run>/evaluations/<id>`) or its
+`evaluation-graph.json` can be passed too. Its annotation nodes and edges are
+drawn as described in "Evaluating annotations".
 
 Paths containing spaces need single quotes inside `--args`:
 `--args="visualize '/path/with spaces/runs/<run id>'"`. Relative paths are
@@ -1020,6 +1032,268 @@ Not yet verified on Wulver:
 
 The GPU smoke test (T13d) is still needed before relying on results.
 
+## Applying a proposal (`apply-proposal`)
+
+```sh
+$GA apply-proposal runs/<run id>/inference/<submission id> --warning W0001
+```
+
+This imports the collected answer for one warning and applies its annotation
+edits to a **fresh copy of the run snapshot** (`workspace/target`). The
+original project, the snapshot, the Specimin slices and the inference
+artifacts are only read. Neither the LLM nor the checker is run, and the
+warning graph is not changed. An applied edit is a source change, not evidence
+that the warning is resolved, or even that the code compiles. To recheck edits with
+the checker, use `evaluate-annotations` (next section), which evaluates each edit
+of a proposal separately.
+
+**Import.** The result used is the one `remote/collection.json` selected. It is
+verified again with the collection's own checks:
+- the submission's inputs still have their recorded SHA-256;
+- the result names this submission, run, warning and prompt hash;
+- `result.json` matches the attempt's `metadata.json`, and the answer and raw
+  response exist;
+- the entry in `collection.json` agrees with that verification. Otherwise the
+  command asks for `inference collect` again.
+
+Only `COMPLETED_PROPOSED` results are imported. `FAILED`, `NO_RESULT`,
+`INVALID_RESULT` and `COMPLETED_INSUFFICIENT_EVIDENCE` are reported (exit 3)
+and never treated as an empty proposal. The answer must follow
+`prompt-template-1`; each edit becomes an `AnnotationEdit` with:
+- source root and source-relative file;
+- fully qualified declaring class, nested classes joined by `.`;
+- the field name, or the method or constructor with its parameter types;
+- the position: `FIELD`, `RETURN`, `PARAMETER` with its index, or `TYPE_USE`
+  with a structured path;
+- `ADD` or `REMOVE`;
+- the fully qualified annotation.
+
+Rationale, uncertainty and provenance stay outside the edit's identity. The
+edits of one answer are one proposal, applied together. Identical edits are
+merged, and every origin is kept. Proposals of different warnings are never
+merged. The source root is taken from the run, not from the answer: the
+warning's resolved target in `warning-targets.json` (the package root the
+prompt named), whose configured root must be one of `report.json`'s source
+roots. Absolute paths, `..`, and files or directories reached through symbolic
+links are rejected.
+
+**Locating declarations.** The applier parses each file with JavaParser 3.28.2
+and finds the declaration structurally:
+- the package and the nested-class path of the declaring class;
+- a field by name, never a local variable or parameter;
+- a method or constructor by name and parameter types.
+
+Parameter types are normalized: whitespace, annotations, `final`, and `...`
+versus `[]` don't matter. Names are not resolved, so `Map` and `java.util.Map`
+stay different. A raw type matches the same type with type arguments, in
+either direction, and the record says so; Java does not allow overloads that
+differ only in type arguments. Anything else must be equal. Ambiguous or
+missing targets are rejected with the candidates. Parameter indices are
+checked, and `TYPE_USE` paths (`typeArgument[i]`, `arrayComponent`,
+`wildcardBound`) are followed explicitly.
+
+**Writing annotations.** New annotations are written fully qualified, at the
+exact type position, and no import or dependency is added:
+
+| Position | Result |
+|---|---|
+| field, return or parameter type | `private @A Object x`, `public <T> @A T get(...)`, `f(@A String s)` |
+| qualified or nested type | `java.util.@A Map<K, V>`, `Outer.@A Inner` |
+| array (the array itself) | `String @A [] a` |
+| `field/arrayComponent` of `String[][]` | `String[] @A [] m` |
+| type argument or wildcard bound | `List<@A String>`, `List<? extends @A Number>` |
+
+Whether a placement is legal Java depends on the annotation's `@Target`, which
+the tool does not load. A provisional table (`edits.AnnotationKinds`) handles
+this:
+- known type-use annotations (JSpecify, Checker Framework) get the exact
+  placements above;
+- known declaration annotations (`javax.annotation`, AndroidX, FindBugs) go
+  before the declaration's modifiers and cannot annotate nested type uses;
+- other annotations are placed only on simple, unqualified, non-array declared
+  types, where both readings give the same source.
+
+**Rejected rather than guessed:**
+- fields declared together (`Object a, b;`), which would annotate the siblings;
+- C-style array declarators (`String a[]`) and varargs parameters;
+- an existing annotation of the same simple name whose qualified name the
+  imports don't determine (for example under an on-demand import);
+- a different or contradictory nullness annotation already at the position;
+- ADD and REMOVE of the same annotation, or two different nullness
+  annotations, at one position.
+
+Adding an annotation that is already present, or removing one that is absent,
+is an explicit `NO_OP`.
+
+**Rewriting.** Files are changed by inserting or deleting only the annotation
+text, at positions taken from JavaParser's tokens. Comments, formatting and all
+other code stay byte for byte. JavaParser's `LexicalPreservingPrinter` was
+tried first. It ignored in-place changes to field types, and after a type was
+replaced it printed `@A` glued to a primitive type (`@…Nullableint`). Each
+rewritten file is parsed again and checked:
+- its comments are unchanged;
+- its tree, without comments and without annotations named like the edited
+  ones, is identical to the original;
+- every applied edit is observable at its position.
+
+**Atomicity and isolation.** Every edit of a proposal is checked before
+anything is written. If any edit is rejected, no file is written and no
+workspace is kept. Each application copies the snapshot afresh, so one
+proposal's edits never reach another's. Output goes to a new directory, built
+under a temporary name and renamed when complete; an earlier application is
+never overwritten, and a second one gets a `-2` suffix:
+
+```
+runs/<run id>/applications/<UTC timestamp>-<ID>/
+  application.json   run, submission, warning, inference attempt, prompt and answer SHA-256; canonical
+                     edits with their origins and APPLIED / NO_OP / REJECTED and a reason; overall
+                     APPLIED / NO_CHANGE / REJECTED; changed files with SHA-256 before and after
+  changes.diff       unified diff (APPLIED only)
+  workspace/         the edited copy of the snapshot (APPLIED only)
+```
+
+The edited files of the snapshot are hashed before and after, so a change to
+the snapshot during application is detected. The run records no hashes of the
+analyzed sources, though, so a snapshot edited *after* the check cannot be
+detected. That limitation is stated in `application.json`.
+
+| Exit | `apply-proposal` meaning |
+|---|---|
+| 0 | APPLIED, or NO_CHANGE (every edit already satisfied) |
+| 2 | Invalid arguments or inconsistent artifacts (wrong run, stale collection, source root not configured); nothing written |
+| 3 | No applicable proposal (failed, missing, invalid or insufficient-evidence result; nothing written), or the proposal was REJECTED (record written, no workspace) |
+| 4 | Internal error |
+
+On a scratch copy of the EventBus run, all 39 collected proposals were
+APPLIED, and W0008 and W0011 were reported as failed results. Every one of the
+39 workspaces compiled with plain `javac` with JSpecify on the classpath.
+
+## Evaluating annotations (`evaluate-annotations`)
+
+```sh
+export GA_CHECKER=nullaway
+export GA_CHECKER_HOME=$HOME/Documents/NullAway
+export GA_TARGET_CLASSPATH=$HOME/.gradle/caches/modules-2/files-2.1/org.jspecify/jspecify/1.0.0/7425a601c1c7ec76645a78d22b8c6a627edee507/jspecify-1.0.0.jar
+$GA evaluate-annotations runs/<run id>/inference/<submission id>              # every candidate
+$GA evaluate-annotations runs/<run id>/inference/<submission id> --warning W0007
+$GA visualize runs/<run id>/evaluations/<evaluation id>                      # evaluation-graph.svg
+```
+
+The checker settings are the same environment variables as for `check`
+(`GA_CHECKER`, `GA_CHECKER_HOME`, `GA_TARGET_CLASSPATH`,
+`GA_CHECKER_JAVA_HOME`, `GA_JAVAC_RELEASE`, `GA_TIMEOUT_SECONDS`,
+`GA_NULLAWAY_ANNOTATED_PACKAGES`). The target and source roots are the run's
+own (`report.json`), so `GA_TARGET_PROJECT` and `GA_TARGET_SOURCE_ROOTS` are
+not used. Proposed edits name annotations such as
+`org.jspecify.annotations.Nullable` fully qualified, without adding a
+dependency, so put the annotation jar on `GA_TARGET_CLASSPATH`. Otherwise every
+applied edit ends as `COMPILATION_FAILED`.
+
+What it does:
+
+1. **Candidates.** Every validated COMPLETED_PROPOSED answer of the submission
+   is imported (the same checks as `apply-proposal`). Identical edits (same
+   source root, file, class, member, exact position, action and annotation) are
+   merged into one candidate `A0001, ...`, which keeps every originating
+   warning, proposal group (one answer = one group, `W0007@1`) and index in the
+   answer. Failed, missing, invalid and insufficient-evidence answers are listed
+   as excluded, with the reason. `--warning` only selects which candidates to
+   evaluate. The checker still analyzes every source root, and the comparison
+   uses every finding.
+2. **Baseline.** The run snapshot is copied explicitly into
+   `baseline/source/` (a plain file copy: git is not consulted, so an ignored
+   `runs/` directory or a parent repository cannot hide sources), and the
+   checker runs on it. A failed baseline blocks the evaluation. It is kept in
+   `baseline-failed/<time>/` and retried next time.
+3. **Attempts.** For each candidate, in ID order: copy `baseline/source/` to
+   `attempts/<A>/source/`, apply **exactly that one edit** with the AST applier,
+   and run the checker with identical settings. Edits that would suppress or
+   switch off checking (`@SuppressWarnings`, `@NullUnmarked`, removing
+   `@NullMarked`) are not evaluated.
+4. **Comparison.** For a completed analysis with the same checker build and
+   annotated packages as the baseline, the findings are matched by the
+   provisional rule `anchored-1` (project-spec §6.1). The rule uses the path,
+   checker, message, enclosing declaration and source line with annotations
+   removed. It never uses counts, run-local IDs or raw line/column, so inserted
+   annotations do not break it. Each finding ends up **resolved**,
+   **persisting**, **introduced**, or **ambiguous** (no claim).
+
+Outcomes per candidate: `COMPLETED`, `AMBIGUOUS` (compared, but some findings
+undecidable), `NO_OP`, `REJECTED`, `COMPILATION_FAILED`, `TIMED_OUT`, `CRASHED`,
+`EXECUTION_FAILED`, `NOT_COMPARABLE` (different checker build or scope). In the
+graph only, a candidate can also be `INTERRUPTED` or `UNEVALUATED`. Counts are
+printed only for `COMPLETED` and `AMBIGUOUS`. An incomplete analysis is never
+zero warnings.
+
+```
+runs/<run>/evaluations/<submission id>-<key>/
+  evaluation.json        key material, settings, matcher assumptions, limitations
+  candidates.json        candidates, proposal groups (rationale, uncertainty, provenance), excluded answers
+  baseline/source/       full copy of the run snapshot (state S0); baseline/check/ logs
+  baseline/result.json   baseline findings with IDs and structural anchors, tool identity
+  attempts/<A>/          source/, changes.diff, check/ (applied edits only), comparison.json,
+                         attempt.json (outcome, counts, resolved and introduced warnings)
+  attempts/interrupted/<A>-<n>/   attempts found incomplete, moved aside before the rerun
+  evaluation-graph.json  expanded graph (schemaVersion 2); summary.json
+```
+
+The `<key>` hashes everything results depend on: the snapshot's tree hash,
+the checker configuration (including classpath file hashes and the JDK), the
+candidate set and the matching rule. A different configuration therefore gets a
+new evaluation directory, and results are reused only for the same baseline,
+configuration and edit. Rerunning the command resumes. Completed attempts
+(those with `attempt.json`) are reused, incomplete ones are moved aside and
+rerun, and the graph is rebuilt from the records, so nothing is duplicated. A
+file lock refuses a second concurrent writer. The run snapshot,
+`warning-graph.json` and the inference artifacts are only read.
+
+**Graph** (`evaluation-graph.json`, `warning-graph.json` schemaVersion 2):
+
+- **Warning nodes.** Baseline warnings (`W0001`, ..., state `S0`, root,
+  distance 0) are always kept. A warning introduced by edit `A` becomes a new
+  node `A-N1`, ... with state `S0+A` and distance 1. Introduced warnings of
+  different attempts are always separate nodes.
+- **Annotation nodes.** Each candidate is one annotation node, applied to `S0`,
+  with its outcome, counts and the answers that proposed it. Proposal
+  associations are node data, not edges.
+- **Edges.** `W -> A` (`resolved-by`) for **every** baseline warning the
+  comparison found resolved, whether or not `A` was proposed for it.
+  `A -> N` (`introduces`) for every introduced warning.
+- **Nodes without edges.** An annotation node without edges states why in its
+  outcome: unevaluated, no change, no-op, rejected, failed, or ambiguous.
+
+`visualize` draws warnings as boxes (introduced ones dashed) and annotations
+as ellipses coloured by outcome, with `resolved-by` edges green and
+`introduces` edges red.
+
+Limitations: each edit is evaluated alone, so the graph does not show whether
+independently successful edits combine safely. For an answer with several
+edits, the individual results do not establish the effect of the whole set.
+When NullAway lists several fields in one message (for example "initializer
+method does not guarantee @NonNull fields 'a', 'b'"), annotating one field
+changes the message. The rule then records one resolved and one introduced
+warning, not a narrowed one.
+
+| Exit | `evaluate-annotations` meaning |
+|---|---|
+| 0 | Every selected candidate has a recorded outcome (which may be a failure of that attempt) |
+| 2 | Invalid arguments, configuration or inference artifacts |
+| 3 | Nothing to evaluate, the baseline analysis failed, or another process is writing the evaluation |
+| 4 | Internal error (an interrupted attempt is moved aside and rerun next time) |
+
+On a scratch copy of the EventBus run (NullAway 0.14.2-SNAPSHOT checkout, JSpecify 1.0.0
+on the classpath), the baseline reproduced the run's 42 findings exactly. The
+39 proposed answers gave 30 distinct candidates, and all 30 attempts completed.
+Fifteen reduced the finding count, 12 resolved one warning but introduced
+another (for example a dereference of the newly `@Nullable` field), 2 increased
+it, and 1 changed nothing. A fresh evaluation took about 75 seconds
+(about 2.5 s per attempt, half of it NullAway's Gradle setup) and was
+reproducible: a second fresh evaluation gave the same evaluation ID and a
+byte-identical graph. A rerun with existing results reused everything in about a
+second. In one earlier run, a single attempt paused for about 6 minutes outside
+the checker commands while the process was idle. It did not recur and its cause
+is unknown.
+
 ## How the local NullAway checkout is used
 
 1. **Setup.** GeneralAnnotator writes `generated/nullaway-processor-path.init.gradle`
@@ -1228,8 +1502,8 @@ mismatched javac counts, or an exit code inconsistent with the diagnostics).
 
 ```
 src/main/java/generalannotator/
-  cli/          check, visualize, targets, slice, context, prompts, prepare-inference and
-                inference commands; exit codes
+  cli/          check, visualize, targets, slice, context, prompts, prepare-inference, inference,
+                apply-proposal and evaluate-annotations commands; exit codes
   config/       environment configuration and validation
   exec/         CommandRunner (ProcessBuilder-based; a terminal-attached variant for ssh login),
                 recorded command logs
@@ -1246,6 +1520,12 @@ src/main/java/generalannotator/
   prompts/      prompt-unit assembly: artifact join, template, manifest (no LLM calls)
   inference/    inference submissions: settings, task assignment, Slurm script
   inference/remote/  SSH connection sharing, upload, sbatch, squeue/sacct, collection, retry
+  edits/        annotation edit model (checker- and parser-independent), applier interface, diff
+  edits/javaparser/  JavaParser-based declaration locator and annotation applier
+  proposals/    import of collected proposals, application to a snapshot copy (applications/)
+  evaluation/   candidate import and deduplication, baseline and per-edit attempts, resume and
+                locking, expanded graph (evaluations/)
+  evaluation/matching/  WarningMatcher interface, provisional anchored-1 rule, structural anchors
 src/main/resources/generalannotator/inference/ga_inference_worker.py   the GPU worker
 src/test/python                   worker tests and fakes (./gradlew workerTest)
 src/main/resources/generalannotator/checker/nullaway/processor-path.init.gradle

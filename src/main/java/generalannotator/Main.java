@@ -1,7 +1,10 @@
 package generalannotator;
 
+import generalannotator.cli.ApplyProposalCommand;
 import generalannotator.cli.CheckCommand;
+import generalannotator.checker.Checkers;
 import generalannotator.cli.ContextCommand;
+import generalannotator.cli.EvaluateAnnotationsCommand;
 import generalannotator.cli.ExitCode;
 import generalannotator.cli.InferenceCommand;
 import generalannotator.cli.PrepareInferenceCommand;
@@ -9,6 +12,8 @@ import generalannotator.cli.PromptsCommand;
 import generalannotator.cli.SliceCommand;
 import generalannotator.cli.TargetsCommand;
 import generalannotator.cli.VisualizeCommand;
+import generalannotator.edits.javaparser.JavaParserAnnotationApplier;
+import generalannotator.evaluation.matching.AnchoredWarningMatcher;
 import generalannotator.exec.ProcessCommandRunner;
 import generalannotator.exec.TerminalCommandRunner;
 import java.io.PrintStream;
@@ -70,12 +75,25 @@ public final class Main {
               inference attach <submission dir> <job id> | --not-submitted
                       Resolve an sbatch call whose outcome is UNKNOWN by attaching a job verified
                       with the scheduler, or by verifying that no job was created.
+              apply-proposal <submission dir> --warning <ID>
+                      Import the collected LLM proposal of one warning and apply its annotation edits,
+                      all or nothing, to a fresh copy of the run snapshot in applications/<id>/
+                      (application.json, changes.diff, workspace/). The checker is not rerun.
+              evaluate-annotations <submission dir> [--warning <ID>]
+                      Evaluate every candidate edit of the collected answers (or those proposed for
+                      <ID>) alone against one baseline analysis of the run snapshot: apply it to a
+                      fresh copy, rerun the checker on all source roots, match findings, and write
+                      evaluations/<id>/ with attempts, summary.json and evaluation-graph.json.
+                      Checker settings as for check (GA_CHECKER, GA_CHECKER_HOME, GA_TARGET_CLASSPATH,
+                      ...); GA_TARGET_PROJECT and GA_TARGET_SOURCE_ROOTS are not used.
 
             Exit codes: 0 success (check: analysis completed), 2 usage/configuration error,
                         3 execution failure (check: incomplete analysis; visualize: Graphviz
                         missing or failed; slice: setup failed or a slice FAILED;
                         context: attribution impossible or a target FAILED;
-                        inference: incomplete, refused or unknown), 4 internal error,
+                        inference: incomplete, refused or unknown; apply-proposal: no applicable
+                        proposal or it was rejected; evaluate-annotations: nothing to evaluate,
+                        baseline failed or evaluation busy), 4 internal error,
                         5 inference: the shared SSH connection is not available (reconnect).""";
 
     private Main() {}
@@ -153,6 +171,30 @@ public final class Main {
             try {
                 return new PrepareInferenceCommand(args[1], args.length == 4 ? Optional.of(args[3]) : Optional.empty(),
                         env, Path.of("").toAbsolutePath(), Clock.systemUTC(), out, err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length == 4 && args[0].equals("apply-proposal") && args[2].equals("--warning")) {
+            try {
+                return new ApplyProposalCommand(args[1], args[3], Path.of("").toAbsolutePath(),
+                        new JavaParserAnnotationApplier(), Clock.systemUTC(), out, err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length >= 2 && args[0].equals("evaluate-annotations")
+                && (args.length == 2 || (args.length == 4 && args[2].equals("--warning")))) {
+            try {
+                return new EvaluateAnnotationsCommand(args[1], args.length == 4 ? Optional.of(args[3])
+                        : Optional.empty(), env, Path.of("").toAbsolutePath(), Path.of(System.getProperty("java.home")),
+                        (config, e) -> Checkers.create(config, e, new ProcessCommandRunner()),
+                        new JavaParserAnnotationApplier(), new AnchoredWarningMatcher(), Clock.systemUTC(), out,
+                        err).run();
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);

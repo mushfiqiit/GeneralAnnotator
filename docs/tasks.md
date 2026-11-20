@@ -172,13 +172,64 @@ Acceptance: tests show that edits in one state are visible neither in the
 original repository nor in other states, that a state can be recreated from
 its identifier, and that states can be cleaned up.
 
-## T6 — Annotation edit model and applier · `todo`
+## T6 — Annotation edit model and applier · `done`
 
-Model one annotation edit (target element and location, annotation, and
-import), and apply it to Java source text in a repository state.
+`apply-proposal <submission directory> --warning <ID>` imports one collected
+LLM proposal and applies its edits, all or nothing, to a fresh copy of the run
+snapshot under `applications/<UTC timestamp>-<ID>/` (`application.json`,
+`changes.diff`, `workspace/`).
+- **Model** (`edits`): an immutable `AnnotationEdit` (source root, file,
+  declaring class, field or executable with normalized parameter types,
+  position FIELD/RETURN/PARAMETER/TYPE_USE with a structured `TypeUsePath`,
+  ADD/REMOVE, qualified annotation), independent of checker and parser.
+  `Proposal` holds the deduplicated `ProposedEdit`s, each with all its origins.
+- **Import** (`proposals.ProposalImporter`): the result `collection.json`
+  selects, verified with the collection's checks through
+  `inference.remote.CollectedResults`. Only COMPLETED_PROPOSED is imported; the
+  other outcomes are reported. The source root comes from
+  `warning-targets.json` and `report.json`.
+- **Applier** (`edits.AnnotationApplier`, implemented by
+  `edits.javaparser.JavaParserAnnotationApplier`): structural location,
+  overload and constructor matching, TYPE_USE paths, NO_OP and conflict
+  handling, token-anchored text splices, and reparse verification.
+- **Application** (`proposals.ProposalApplication`): a fresh snapshot copy per
+  proposal (`isolation.SnapshotCopier`), a temporary directory renamed when
+  complete, never overwriting, and before/after hashes.
 
-Acceptance: fixture-based before/after source tests. Applying an edit to a
-location that does not exist fails explicitly.
+Not done here:
+- rerunning the checker and comparing warnings (T8);
+- a `Proposer` interface and manual proposal files (T7);
+- graph expansion;
+- detecting a snapshot edited after the check (no source hashes are recorded).
+
+Verified by:
+- `JavaParserAnnotationApplierTest` covers:
+  - fields, returns, parameters, constructors, nested classes and overloads;
+  - raw versus generic matching, and rejection of different type arguments,
+    qualified names and ambiguous method/constructor pairs;
+  - qualified, nested, array, array-component, type-argument and wildcard
+    positions; primitives;
+  - existing, imported and on-demand-imported annotations; removal; repeated
+    application;
+  - conflicting nullness annotations and declaration-annotation placement;
+  - missing classes, fields and methods, invalid indices, constructors, void,
+    varargs and C-style arrays;
+  - multi-variable fields, duplicate and conflicting edits, and a multi-file
+    proposal writing nothing;
+  - path traversal and symbolic links (file and directory);
+  - comment preservation, and the edited sources compiling in-process against
+    local stand-in annotations.
+- `ProposalImportAndApplicationTest` covers import with deduplication;
+  FAILED, INSUFFICIENT_EVIDENCE, NO_RESULT and unsafe answers; a stale
+  collection, a changed prompt and an unconfigured source root; application
+  records, unchanged snapshot and inference files, isolation between
+  proposals, no overwriting, rejection without a workspace, a fake applier and
+  command exit codes.
+- `MainTest`.
+
+A manual cross-check on a scratch copy of the EventBus run applied all 39
+proposals. Each edited workspace compiled with `javac` and JSpecify, and the
+real run directory was not modified.
 
 ## T7 — Manual proposal source · `todo`
 
@@ -187,20 +238,102 @@ human-written proposal file. Choose and document the file format.
 
 Acceptance: valid and invalid proposal-file fixtures are tested.
 
-## T8 — Single attempt: apply, recheck, compare · `todo`
+## T8 — Annotation evaluation and warning-graph expansion · `done`
 
-For one warning and one edit: create a state, apply the edit, rerun the checker,
-and report the before/after findings or an execution failure. Any warning
-matching done here must go through a pluggable `WarningMatcher` with a
-provisional rule that is recorded in project-spec §6.
+`evaluate-annotations <submission dir> [--warning ID]` evaluates every distinct
+candidate edit from the collected answers alone against one immutable baseline,
+and records the results as an expanded graph under
+`runs/<run>/evaluations/<submission id>-<key>/`. The key is a hash of the
+snapshot tree, the checker configuration fingerprint, the candidate set and the
+matcher.
 
-Acceptance: tests with fake checker results cover warning resolved, warning
-persists, new warning introduced, and execution failure after the edit.
+- **Candidates.** Validated COMPLETED_PROPOSED answers are imported through
+  `ProposalImporter`. Identical edits are merged by source root, file, class,
+  member, exact position, action and annotation, keeping every association
+  (warning, proposal group, answer index, uncertainty). Groups keep rationale,
+  uncertainty and run, submission, attempt, prompt and answer provenance.
+  Failed, missing, invalid and insufficient-evidence answers are listed as
+  excluded.
+- **Baseline.** An explicit file copy of the run snapshot (no git, so ignored
+  `runs/` directories cannot hide sources) is checked with the `check`
+  environment settings and the run's source roots. A failed baseline blocks the
+  evaluation and is kept in `baseline-failed/`.
+- **Attempts.** For each candidate: a fresh copy of `baseline/source`, exactly
+  one edit through the AST applier, and the checker with identical settings.
+  Outcomes are COMPLETED, AMBIGUOUS, NO_OP, REJECTED (including suppressing
+  edits), COMPILATION_FAILED, TIMED_OUT, CRASHED, EXECUTION_FAILED and
+  NOT_COMPARABLE (different checker build or annotated packages).
+- **Matching.** Through the `WarningMatcher` interface. The provisional rule
+  `anchored-1` uses normalized path, checker, severity, message, structural
+  enclosing declaration and annotation-free source line, with offsets inside
+  the declaration for repeated findings. Undecidable groups are ambiguous.
+- **Graph.** Baseline warning nodes (state `S0`), one annotation node per
+  candidate with its outcome and proposal associations, `W -> A` resolved-by
+  edges for every resolved baseline warning, and new nodes `A-N<k>` (state
+  `S0+A`, distance 1) with `A -> N` introduces edges. The graph is saved as
+  `evaluation-graph.json` (`warning-graph.json` schemaVersion 2), and
+  `visualize` distinguishes the node kinds.
+- **Persistence.** Atomic writes and an OS file lock. Completed attempts are
+  reused; incomplete ones are moved to `attempts/interrupted/` and rerun. The
+  graph and `summary.json` are rebuilt from the records. The original
+  `warning-graph.json`, run snapshot and inference artifacts are only read.
+
+Code:
+- `evaluation`: `Candidates`, `EvaluationConfig`, `Evaluator`, `EvaluationGraph`,
+  `EvaluationFiles`, `ToolIdentity`, `AttemptOutcome`, `FindingJson`.
+- `evaluation.matching`: `WarningMatcher`, `AnchoredWarningMatcher`,
+  `DeclarationAnchors`, `ObservedFinding`.
+- `graph`: `AnnotationNode`, `WarningNode.state`, `GraphEdge` kinds and
+  `WarningGraphJson` v2.
+- Also `DotExporter`, `VisualizeCommand`, `ConfigLoader.loadForSnapshot`,
+  `CollectedResults.warningIds` and `cli.EvaluateAnnotationsCommand`.
+
+Not done:
+- cumulative annotation sequences;
+- inferring fixes for introduced warnings;
+- an append-only state-transition log (T9);
+- a real-NullAway integration test for this command (the EventBus cross-check
+  below was manual).
+
+Verified by:
+- `EvaluateAnnotationsTest` (fake checker, real AST applier) covers:
+  - one and many resolutions with zero, one and many introduced warnings;
+  - no change, unchanged totals with changed findings, and ambiguity;
+  - a shifted column on the edited line, and repeated similar diagnostics;
+  - deduplication, multi-edit groups, and actual versus proposed associations;
+  - no-op, rejected and suppressing edits, execution failures, a failed and
+    retried baseline, and a different checker build;
+  - interruption and resume, reuse without duplicates, and a held lock;
+  - the warning filter keeping the full checker scope, and a parent git
+    repository with an ignored `runs/`;
+  - unchanged originals, a new evaluation for another classpath, mapping to
+    the run's warning IDs, and graph round trip and DOT output.
+- `AnchoredWarningMatcherTest` covers shifted lines and columns, offsets,
+  multiplicity, ambiguity, unresolved anchors and normalization.
+- `DeclarationAnchorsTest` covers fields, initializers, constructors,
+  generics and varargs, anonymous, nested and enum-constant classes, stability
+  under inserted annotations, and unparsable or outside files.
+- `WarningGraphJsonTest` covers v2 round trips, unchanged v1 output and strict
+  rejection.
+- `MainTest`.
+
+On a scratch copy of the EventBus run (NullAway 0.14.2-SNAPSHOT, JSpecify 1.0.0
+on the classpath):
+- the baseline reproduced all 42 run findings;
+- 30 candidates came from 39 answers (W0008 and W0011 excluded as FAILED);
+- all 30 attempts COMPLETED: 15 reduced the count, 12 kept it with one
+  resolved and one introduced warning, 2 increased it, and 1 changed nothing;
+- a fresh run took about 75 s and was reproducible (same evaluation ID,
+  byte-identical graph); a rerun reused everything. One earlier run had an
+  unexplained 6-minute idle pause in one attempt, outside the checker
+  commands, which did not recur;
+- the real run directory was not touched.
 
 ## T9 — Record attempts and state transitions · `todo`
 
 Persist warning/action/resolution records and state transitions in a
-documented, append-only format.
+documented, append-only format. (T8 writes per-attempt records and a graph
+rebuilt from them; an append-only transition log across states is still open.)
 
 Acceptance: round-trip tests, and an output schema documented in `docs/`.
 

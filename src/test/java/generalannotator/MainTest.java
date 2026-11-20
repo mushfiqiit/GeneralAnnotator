@@ -82,6 +82,25 @@ class MainTest {
     }
 
     @Test
+    void applyProposalCommandIsDispatchedAndValidatesItsArguments() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "apply-proposal", "no-such-dir", "--warning",
+                "W0001"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot apply the proposal"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "apply-proposal", "dir"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("apply-proposal <submission dir> --warning <ID>"));
+    }
+
+    @Test
+    void evaluateAnnotationsCommandIsDispatchedAndValidatesItsArguments() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "evaluate-annotations", "no-such-dir"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot evaluate annotations"));
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "evaluate-annotations", "dir", "--warning"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("evaluate-annotations <submission dir> [--warning <ID>]"));
+    }
+
+    @Test
     void checkWithoutConfigurationIsConfigurationError() {
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "check"));
         String text = err.toString(StandardCharsets.UTF_8);
