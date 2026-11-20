@@ -65,7 +65,7 @@ class SshClusterTest {
         return new RemoteSettings(TARGET, mode,
                 mode == RemoteSettings.ControlMode.EXPLICIT ? Optional.of("/home/u/.ssh/cm-wulver") : Optional.empty(),
                 mode == RemoteSettings.ControlMode.MANAGED ? Optional.of(Path.of("/home/u/.ga-ssh")) : Optional.empty(),
-                "4h", 30, Duration.ofSeconds(300), Duration.ofSeconds(3600), Duration.ofSeconds(600),
+                "4h", 15, 30, Duration.ofSeconds(300), Duration.ofSeconds(3600), Duration.ofSeconds(600),
                 "/project/mjk76/mc2399", "generalannotator/inference", Duration.ofSeconds(300), 3, 100001, "ssh",
                 "rsync");
     }
@@ -81,14 +81,16 @@ class SshClusterTest {
         assertEquals(Cluster.DirectoryProbe.Kind.ABSENT, c.probe(DIR).kind());
         List<String> ssh = runner.last();
         assertEquals(List.of("ssh", "-o", "ControlPath=/home/u/.ga-ssh/%C", "-o", "ControlMaster=no", "-o",
-                "BatchMode=yes", "-o", "ConnectTimeout=30", "-T", TARGET, "bash", "-l", "-c"), ssh.subList(0, 14));
-        assertEquals(15, ssh.size(), "the script is one quoted word");
-        assertTrue(ssh.get(14).startsWith("'") && ssh.get(14).contains("d='\\''" + DIR + "'\\''"),
-                ssh.get(14));
+                "BatchMode=yes", "-o", "ProxyCommand=false", "-o", "ConnectTimeout=30", "-T", TARGET, "bash", "-l",
+                "-c"), ssh.subList(0, 16));
+        assertEquals(17, ssh.size(), "the script is one quoted word");
+        assertTrue(ssh.get(16).startsWith("'") && ssh.get(16).contains("d='\\''" + DIR + "'\\''"),
+                ssh.get(16));
 
         c.upload(Path.of("/local/sub"), List.of("submission.json", "prompts/W0001.txt"), DIR);
         List<String> up = runner.last();
-        String shell = "ssh -o ControlPath=/home/u/.ga-ssh/%C -o ControlMaster=no -o BatchMode=yes -o ConnectTimeout=30 -T";
+        String shell = "ssh -o ControlPath=/home/u/.ga-ssh/%C -o ControlMaster=no -o BatchMode=yes "
+                + "-o ProxyCommand=false -o ConnectTimeout=30 -T";
         assertEquals(List.of("rsync", "-R", "-t", "--chmod=D755,F444", "-e", shell, "--", "submission.json",
                 "prompts/W0001.txt", TARGET + ":" + DIR + "/"), up);
         assertEquals(Path.of("/local/sub"), runner.specs.get(1).workingDirectory());
@@ -110,7 +112,10 @@ class SshClusterTest {
         SshConnection managed = new SshConnection(settings(RemoteSettings.ControlMode.MANAGED), new ScriptedRunner(),
                 Path.of("/work"));
         assertEquals(List.of("ssh", "-M", "-N", "-f", "-o", "ControlPath=/home/u/.ga-ssh/%C", "-o",
-                "ControlPersist=4h", "-o", "ConnectTimeout=30", TARGET), managed.masterCommand());
+                "ControlPersist=4h", "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=15", "-o",
+                "ServerAliveCountMax=3", TARGET), managed.masterCommand());
+        assertFalse(managed.masterCommand().contains("BatchMode=yes"));
+        assertFalse(managed.masterCommand().contains("ProxyCommand=false"), "the interactive login connects normally");
         assertEquals(List.of("ssh", "-o", "ControlPath=/home/u/.ga-ssh/%C", "-O", "check", TARGET),
                 managed.checkCommand());
 
@@ -130,11 +135,12 @@ class SshClusterTest {
     @Test
     void checkAsksTheMasterAndNeverAuthenticates() {
         ScriptedRunner runner = new ScriptedRunner().answer(0, "", "Master running (pid=4242)\r\n")
+                .answer(0, "GA-HEALTH ok\n", "")
                 .answer(255, "", "Control socket connect(/home/u/.ssh/cm-wulver): No such file or directory\r\n");
         SshCluster c = cluster(RemoteSettings.ControlMode.EXPLICIT, runner);
         Cluster.ConnectionCheck alive = c.check();
         assertTrue(alive.alive());
-        assertEquals("Master running (pid=4242)", alive.detail());
+        assertTrue(alive.detail().startsWith("Master running (pid=4242); remote round trip ok"), alive.detail());
         Cluster.ConnectionCheck gone = c.check();
         assertFalse(gone.alive());
         assertTrue(gone.detail().contains("No such file"));
@@ -169,7 +175,8 @@ class SshClusterTest {
     @Test
     void sbatchWithALostConnectionOrTimeoutIsUnknown() {
         ScriptedRunner runner = new ScriptedRunner().answer(255, "", "Connection to wulver closed by remote host.")
-                .timeout().answer(0, "GA-SBATCH RC 0\nGA-OUT 99\nGA-SBATCH END\n", "");
+                .timeout().answer(0, "", "Master running").answer(255, "", "Broken pipe") // health after the timeout
+                .answer(0, "GA-SBATCH RC 0\nGA-OUT 99\nGA-SBATCH END\n", "");
         SshCluster c = cluster(RemoteSettings.ControlMode.EXPLICIT, runner);
         assertInstanceOf(SbatchOutcome.Unknown.class, c.sbatch(DIR, "job-001", "0-40%4", "GeneralAnnotator:s:job-001"));
         assertInstanceOf(SbatchOutcome.Unknown.class, c.sbatch(DIR, "job-002", "0-40%4", "GeneralAnnotator:s:job-002"));
@@ -240,10 +247,67 @@ class SshClusterTest {
         assertEquals(Category.UNKNOWN, cut.state("5000", 0).category());
         assertFalse(cut.activeKnown() || cut.historyKnown());
 
-        ScriptedRunner runner = new ScriptedRunner().answer(255, "", "Control socket connect: Connection refused");
-        SchedulerSnapshot lost = cluster(RemoteSettings.ControlMode.EXPLICIT, runner).query(List.of("5000"));
-        assertEquals(Category.UNKNOWN, lost.state("5000", 0).category());
-        assertTrue(lost.problems().get(0).startsWith("DISCONNECTED"));
+    }
+
+    @Test
+    void transportLossDuringASchedulerQueryIsADisconnectNotUnknownTasks() throws Exception {
+        // The incident: the local master lives on, but its session request fails.
+        ScriptedRunner broken = new ScriptedRunner().answer(255, "",
+                "mux_client_request_session: read from master failed: Broken pipe\r\n");
+        RemoteException e = assertThrows(RemoteException.class,
+                () -> cluster(RemoteSettings.ControlMode.EXPLICIT, broken).query(List.of("5000")));
+        assertEquals(RemoteException.Kind.DISCONNECTED, e.kind());
+        assertTrue(e.getMessage().contains("Broken pipe"), e.getMessage());
+
+        // A hanging command over a dead master: the timeout is followed by a health check that fails.
+        ScriptedRunner hung = new ScriptedRunner().timeout()
+                .answer(0, "", "Master running (pid=10315)").timeout();
+        assertEquals(RemoteException.Kind.DISCONNECTED, assertThrows(RemoteException.class,
+                () -> cluster(RemoteSettings.ControlMode.EXPLICIT, hung).query(List.of("5000"))).kind());
+
+        // A slow scheduler over a healthy connection: unknown tasks, not a disconnect.
+        ScriptedRunner slow = new ScriptedRunner().timeout()
+                .answer(0, "", "Master running (pid=1)").answer(0, "GA-HEALTH ok\n", "");
+        SchedulerSnapshot snapshot = cluster(RemoteSettings.ControlMode.EXPLICIT, slow).query(List.of("5000"));
+        assertEquals(Category.UNKNOWN, snapshot.state("5000", 0).category());
+        assertTrue(snapshot.problems().get(0).startsWith("TIMED_OUT"), snapshot.problems().toString());
+    }
+
+    @Test
+    void healthNeedsARemoteRoundTripNotJustALiveLocalMaster() {
+        // -O check succeeds, the remote probe fails (the incident's broken pipe).
+        ScriptedRunner stale = new ScriptedRunner().answer(0, "", "Master running (pid=10315)\r\n")
+                .answer(255, "", "mux_client_request_session: read from master failed: Broken pipe");
+        SshConnection connection = new SshConnection(settings(RemoteSettings.ControlMode.EXPLICIT), stale,
+                Path.of("/work"));
+        Cluster.ConnectionCheck c = connection.health();
+        assertFalse(c.alive());
+        assertTrue(c.masterRunning());
+        assertTrue(c.detail().contains("Broken pipe"), c.detail());
+        List<String> probe = stale.last();
+        assertEquals(List.of("ssh", "-o", "ControlPath=/home/u/.ssh/cm-wulver", "-o", "ControlMaster=no", "-o",
+                "BatchMode=yes", "-o", "ProxyCommand=false", "-o", "ConnectTimeout=30", "-T", TARGET,
+                "printf '%s-%s %s\\n' GA HEALTH ok"), probe);
+        assertEquals(Duration.ofSeconds(45), stale.specs.get(1).timeout(), "bounded");
+
+        // Exit 0 without the marker (for example a login banner only) is not healthy either.
+        ScriptedRunner noMarker = new ScriptedRunner().answer(0, "", "Master running").answer(0, "Welcome\n", "");
+        assertFalse(new SshConnection(settings(RemoteSettings.ControlMode.EXPLICIT), noMarker, Path.of("/w"))
+                .health().alive());
+        // A command that merely echoes the command text does not contain the assembled marker.
+        assertFalse(String.join(" ", probe).contains(SshConnection.HEALTH_MARKER));
+
+        ScriptedRunner healthy = new ScriptedRunner().answer(0, "", "Master running (pid=1)")
+                .answer(0, "Welcome to Wulver\nGA-HEALTH ok\n", "");
+        Cluster.ConnectionCheck ok = new SshConnection(settings(RemoteSettings.ControlMode.EXPLICIT), healthy,
+                Path.of("/w")).health();
+        assertTrue(ok.alive());
+
+        // No master: the probe is not even attempted.
+        ScriptedRunner none = new ScriptedRunner().answer(255, "", "Control socket connect: No such file");
+        assertFalse(new SshConnection(settings(RemoteSettings.ControlMode.EXPLICIT), none, Path.of("/w")).health()
+                .masterRunning());
+        assertEquals(1, none.specs.size());
     }
 
     @Test
@@ -266,6 +330,7 @@ class SshClusterTest {
         ScriptedRunner runner = new ScriptedRunner()
                 .answer(12, "", "rsync: connection unexpectedly closed").answer(255, "", "no master")
                 .answer(12, "", "rsync: connection unexpectedly closed").answer(0, "", "Master running")
+                .answer(0, "GA-HEALTH ok\n", "")
                 .answer(23, "", "rsync: some files could not be transferred");
         SshCluster c = cluster(RemoteSettings.ControlMode.EXPLICIT, runner);
         RemoteException lost = assertThrows(RemoteException.class,
@@ -276,7 +341,8 @@ class SshClusterTest {
         assertEquals(RemoteException.Kind.FAILED, assertThrows(RemoteException.class,
                 () -> c.download(DIR, Path.of("/l/in"))).kind());
         assertEquals(RemoteException.Kind.TIMED_OUT, assertThrows(RemoteException.class,
-                () -> cluster(RemoteSettings.ControlMode.EXPLICIT, new ScriptedRunner().timeout())
+                () -> cluster(RemoteSettings.ControlMode.EXPLICIT, new ScriptedRunner().timeout()
+                        .answer(0, "", "Master running").answer(0, "GA-HEALTH ok\n", ""))
                         .upload(Path.of("/l"), List.of("submission.json"), DIR)).kind());
         assertEquals(RemoteException.Kind.FAILED, assertThrows(RemoteException.class,
                 () -> c.upload(Path.of("/l"), List.of("../secret"), DIR)).kind());

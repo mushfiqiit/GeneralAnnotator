@@ -59,9 +59,22 @@ class InferenceCommandTest {
         }
     }
 
+    /** Exit codes of successive remote health probes; default 0 with the marker. */
+    private final List<Integer> probes = new ArrayList<>();
+
     private final CommandRunner runner = spec -> {
         commands.add(spec.command());
-        int exit = spec.command().contains("-O") && !checks.isEmpty() ? checks.remove(0) : 0;
+        List<String> c = spec.command();
+        if (c.get(c.size() - 1).contains("HEALTH")) {
+            int exit = probes.isEmpty() ? 0 : probes.remove(0);
+            return new CommandResult(spec, OptionalInt.of(exit), exit == 0 ? "GA-HEALTH ok\n" : "",
+                    exit == 0 ? "" : "mux_client_request_session: read from master failed: Broken pipe",
+                    Duration.ZERO, false, Optional.empty());
+        }
+        if (c.contains("exit") && c.contains("-O")) {
+            return result(spec, 0, "Exit request sent.");
+        }
+        int exit = c.contains("-O") && !checks.isEmpty() ? checks.remove(0) : 0;
         return result(spec, exit, exit == 0 ? "Master running (pid=7)" : "Control socket connect: No such file");
     };
 
@@ -100,6 +113,54 @@ class InferenceCommandTest {
         assertEquals(List.of(), terminal);
         assertEquals(List.of("ssh", "-o", "ControlPath=/home/u/.ssh/cm", "-O", "check", "mc2399@wulver.njit.edu"),
                 commands.get(0));
+        assertTrue(commands.get(1).get(commands.get(1).size() - 1).contains("HEALTH"), "a remote round trip ran");
+        assertEquals(2, commands.size());
+    }
+
+    /** A private, existing managed socket directory (as left by an earlier connect). */
+    private Map<String, String> managedWithDirectory() throws IOException {
+        Map<String, String> env = managed();
+        Files.createDirectory(shortDir.resolve("s"), PosixFilePermissions.asFileAttribute(
+                PosixFilePermissions.fromString("rwx------")));
+        return env;
+    }
+
+    @Test
+    void connectRecoversAStaleManagedMasterWithOneNewLogin() throws IOException {
+        Map<String, String> env = managedWithDirectory();
+        checks.add(0);     // the old master answers -O check ...
+        probes.add(255);   // ... but a remote command through it fails (Broken pipe)
+        checks.add(255);   // after -O exit: gone
+        checks.add(0);     // after the new login
+        assertEquals(ExitCode.COMPLETED, run(env, true, "connect"), text());
+        assertTrue(text().contains("stale"), text());
+        assertTrue(commands.stream().anyMatch(c -> c.contains("-O") && c.contains("exit")), commands.toString());
+        assertEquals(1, terminal.size(), "one interactive login");
+        assertTrue(terminal.get(0).contains("-M"));
+        assertTrue(Files.isDirectory(shortDir.resolve("s")), "the private directory is kept");
+    }
+
+    @Test
+    void aStaleManagedMasterThatWillNotExitIsReportedNotKilled() throws IOException {
+        Map<String, String> env = managedWithDirectory();
+        checks.add(0);
+        probes.add(255);
+        checks.add(0); // still there after -O exit
+        assertEquals(ExitCode.RECONNECT_REQUIRED, run(env, true, "connect"));
+        assertTrue(text().contains("did not exit"), text());
+        assertEquals(List.of(), terminal);
+    }
+
+    @Test
+    void aStaleUserOwnedMasterIsLeftAloneWithInstructions() {
+        checks.add(0);
+        probes.add(255);
+        assertEquals(ExitCode.RECONNECT_REQUIRED, run(Map.of("GA_SSH_CONTROL_PATH", "/home/u/.ssh/cm"), true,
+                "connect"));
+        assertTrue(text().contains("does not stop it"), text());
+        assertTrue(text().contains("ssh -o ControlPath=/home/u/.ssh/cm -O exit mc2399@wulver.njit.edu"), text());
+        assertFalse(commands.stream().anyMatch(c -> c.contains("exit")), "never sent: " + commands);
+        assertEquals(List.of(), terminal);
     }
 
     @Test
@@ -111,7 +172,8 @@ class InferenceCommandTest {
         assertEquals("rwx------", PosixFilePermissions.toString(Files.getPosixFilePermissions(dir)));
         assertEquals(1, terminal.size(), "exactly one interactive login");
         assertEquals(List.of("ssh", "-M", "-N", "-f", "-o", "ControlPath=" + dir + "/%C", "-o", "ControlPersist=4h",
-                "-o", "ConnectTimeout=30", "mc2399@wulver.njit.edu"), terminal.get(0));
+                "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+                "mc2399@wulver.njit.edu"), terminal.get(0));
         assertTrue(text().contains("does not see or store what you type"), text());
         assertTrue(text().contains("-O exit"), text());
         for (List<String> c : commands) {
@@ -173,10 +235,19 @@ class InferenceCommandTest {
         assertEquals(ExitCode.RECONNECT_REQUIRED, run(env, false, "upload", temp.relativize(submission).toString()));
         assertEquals(ExitCode.RECONNECT_REQUIRED, run(env, false, "collect", submission.toString()));
         assertEquals(ExitCode.RECONNECT_REQUIRED, run(env, false, "run", submission.toString()));
+        // A stale master (alive locally, broken remotely): submit/retry/collect still never prompt.
+        // (status on a never-uploaded submission needs no connection; RemoteInferenceTest covers it.)
+        for (String op : List.of("submit", "retry", "collect")) {
+            checks.add(0);
+            probes.add(255);
+            assertEquals(ExitCode.RECONNECT_REQUIRED, run(env, true, op, submission.toString()), op);
+        }
+        assertTrue(text().contains("inference connect"), text());
         assertEquals(List.of(), terminal);
         assertTrue(Files.exists(submission.resolve("remote/lock")));
         assertFalse(Files.exists(submission.resolve("remote/state.json")), "nothing happened remotely");
-        assertTrue(commands.stream().allMatch(c -> c.contains("-O")), "only connection checks ran: " + commands);
+        assertTrue(commands.stream().allMatch(c -> c.contains("-O") || c.get(c.size() - 1).contains("HEALTH")),
+                "only connection checks ran: " + commands);
     }
 
     @Test

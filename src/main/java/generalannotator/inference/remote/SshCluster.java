@@ -44,7 +44,7 @@ public final class SshCluster implements Cluster {
 
     @Override
     public ConnectionCheck check() {
-        return connection.check();
+        return connection.health();
     }
 
     @Override
@@ -216,7 +216,7 @@ public final class SshCluster implements Cluster {
     }
 
     @Override
-    public SchedulerSnapshot query(List<String> jobIds) {
+    public SchedulerSnapshot query(List<String> jobIds) throws RemoteException {
         if (jobIds.isEmpty()) {
             return new SchedulerSnapshot(true, true, List.of(), List.of());
         }
@@ -236,6 +236,9 @@ public final class SshCluster implements Cluster {
                     echo "GA-END"
                     """.formatted(ids));
         } catch (RemoteException e) {
+            if (e.kind() == RemoteException.Kind.DISCONNECTED) {
+                throw e; // says nothing about the jobs
+            }
             return SchedulerSnapshot.unavailable(e.kind() + ": " + e.getMessage());
         }
         return parseQuery(out);
@@ -394,16 +397,16 @@ public final class SshCluster implements Cluster {
             throw new RemoteException(RemoteException.Kind.FAILED, "cannot run rsync: " + r.startFailure().get());
         }
         if (r.timedOut()) {
-            throw new RemoteException(RemoteException.Kind.TIMED_OUT, what + " timed out after "
+            throw lostOr(RemoteException.Kind.TIMED_OUT, what + " timed out after "
                     + settings().transferTimeout().toSeconds() + "s");
         }
         int code = r.exitCode().getAsInt();
         if (code == 0) {
             return;
         }
-        if (RSYNC_TRANSPORT.contains(code) && !connection.check().alive()) {
-            throw new RemoteException(RemoteException.Kind.DISCONNECTED, what + " failed (rsync exit " + code
-                    + ") and the SSH master is gone: " + clip(r.stderr()));
+        if (RSYNC_TRANSPORT.contains(code)) {
+            throw lostOr(RemoteException.Kind.FAILED, what + " failed (rsync exit " + code + "): "
+                    + clip(r.stderr()));
         }
         throw new RemoteException(RemoteException.Kind.FAILED, what + " failed (rsync exit " + code + "): "
                 + clip(r.stderr()));
@@ -419,8 +422,8 @@ public final class SshCluster implements Cluster {
             throw new RemoteException(RemoteException.Kind.FAILED, "cannot run ssh: " + r.startFailure().get());
         }
         if (r.timedOut()) {
-            throw new RemoteException(RemoteException.Kind.TIMED_OUT, "the remote command timed out after "
-                    + timeout.toSeconds() + "s");
+            throw lostOr(RemoteException.Kind.TIMED_OUT, "the remote command timed out after " + timeout.toSeconds()
+                    + "s");
         }
         int code = r.exitCode().getAsInt();
         if (code == 255) {
@@ -432,6 +435,20 @@ public final class SshCluster implements Cluster {
                     + clip(r.stderr() + r.stdout()));
         }
         return r.stdout();
+    }
+
+    /**
+     * A failure that may be caused by a dead connection: DISCONNECTED if the connection is no longer
+     * healthy (for example a master whose network path vanished, where commands hang), otherwise
+     * {@code kind}.
+     */
+    private RemoteException lostOr(RemoteException.Kind kind, String message) {
+        Cluster.ConnectionCheck health = connection.health();
+        if (!health.alive()) {
+            return new RemoteException(RemoteException.Kind.DISCONNECTED, message + "; the shared connection is not "
+                    + "usable: " + health.detail());
+        }
+        return new RemoteException(kind, message);
     }
 
     /** Lines that start with {@code prefix}, without it. */

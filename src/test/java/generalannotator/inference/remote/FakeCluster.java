@@ -34,6 +34,8 @@ final class FakeCluster implements Cluster {
     boolean corruptPromptAfterUpload;
     boolean disconnectAtDownload;
     boolean schedulerUnavailable;
+    boolean loseConnectionAtQuery;
+    int queryCalls;
     SbatchMode sbatchMode = SbatchMode.SUBMIT;
     String jobName = "ga-inference";
     int uploadCalls;
@@ -191,9 +193,12 @@ final class FakeCluster implements Cluster {
     }
 
     @Override
-    public SchedulerSnapshot query(List<String> jobIds) {
-        if (!connected) {
-            return SchedulerSnapshot.unavailable("DISCONNECTED: fake");
+    public SchedulerSnapshot query(List<String> jobIds) throws RemoteException {
+        queryCalls++;
+        if (!connected || loseConnectionAtQuery) {
+            connected = false;
+            throw new RemoteException(RemoteException.Kind.DISCONNECTED, "fake: mux_client_request_session: read from "
+                    + "master failed: Broken pipe");
         }
         if (schedulerUnavailable) {
             return new SchedulerSnapshot(false, false, List.of(), List.of("squeue failed", "sacct failed"));

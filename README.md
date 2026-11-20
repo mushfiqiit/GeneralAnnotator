@@ -20,9 +20,10 @@ compact usage context) without calling an LLM. `prepare-inference` turns the
 generated prompts into an immutable **Slurm submission** for NJIT Wulver, with a
 GPU worker that serves the model with vLLM and validates its answers. The
 `inference` commands upload it over one shared SSH connection (a single
-password-and-Duo login), submit one Slurm array job, monitor it and collect the
-results. They are tested with fakes only: no job has been submitted to Wulver
-yet, and the GPU smoke test is still to do. Inference results are proposals;
+password-and-Duo login) and submit one Slurm array job. You can then disconnect
+and later check status and collect the results. They have been used on Wulver;
+the reconnection safeguards added since are tested with fakes only, and the
+GPU settings are not yet tuned. Inference results are proposals;
 they are not applied or checker-validated. No other pipeline stage (slice validation, applying proposals, editing, graph
 expansion, search, batching) is implemented. See [docs/project-spec.md](docs/project-spec.md) and
 [docs/tasks.md](docs/tasks.md).
@@ -782,25 +783,83 @@ your terminal, and a process started by `./gradlew run` has none: there
 operations also work through `./gradlew run --args="inference status $SUB"` once
 the connection is open.
 
-**One login, one shared connection.** `inference connect` asks a running OpenSSH
-master whether it is alive (`ssh -O check`). If it isn't, it runs this in your
-terminal, where ssh asks for the password and Duo itself; GeneralAnnotator
-never sees or stores them:
+### Submit, disconnect, come back later
+
+The job does not need your computer. The worker and vLLM run entirely inside
+the Slurm allocation. Once `submit` has saved the job ID, no SSH session, local
+process or awake laptop is needed. The recommended workflow is:
+
+```sh
+$GA inference connect              # one login (password + Duo)
+$GA inference upload  $SUB         # copy inputs, verify SHA-256 on the cluster
+$GA inference submit  $SUB         # one sbatch; returns as soon as the job ID is saved
+# Now disconnect the VPN, close the terminal, sleep or shut down the laptop.
+# ... later, VPN back on ...
+$GA inference connect              # reuses a healthy connection, or replaces a stale one (one login)
+$GA inference status  $SUB         # fresh squeue/sacct state of every array task
+$GA inference collect $SUB         # download and verify results into $SUB/remote/collected/
+```
+
+`submit` never monitors. It prints the job ID, where it is saved
+(`$SUB/remote/state.json`), and the commands for later. Every later command
+uses that saved state. Coming back never submits another job, and it works
+from a new terminal or after a reboot. `run` is optional: it keeps a terminal
+open and polls while you stay connected. If its monitoring stops (Ctrl-C, VPN
+off, sleep), the job keeps running; use `status` and `collect`, or `run`
+again.
+
+What a disconnection affects:
+- **Nothing on the cluster.** Running and pending tasks continue. Results
+  accumulate in the remote submission directory until you collect them.
+- **The SSH connection.** After a VPN change or sleep, the master is usually
+  dead. It may also linger as a local process whose network connection is
+  gone; `ssh -O check` still answers, but every session fails ("read from
+  master failed: Broken pipe"). `connect` detects both cases (below).
+- **A command that was running.** `status`, `collect`, `submit`, `retry` and
+  `run` stop with exit 5 and change nothing. If the connection drops during
+  `sbatch` itself, that call is UNKNOWN and needs `attach` (see Submission).
+
+**One login, one shared connection.** A connection counts as healthy only if
+both hold:
+- the OpenSSH master answers `ssh -O check`;
+- a bounded remote round trip through it, `printf '%s-%s %s\n' GA HEALTH ok`
+  with at most `GA_SSH_CONNECT_TIMEOUT_SECONDS` + 15 s, prints the line
+  `GA-HEALTH ok`.
+
+`inference connect` reuses a healthy connection without a login. A managed
+master that answers but fails the round trip is stale: `connect` asks it to
+exit (`ssh -O exit`). If it does not exit, `connect` reports its pid and stops
+instead of killing anything. With no usable master, `connect` runs this in
+your terminal, where ssh asks for the password and Duo itself;
+GeneralAnnotator never sees or stores them:
 
 ```
-ssh -M -N -f -o ControlPath=~/.ga-ssh/%C -o ControlPersist=4h -o ConnectTimeout=30 mc2399@wulver.njit.edu
+ssh -M -N -f -o ControlPath=~/.ga-ssh/%C -o ControlPersist=4h -o ConnectTimeout=30 \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=3 mc2399@wulver.njit.edu
 ```
+
+`ServerAliveInterval` (`GA_SSH_SERVER_ALIVE_SECONDS`, 0 to omit) makes a
+master whose network path vanished exit by itself after about 45 s.
 
 The socket directory (`GA_SSH_CONTROL_DIR`, default `~/.ga-ssh`) is created
 with mode 0700. An existing one must be private and yours, or it is refused.
-Every later ssh and rsync call uses the same socket with `ControlMaster=no
--o BatchMode=yes`: it can only reuse the master, and it fails instead of
-prompting. Host keys are checked as your SSH configuration says, which is never
-edited. If the master is gone, a command stops with exit 5 and asks you to
-reconnect; all progress is kept. To reuse a connection you own instead, set
-`GA_SSH_CONTROL_PATH=config` (the `ControlPath` of your SSH config, for
-example for a host alias in `GA_SSH_TARGET`) or a socket path. In those modes
-GeneralAnnotator never creates or closes the master. `connect` prints how to
+Every later ssh and rsync call uses the same socket with `-o
+ControlMaster=no -o BatchMode=yes -o ProxyCommand=false`. `BatchMode` alone is
+not enough: when the socket is missing or refuses a session, OpenSSH silently
+opens a fresh connection, which could still log in with keys or an agent. A
+multiplexed session never uses ProxyCommand, so `ProxyCommand=false` only makes
+that fallback fail at once. So `status`, `collect`, `submit`, `retry` and
+`upload` can neither prompt nor log in afresh. Each checks the connection's
+health first; without a healthy connection it stops with exit 5 and tells you
+to run `inference connect`, and all progress is kept. A connection lost in the
+middle of a command is also exit 5. That includes a command that hangs until
+its timeout and then fails the health check. Host keys are checked as your SSH
+configuration says, which is never edited. To reuse a connection you own
+instead, set `GA_SSH_CONTROL_PATH=config` (the `ControlPath` of your SSH
+config, for example for a host alias in `GA_SSH_TARGET`) or a socket path. In
+those modes GeneralAnnotator never creates, stops or closes the master. If
+yours is stale, `connect` prints the `ssh -O exit` and login commands for you
+to run. `connect` prints how to
 close a managed master early (`ssh -O exit ...`); otherwise it ends after
 `GA_SSH_CONTROL_PERSIST` idle.
 
@@ -845,16 +904,26 @@ the remote marker shows sbatch was never reached, or that it failed with no job
 in that directory. A rejected sbatch call (bad account, limits) is recorded as
 REJECTED, and nothing was submitted.
 
-**Status.** `status` lists the sbatch calls and the state of every array task
-of the latest job that includes it. squeue covers active tasks and sacct the
-history; squeue's "invalid job id" just means the job left the queue. A task
-that neither reports is `UNKNOWN`, never finished. Scheduler states describe
-tasks, not prompts (a COMPLETED task can have failed prompts); `status` shows
-the last collection's prompt counts separately. It also writes
-`remote/status.json`. It takes no lock, so it works while `run` is monitoring.
+**Status.** `status` lists the sbatch calls (local record) and a fresh
+scheduler query for every array task of the latest job that includes it.
+squeue covers active tasks and sacct the history; squeue's "invalid job id"
+just means the job left the queue. A task that neither reports is `UNKNOWN`,
+never finished. A lost connection is not scheduler uncertainty. `status` then
+exits 5 instead of listing every task as UNKNOWN, and it shows the last
+successful snapshot, labeled `CACHED snapshot from <time> (may be outdated)`.
+`remote/status.json` keeps that snapshot (`queriedAt`) and records the failure
+in `refreshFailure` (`at`, `reason`); the next successful query clears it.
+Scheduler states describe tasks, not prompts: a COMPLETED task can have failed
+prompts. `status` never downloads results; it shows the last collection's
+prompt counts labeled `CACHED from the last collection at <time>`. Run
+`collect` for current ones. `status` takes no lock, so it works while `run` is
+monitoring.
 
-**Collection.** `collect` first checks that the remote `submission.json` still
-has the local SHA-256. It then rsyncs `results/`, `logs/` and `.ga-sbatch/`
+**Collection.** `collect` does not use the scheduler, so it works while jobs
+run, after any disconnection, and when squeue/sacct have no record of the job.
+A prompt without a result is `NO_RESULT` (not yet written, or the task ended
+first), never inferred as finished or failed from missing scheduler records.
+It first checks that the remote `submission.json` still has the local SHA-256. It then rsyncs `results/`, `logs/` and `.ga-sbatch/`
 into `remote/incoming/`, skipping files still being written atomically, and
 merges them into `remote/collected/`:
 - attempt files and sbatch records are write-once, so a differing remote copy
@@ -888,13 +957,15 @@ automatically.
 **End to end.** `inference run`:
 1. connects (one login if needed);
 2. uploads unless already verified;
-3. submits unless a job exists (it refuses if one is UNKNOWN);
+3. refuses if any sbatch call (initial or retry) is UNKNOWN; otherwise submits
+   unless a job exists;
 4. polls status and collects every `GA_REMOTE_POLL_SECONDS` (default 300,
    minimum 60), until every task has finished.
 
 It exits 0 only when every prompt has a completed result. Ctrl-C, a lost
-connection or `GA_REMOTE_MAX_UNKNOWN_POLLS` polls in a row with unknown
-scheduler state stop only the local monitoring. Jobs are never cancelled, and
+connection (exit 5; the last snapshot is kept as cached) or
+`GA_REMOTE_MAX_UNKNOWN_POLLS` polls in a row with unknown scheduler state stop
+only the local monitoring. Jobs are never cancelled, and
 rerunning `run` resumes without resubmitting.
 
 | Variable | Default | Meaning |
@@ -903,7 +974,8 @@ rerunning `run` resumes without resubmitting.
 | `GA_SSH_CONTROL_PATH` | unset | unset: managed socket in `GA_SSH_CONTROL_DIR`; `config`: your SSH config's ControlPath; or an existing socket path (reused only) |
 | `GA_SSH_CONTROL_DIR` | `~/.ga-ssh` | private socket directory (short: socket paths are limited to about 100 characters) |
 | `GA_SSH_CONTROL_PERSIST` | `4h` | idle lifetime of a managed master |
-| `GA_SSH_CONNECT_TIMEOUT_SECONDS` | 30 | SSH ConnectTimeout |
+| `GA_SSH_SERVER_ALIVE_SECONDS` | 15 | ServerAliveInterval of a managed master (3 missed replies end it); 0 omits it |
+| `GA_SSH_CONNECT_TIMEOUT_SECONDS` | 30 | SSH ConnectTimeout; the health round trip may take this + 15 s |
 | `GA_SSH_COMMAND_TIMEOUT_SECONDS` / `_TRANSFER_` / `_AUTH_` | 300 / 3600 / 600 | one remote command, one rsync, the interactive login |
 | `GA_SSH_EXECUTABLE`, `GA_RSYNC_EXECUTABLE` | `ssh`, `rsync` | executables |
 | `GA_REMOTE_BASE` | `/project/mjk76/mc2399` | remote base directory |
@@ -927,16 +999,24 @@ after an upload is refused for that submission.
 | 5 | The shared SSH connection is not available: reconnect (`inference connect`) and rerun; progress is kept |
 
 **Tested, and what isn't verified yet.** Unit tests cover the command lines,
-output parsing and the whole flow against fakes. A manual cross-check ran
-`inference run`, `retry` and `status` with real rsync, bash and `sha256sum`
-through a fake `ssh` and fake `sbatch`/`squeue`/`sacct` that ran the real worker
-with a fake vLLM. Nothing has contacted Wulver yet. Still to confirm there:
-- the Duo login with `ssh -M` and that `ControlPersist` keeps the master;
-- that `bash -l` finds `sbatch`, `squeue`, `sacct`, `sha256sum` and rsync on
-  the login node;
-- that sacct reports `WorkDir` (needed by `attach`) and `--comment`;
-- the effective account and QoS limits (MaxSubmitJobs and similar) for a
-  41-task array.
+output parsing and the whole flow against fakes. That includes a live local
+master with a broken remote side, stale-master recovery, transport loss during
+squeue/sacct, collection without scheduler history, and cached versus fresh
+status. A manual cross-check ran `inference run`, `retry` and `status` with real
+rsync, bash and `sha256sum`, through a fake `ssh` and fake
+`sbatch`/`squeue`/`sacct` that ran the real worker with a fake vLLM.
+
+On Wulver, the previous version uploaded, submitted (array jobs 1628816 and
+1629432), monitored and collected results. That showed the Duo login,
+`bash -l` finding the Slurm tools, `sha256sum` and rsync work there. The
+incident behind the health check also came from there: after a VPN change, a
+lingering master answered `-O check` while sessions failed with "Broken pipe".
+Not yet verified on Wulver:
+- the new health check, stale-master recovery, `ProxyCommand=false` and
+  `ServerAliveInterval`;
+- a real VPN-off, sleep and reconnect cycle with this version;
+- that sacct reports `WorkDir` (needed by `attach`);
+- the effective account and QoS limits for large arrays.
 
 The GPU smoke test (T13d) is still needed before relying on results.
 

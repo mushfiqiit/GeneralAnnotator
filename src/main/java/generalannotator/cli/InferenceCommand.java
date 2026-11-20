@@ -147,26 +147,49 @@ public final class InferenceCommand {
     }
 
     /**
-     * Reuses a running master, or (managed mode, in a terminal) opens one with a single interactive
-     * login. Passwords and Duo codes go from the terminal straight to ssh.
+     * Reuses a healthy master (it answers and a remote round trip through it works), or, in managed
+     * mode, retires a stale managed master and opens a new one with a single interactive login in a
+     * terminal. Passwords and Duo codes go from the terminal straight to ssh. User-owned masters are
+     * never stopped or created; the user gets instructions instead.
      */
     ExitCode connect(SshConnection connection) {
         RemoteSettings s = connection.settings();
-        Cluster.ConnectionCheck check = connection.check();
+        Cluster.ConnectionCheck check = connection.health();
         if (check.alive()) {
             out.println("Reusing the SSH master for " + s.sshTarget() + " (" + check.detail() + "). Remote commands "
-                    + "share it with BatchMode=yes; no new login is needed.");
+                    + "share it and cannot prompt or log in afresh; no new login is needed.");
             return ExitCode.COMPLETED;
+        }
+        if (check.masterRunning() && s.controlMode() != RemoteSettings.ControlMode.MANAGED) {
+            err.println("GeneralAnnotator: your SSH master for " + s.sshTarget() + " is running but unusable ("
+                    + check.detail() + ").");
+            err.println("It is your connection (GA_SSH_CONTROL_PATH), so GeneralAnnotator does not stop it. Close it "
+                    + "and log in again, for example:");
+            err.println("  " + SshConnection.display(connection.exitCommand()));
+            err.println("  " + SshConnection.display(userMaster(s)));
+            return ExitCode.RECONNECT_REQUIRED;
+        }
+        if (check.masterRunning()) {
+            // Our own managed master: its local process answers, but its connection is dead (for
+            // example after a VPN change or sleep). Ask it to exit so a new login can take its place.
+            out.println("The managed SSH master is stale (" + check.detail() + "); stopping it:");
+            out.println("  " + SshConnection.display(connection.exitCommand()));
+            runner.run(new CommandSpec(connection.exitCommand(), workingDirectory, Map.of(),
+                    java.time.Duration.ofSeconds(s.connectTimeoutSeconds() + 10L)));
+            Cluster.ConnectionCheck after = connection.checkMaster();
+            if (after.masterRunning()) {
+                err.println("GeneralAnnotator: the stale master did not exit (" + after.detail() + "). Stop that ssh "
+                        + "process yourself (the pid is shown above), then run `inference connect` again.");
+                return ExitCode.RECONNECT_REQUIRED;
+            }
+            out.println("Stopped. Jobs on the cluster are not affected.");
         }
         if (s.controlMode() != RemoteSettings.ControlMode.MANAGED) {
             err.println("GeneralAnnotator: no running SSH master for " + s.sshTarget() + " (" + check.detail() + ").");
             err.println("GA_SSH_CONTROL_PATH=" + (s.controlMode() == RemoteSettings.ControlMode.CONFIG ? "config"
                     : s.controlPath().orElse("")) + " means GeneralAnnotator only reuses a connection you own. Open it"
                     + " yourself, for example:");
-            List<String> example = new ArrayList<>(List.of(s.sshExecutable(), "-M", "-N", "-f"));
-            s.controlPath().ifPresent(p -> example.addAll(List.of("-o", "ControlPath=" + p)));
-            example.add(s.sshTarget());
-            err.println("  " + SshConnection.display(example));
+            err.println("  " + SshConnection.display(userMaster(s)));
             return ExitCode.RECONNECT_REQUIRED;
         }
         Optional<String> problem;
@@ -195,7 +218,7 @@ public final class InferenceCommand {
         out.flush();
         CommandResult r = terminalRunner.run(new CommandSpec(connection.masterCommand(), workingDirectory, Map.of(),
                 s.authenticationTimeout()));
-        Cluster.ConnectionCheck after = connection.check();
+        Cluster.ConnectionCheck after = connection.health();
         if (!r.succeeded() || !after.alive()) {
             err.println("GeneralAnnotator: the SSH login did not open a master (" + r.describeStatus() + "; "
                     + after.detail() + "). Nothing else was done; run `inference connect` again when ready.");
@@ -208,6 +231,14 @@ public final class InferenceCommand {
         exit.addAll(List.of("-O", "exit", s.sshTarget()));
         out.println("  " + SshConnection.display(exit));
         return ExitCode.COMPLETED;
+    }
+
+    /** The command a user runs to open their own master. */
+    private static List<String> userMaster(RemoteSettings s) {
+        List<String> example = new ArrayList<>(List.of(s.sshExecutable(), "-M", "-N", "-f"));
+        s.controlPath().ifPresent(p -> example.addAll(List.of("-o", "ControlPath=" + p)));
+        example.add(s.sshTarget());
+        return example;
     }
 
     private ExitCode usage(String problem) {

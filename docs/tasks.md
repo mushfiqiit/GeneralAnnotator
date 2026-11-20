@@ -444,12 +444,66 @@ went from 41 failed (a fixture error) to 40 after a retry, then to all 41
 completed after a second retry. That retry re-requested only W0005 of its
 10-prompt task. Nothing contacted Wulver.
 
+## T13e — Disconnected operation and stale-connection recovery · `done`
+
+Observed incident (submission `20261119T165512Z-inference`, job 1629432):
+1. Monitoring stopped when the VPN was turned off.
+2. After reconnecting, `inference connect` reported "Reusing the SSH master"
+   because `ssh -O check` answered.
+3. `inference status` then failed with `mux_client_request_session: read from
+   master failed: Broken pipe` and listed all 41 tasks as UNKNOWN, next to an
+   older prompt total. The worker failures W0008 (`STARTUP_TIMEOUT`) and W0011
+   (`INVALID_ANSWER`) are unrelated to this.
+
+Changes:
+- **The documented workflow** is `connect`, `upload`, `submit`, disconnect
+  freely, then `connect`, `status`, `collect`. `submit` returns as soon as
+  the job ID is saved and prints these steps. `run` stays optional.
+- **Health** means `ssh -O check` plus a bounded remote round trip that must
+  print `GA-HEALTH ok` (`SshConnection.health`, used by `Cluster.check`).
+- **No fresh login:** non-interactive ssh/rsync use `ProxyCommand=false` as
+  well as `ControlMaster=no` and `BatchMode=yes`. A missing or refusing socket
+  can then not fall back to a fresh, possibly key-based login.
+- **Managed masters** get `ServerAliveInterval` (`GA_SSH_SERVER_ALIVE_SECONDS`,
+  default 15).
+- **`connect` and stale masters:** a stale managed master gets `ssh -O exit`,
+  then one interactive login. A master that will not exit is reported, not
+  killed. User-owned sockets are never stopped; `connect` prints commands
+  instead.
+- **Disconnects versus uncertainty:** `Cluster.query` throws DISCONNECTED for
+  a lost transport, and timeouts are followed by a health check, so a dead
+  connection is exit 5 and not a list of UNKNOWN tasks. `status.json` keeps
+  the last successful snapshot and records `refreshFailure`.
+- **Labels:** `status` marks cached scheduler data and cached prompt results
+  as such.
+- **UNKNOWN calls first:** `submit` and `run` check for an UNKNOWN sbatch call
+  (initial or retry) before their "already submitted" shortcut.
+
+Verified by:
+- `SshClusterTest`: the health probe argv, timeout and marker; a live master
+  whose probe fails; transport loss and a hung command during squeue/sacct
+  (DISCONNECTED) versus a slow scheduler (UNKNOWN); the no-fallback options.
+- `InferenceCommandTest`: healthy reuse with no login; stale managed recovery
+  with exactly one login; a stale master that does not exit; stale user-owned
+  sockets left untouched; submit, retry and collect never prompting on a stale
+  connection.
+- `RemoteInferenceTest`: submit without polling or sleeping; the disconnected
+  submit, status and collect cycle keeping the same job ID and results;
+  transport loss during status (exit 5, cached labels, `refreshFailure`) and
+  while monitoring; an UNKNOWN retry blocking submit and run; collection
+  without scheduler history.
+
+The real VPN-off, sleep and reconnect cycle has not been run with this
+version.
+
 ## T13d — Wulver end-to-end and GPU smoke test · `next`
 
 On Wulver, with one or two prompts (`prepare-inference --warning`), confirm:
-- the Duo login through `inference connect` (`ssh -M -N -f`), that
-  `ControlPersist` keeps the master, and that `bash -l` on the login node finds
-  `sbatch`, `squeue`, `sacct`, `sha256sum` and rsync;
+- (observed with the previous version: the Duo login, `bash -l` finding the
+  Slurm tools, `sha256sum` and rsync, upload, sbatch, monitoring and
+  collection.) Still to check: `submit`, then VPN off and sleep, then
+  `connect`, `status` and `collect` with this version, including stale-master
+  recovery and `ServerAliveInterval`;
 - that sacct reports `WorkDir` for `attach`, and the effective account and QoS
   limits (MaxSubmitJobs and similar) for a 41-task array;
 - the model loads from the cache offline with vLLM 0.30.0 on the requested GPU

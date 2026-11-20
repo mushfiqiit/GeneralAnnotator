@@ -18,11 +18,22 @@ import java.util.Set;
 
 /**
  * Command lines for one shared OpenSSH connection (ControlMaster). Every non-interactive ssh and
- * rsync invocation uses the same control socket with {@code ControlMaster=no} and {@code
- * BatchMode=yes}: it can only reuse the master and never prompts, so a lost connection fails fast
- * instead of asking for a password or Duo code again. Host-key checking is left to the user's SSH
- * configuration (it is never disabled). Only {@link #masterCommand()} is interactive; it runs in the
- * user's terminal and GeneralAnnotator never sees what is typed.
+ * rsync invocation uses the same control socket and can only reuse the master:
+ * <ul>
+ *   <li>{@code ControlMaster=no}: never becomes a master itself;
+ *   <li>{@code BatchMode=yes}: never prompts;
+ *   <li>{@code ProxyCommand=false}: if the socket is missing or refuses the session, OpenSSH silently
+ *       falls back to a fresh connection, which could still authenticate with keys or an agent.
+ *       A session multiplexed over a master never uses ProxyCommand, so this option only makes that
+ *       fallback fail at once (exit 255).
+ * </ul>
+ * A lost connection therefore fails fast instead of logging in again. Host-key checking is left to
+ * the user's SSH configuration (it is never disabled). Only {@link #masterCommand()} is
+ * interactive; it runs in the user's terminal and GeneralAnnotator never sees what is typed.
+ *
+ * <p>A master that answers {@code ssh -O check} is not necessarily usable: after a VPN change or
+ * sleep its TCP connection can be dead while the local process lives on. {@link #health()}
+ * therefore also needs a remote round trip through the master.
  */
 public final class SshConnection {
 
@@ -49,13 +60,34 @@ public final class SshConnection {
         return options;
     }
 
-    /** Options of every non-interactive ssh: reuse the master only, never prompt. */
+    /** Options of every non-interactive ssh: reuse the master only, never prompt, never log in afresh. */
     List<String> batchOptions() {
         List<String> options = controlOptions();
-        options.addAll(List.of("-o", "ControlMaster=no", "-o", "BatchMode=yes",
+        options.addAll(List.of("-o", "ControlMaster=no", "-o", "BatchMode=yes", "-o", "ProxyCommand=false",
                 "-o", "ConnectTimeout=" + settings.connectTimeoutSeconds()));
         return options;
     }
+
+    /** {@code ssh -O exit}: asks the master to exit (used only for a stale managed master). */
+    public List<String> exitCommand() {
+        List<String> command = new ArrayList<>(List.of(settings.sshExecutable()));
+        command.addAll(controlOptions());
+        command.addAll(List.of("-O", "exit", settings.sshTarget()));
+        return command;
+    }
+
+    /** The remote round trip of {@link #health()}: prints {@link #HEALTH_MARKER} on the cluster. */
+    List<String> probeCommand() {
+        List<String> command = new ArrayList<>(List.of(settings.sshExecutable()));
+        command.addAll(batchOptions());
+        command.add("-T");
+        command.add(settings.sshTarget());
+        // The marker is assembled by printf on the cluster, so it cannot come from the command text.
+        command.add("printf '%s-%s %s\\n' GA HEALTH ok");
+        return command;
+    }
+
+    static final String HEALTH_MARKER = "GA-HEALTH ok";
 
     /** {@code ssh -O check}: asks the master whether it is running; never authenticates. */
     public List<String> checkCommand() {
@@ -76,7 +108,13 @@ public final class SshConnection {
         List<String> command = new ArrayList<>(List.of(settings.sshExecutable(), "-M", "-N", "-f"));
         command.addAll(controlOptions());
         command.addAll(List.of("-o", "ControlPersist=" + settings.controlPersist(),
-                "-o", "ConnectTimeout=" + settings.connectTimeoutSeconds(), settings.sshTarget()));
+                "-o", "ConnectTimeout=" + settings.connectTimeoutSeconds()));
+        if (settings.serverAliveSeconds() > 0) {
+            // A master whose network path is gone (VPN off, sleep) then exits by itself.
+            command.addAll(List.of("-o", "ServerAliveInterval=" + settings.serverAliveSeconds(),
+                    "-o", "ServerAliveCountMax=3"));
+        }
+        command.add(settings.sshTarget());
         return command;
     }
 
@@ -112,8 +150,31 @@ public final class SshConnection {
         return runner.run(new CommandSpec(command, directory, Map.of(), timeout));
     }
 
-    /** Whether the master is running, asked through the control socket without authenticating. */
-    public Cluster.ConnectionCheck check() {
+    /**
+     * Whether the connection is usable: the master answers {@code ssh -O check} and a bounded remote
+     * round trip through it prints the health marker. Never authenticates.
+     */
+    public Cluster.ConnectionCheck health() {
+        Cluster.ConnectionCheck master = checkMaster();
+        if (!master.alive()) {
+            return master;
+        }
+        Duration timeout = Duration.ofSeconds(settings.connectTimeoutSeconds() + 15L);
+        CommandResult r = run(probeCommand(), timeout);
+        boolean marker = r.stdout().lines().anyMatch(l -> l.strip().equals(HEALTH_MARKER));
+        if (r.succeeded() && marker) {
+            return new Cluster.ConnectionCheck(true, true, master.detail() + "; remote round trip ok");
+        }
+        String why = r.timedOut() ? "no answer within " + timeout.toSeconds() + "s"
+                : r.startFailure().isPresent() ? r.describeStatus()
+                : (r.stderr().strip().isEmpty() ? r.describeStatus() + (r.succeeded() ? " without the marker" : "")
+                        : r.stderr().strip().replaceAll("\\s+", " "));
+        return new Cluster.ConnectionCheck(false, true, master.detail()
+                + ", but a remote command through it failed (" + why + ")");
+    }
+
+    /** Whether the master process answers through the control socket (local only; never authenticates). */
+    public Cluster.ConnectionCheck checkMaster() {
         Optional<String> problem = controlDirectoryProblem();
         if (problem.isPresent()) {
             return new Cluster.ConnectionCheck(false, problem.get());

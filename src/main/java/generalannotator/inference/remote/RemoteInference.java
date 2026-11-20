@@ -147,7 +147,12 @@ public final class RemoteInference {
         });
     }
 
-    /** Scheduler state of every array task, without taking the lock (it only reads state). */
+    /**
+     * Scheduler state of every array task, freshly queried, without taking the lock (it changes no
+     * remote state). Without a usable connection it reports RECONNECT and shows the last successful
+     * snapshot, labeled as cached with its time and the failure. Prompt results are never downloaded
+     * here; the last collection is shown, labeled as cached.
+     */
     public Outcome status() {
         return guarded(() -> {
             open(false);
@@ -155,12 +160,23 @@ public final class RemoteInference {
                 out.println("Not uploaded yet: nothing to query.");
                 return Outcome.DONE;
             }
-            requireConnection();
+            out.println("sbatch calls (local record):");
             boolean unknown = printJobs();
-            Tasks tasks = taskStates();
+            Tasks tasks;
+            try {
+                requireConnection();
+                tasks = taskStates();
+            } catch (Stop s) {
+                if (s.outcome == Outcome.RECONNECT) {
+                    refreshFailed(s.getMessage());
+                    printCachedStatus();
+                    printCachedPrompts();
+                }
+                throw s;
+            }
+            out.println("Fresh scheduler query at " + now() + ":");
             printTasks(tasks, true);
-            loadCollection().ifPresent(c -> out.println("Prompts (last collection " + c.get("collectedAt") + "): "
-                    + summaryLine(c.get("summary"))));
+            printCachedPrompts();
             return unknown || tasks.unknown() > 0 ? Outcome.INCOMPLETE : Outcome.DONE;
         });
     }
@@ -173,6 +189,7 @@ public final class RemoteInference {
     public Outcome run() {
         return locked(() -> {
             requireConnection();
+            refuseUnresolved(); // before any shortcut: an UNKNOWN retry blocks too
             if (state.upload != RemoteState.UploadStatus.VERIFIED) {
                 Outcome o = doUpload();
                 if (o != Outcome.DONE) {
@@ -383,12 +400,12 @@ public final class RemoteInference {
     // ------------------------------------------------------------------ submit
 
     private Outcome doSubmit() throws Stop, IOException {
+        refuseUnresolved(); // before the "already submitted" shortcut: an UNKNOWN retry blocks too
         if (!state.submitted().isEmpty()) {
             out.println("Already submitted (" + jobList() + "); not submitting again. Use `inference status`, "
                     + "`inference collect` or `inference retry`.");
             return Outcome.DONE;
         }
-        refuseUnresolved();
         if (state.upload != RemoteState.UploadStatus.VERIFIED) {
             throw new Stop(Outcome.INCOMPLETE, "Not uploaded and verified yet; run `inference upload` first.");
         }
@@ -464,6 +481,10 @@ public final class RemoteInference {
                 out.println("Submitted array job " + s.jobId() + " (" + job.label + ", " + kind.toLowerCase()
                         + "): " + taskIndices.size() + " task(s), --array=" + job.array + ", from "
                         + state.remoteDir + ".");
+                out.println("The job ID is saved in " + store.dir().resolve(StateStore.STATE) + ". The job runs on "
+                        + "the cluster on its own: you can disconnect the VPN and close or sleep this computer. "
+                        + "Later, reconnect and check:\n  inference connect\n  inference status " + submissionDir
+                        + "\n  inference collect " + submissionDir);
                 return Outcome.DONE;
             }
             case SbatchOutcome.Rejected r -> {
@@ -637,9 +658,14 @@ public final class RemoteInference {
         }
     }
 
-    private Tasks taskStates() throws IOException {
+    private Tasks taskStates() throws Stop, IOException {
         List<RemoteState.Job> jobs = state.submitted();
-        SchedulerSnapshot snapshot = cluster.query(jobs.stream().map(j -> j.jobId).distinct().toList());
+        SchedulerSnapshot snapshot;
+        try {
+            snapshot = cluster.query(jobs.stream().map(j -> j.jobId).distinct().toList());
+        } catch (RemoteException e) {
+            throw remote(e, "Querying the scheduler"); // a lost connection is not scheduler uncertainty
+        }
         Map<Integer, String> jobOf = new TreeMap<>();
         Map<Integer, SchedulerSnapshot.TaskState> states = new TreeMap<>();
         for (RemoteState.Job j : jobs) {
@@ -699,9 +725,60 @@ public final class RemoteInference {
         }
         root.put("tasks", list);
         root.put("problems", tasks.problems());
-        root.put("note", "Scheduler states of array tasks. They say nothing about whether a prompt got a valid "
-                + "response; see collection.json.");
+        root.put("refreshFailure", null);
+        root.put("note", "Scheduler states of array tasks from the query at queriedAt. They say nothing about "
+                + "whether a prompt got a valid response; see collection.json. If refreshFailure is set, a later "
+                + "query failed and these states are older than that.");
         StateStore.writeAtomically(store.dir().resolve(STATUS), Json.write(root));
+    }
+
+    /** Keeps the last snapshot in status.json and records why the latest refresh failed. */
+    private void refreshFailed(String reason) throws IOException {
+        Map<String, Object> root = new LinkedHashMap<>();
+        Optional<Map<?, ?>> cached = loadJson(STATUS);
+        if (cached.isPresent()) {
+            cached.get().forEach((k, v) -> root.put((String) k, v));
+        } else {
+            root.put("schemaVersion", 1);
+            root.put("submissionId", local.submissionId());
+            root.put("queriedAt", null);
+            root.put("tasks", List.of());
+        }
+        Map<String, Object> failure = new LinkedHashMap<>();
+        failure.put("at", now());
+        failure.put("reason", reason);
+        root.put("refreshFailure", failure);
+        StateStore.writeAtomically(store.dir().resolve(STATUS), Json.write(root));
+    }
+
+    /** The last successful scheduler snapshot, clearly labeled as cached. */
+    private void printCachedStatus() {
+        Optional<Map<?, ?>> cached = loadJson(STATUS);
+        Object queriedAt = cached.map(c -> c.get("queriedAt")).orElse(null);
+        if (queriedAt == null) {
+            out.println("Scheduler: no fresh information, and no earlier snapshot exists.");
+            return;
+        }
+        Map<String, Integer> counts = new TreeMap<>();
+        if (cached.get().get("tasks") instanceof List<?> list) {
+            for (Object o : list) {
+                counts.merge(String.valueOf(((Map<?, ?>) o).get("state")), 1, Integer::sum);
+            }
+        }
+        out.println("Scheduler: no fresh information. CACHED snapshot from " + queriedAt + " (may be outdated): "
+                + counts + ".");
+    }
+
+    /** Prompt results of the last collection, labeled as cached (status never downloads results). */
+    private void printCachedPrompts() {
+        Optional<Map<?, ?>> c = loadJson(COLLECTION);
+        if (c.isEmpty()) {
+            out.println("Prompt results: none collected yet (run `inference collect " + submissionDir + "`).");
+            return;
+        }
+        out.println("Prompt results: CACHED from the last collection at " + c.get().get("collectedAt") + ": "
+                + summaryLine(c.get().get("summary")) + ". `status` does not download results; run `inference "
+                + "collect " + submissionDir + "` to refresh them.");
     }
 
     // ------------------------------------------------------------------ collect
@@ -788,9 +865,9 @@ public final class RemoteInference {
         StateStore.writeAtomically(store.dir().resolve(COLLECTION), Json.write(root));
     }
 
-    private Optional<Map<?, ?>> loadCollection() {
+    private Optional<Map<?, ?>> loadJson(String name) {
         try {
-            Path f = store.dir().resolve(COLLECTION);
+            Path f = store.dir().resolve(name);
             if (Files.isRegularFile(f) && JsonParser.parse(Files.readString(f, StandardCharsets.UTF_8))
                     instanceof Map<?, ?> m) {
                 return Optional.of(m);
@@ -839,7 +916,12 @@ public final class RemoteInference {
         if (state.submitted().isEmpty()) {
             throw new Stop(Outcome.INCOMPLETE, "Nothing was submitted yet; use `inference submit` or `inference run`.");
         }
-        SchedulerSnapshot snapshot = cluster.query(state.submitted().stream().map(j -> j.jobId).distinct().toList());
+        SchedulerSnapshot snapshot;
+        try {
+            snapshot = cluster.query(state.submitted().stream().map(j -> j.jobId).distinct().toList());
+        } catch (RemoteException e) {
+            throw remote(e, "Querying the scheduler");
+        }
         List<String> blocking = new ArrayList<>();
         for (RemoteState.Job j : state.submitted()) {
             for (int t : j.taskIndices) {
@@ -894,8 +976,18 @@ public final class RemoteInference {
                 + "this local monitoring; the jobs keep running and `inference run " + submissionDir
                 + "` resumes it.");
         while (true) {
-            requireConnection();
-            Tasks tasks = taskStates();
+            Tasks tasks;
+            try {
+                requireConnection();
+                tasks = taskStates();
+            } catch (Stop s) {
+                if (s.outcome == Outcome.RECONNECT) {
+                    refreshFailed(s.getMessage());
+                    out.println("Monitoring stopped; the jobs keep running on the cluster. After reconnecting, use "
+                            + "`inference status` and `inference collect`, or `inference run` to monitor again.");
+                }
+                throw s;
+            }
             Collected c;
             try {
                 c = doCollect();

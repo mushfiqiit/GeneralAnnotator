@@ -283,7 +283,11 @@ interface or in one named class), labeled provisional, and noted here.
   **Provisional defaults, isolated in `inference.remote.RemoteSettings`:**
   - target `mc2399@wulver.njit.edu`, remote base `/project/mjk76/mc2399` with
     `generalannotator/inference/<run id>/<submission id>`;
-  - managed socket directory `~/.ga-ssh`, ControlPersist 4h;
+  - managed socket directory `~/.ga-ssh`, ControlPersist 4h, ServerAliveInterval
+    15 s (T13e);
+  - a connection is healthy only after a remote round trip (`printf` marker,
+    ConnectTimeout + 15 s), and non-interactive calls add `ProxyCommand=false`
+    so they can never fall back to a fresh login (T13e);
   - remote commands run with `bash -l -c`;
   - polling every 300 s, and monitoring stops after 3 polls with unknown state;
   - retries skip `PROMPT_TOO_LONG`, `PROMPT_HASH_MISMATCH`, `PROMPT_MISSING` and
@@ -310,6 +314,8 @@ interface or in one named class), labeled provisional, and noted here.
   member and position exist in the original project is not checked yet.
 - Whether the worker should retry transient HTTP errors itself (it doesn't;
   `inference retry` resubmits failed prompts as new attempts).
+- Whether a managed master that ignores `ssh -O exit` should ever be stopped
+  automatically (by pid). Currently `connect` only reports it (T13e).
 - Effective Wulver limits (account/QoS MaxSubmitJobs, GPU availability) for
   large arrays are unverified; only MaxArraySize=100001 is known. Whether
   `GA_INFERENCE_ARRAY_CONCURRENCY=4` is a good default depends on them (T13d).
@@ -341,7 +347,7 @@ interface or in one named class), labeled provisional, and noted here.
 | 2. Slice: generation | Implemented: `slice` command runs Specimin per warning into `slices/<ID>/` (`slice-results.json`). Reproduction is NOT_VALIDATED. |
 | 2. Slice: reproduction validation | Not implemented (T10b). |
 | 3. Extract context | Implemented for symbol usages: `context` command writes `context/<ID>.json`/`.txt` (one hop, symbol-based, no safe/unsafe policy). Unsafe-region usages (T12) blocked on §6.2. |
-| 4. Propose (manual / LLM) | Prompt units (`prompts`), Wulver submissions with a GPU worker (`prepare-inference`), and upload, submission, monitoring, collection and retry over one shared SSH connection (`inference`). All tested with fakes only: nothing has run on Wulver or a GPU yet (T13d), and proposals are not applied. |
+| 4. Propose (manual / LLM) | Prompt units (`prompts`), Wulver submissions with a GPU worker (`prepare-inference`), and upload, submission, monitoring, collection and retry over one shared SSH connection (`inference`), with a submit, disconnect, reconnect and collect workflow (T13e). Used on Wulver (jobs 1628816 and 1629432); the T13e health check and stale-connection recovery are tested with fakes only. Proposals are not applied. |
 | 5. Apply and recheck | Not implemented |
 | 6. Record | Not implemented |
 | 7. Explore and select | Not implemented; blocked on §6 decisions |

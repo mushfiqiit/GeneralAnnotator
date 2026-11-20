@@ -13,7 +13,10 @@ import java.util.Optional;
  */
 public interface Cluster {
 
-    /** Whether the shared connection is usable now, checked without prompting. */
+    /**
+     * Whether the shared connection is usable now: the master answers and a remote round trip through
+     * it succeeds. Checked without prompting.
+     */
     ConnectionCheck check();
 
     /** What exists at {@code remoteDir}. */
@@ -35,8 +38,13 @@ public interface Cluster {
      */
     SbatchOutcome sbatch(String remoteDir, String label, String arraySpec, String comment);
 
-    /** Scheduler state of the array tasks of {@code jobIds} (squeue, then sacct). Never throws. */
-    SchedulerSnapshot query(List<String> jobIds);
+    /**
+     * Scheduler state of the array tasks of {@code jobIds} (squeue, then sacct). Scheduler problems
+     * (a command failing or answering incompletely) become unknown tasks in the snapshot; a lost
+     * connection is thrown as {@link RemoteException.Kind#DISCONNECTED}, because it says nothing
+     * about the jobs.
+     */
+    SchedulerSnapshot query(List<String> jobIds) throws RemoteException;
 
     /** Scheduler records (sacct and squeue) of one job, for verifying a job ID. */
     List<JobRecord> describe(String jobId) throws RemoteException;
@@ -54,8 +62,17 @@ public interface Cluster {
      */
     void download(String remoteDir, Path incoming) throws RemoteException;
 
-    /** Result of {@link #check()}. */
-    record ConnectionCheck(boolean alive, String detail) {}
+    /**
+     * Result of {@link #check()}.
+     *
+     * @param alive the connection is usable (master and remote round trip)
+     * @param masterRunning the local master process answers, whether or not the remote side works
+     */
+    record ConnectionCheck(boolean alive, boolean masterRunning, String detail) {
+        public ConnectionCheck(boolean alive, String detail) {
+            this(alive, alive, detail);
+        }
+    }
 
     /** Result of {@link #probe(String)}. */
     record DirectoryProbe(Kind kind, Optional<String> submissionSha256) {

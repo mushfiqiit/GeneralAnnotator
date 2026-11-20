@@ -485,6 +485,150 @@ class RemoteInferenceTest {
         assertTrue(output().contains("belongs to"), output());
     }
 
+    private Map<?, ?> statusJson() throws IOException {
+        return (Map<?, ?>) JsonParser.parse(Files.readString(submission.resolve("remote/status.json")));
+    }
+
+    @Test
+    void submitReturnsOnceTheJobIdIsSavedWithoutMonitoring() throws Exception {
+        prepare(41, 1, 4);
+        assertEquals(Outcome.DONE, remote().upload());
+        assertEquals(Outcome.DONE, remote().submit());
+        assertEquals(List.of(), sleeps, "no polling");
+        assertEquals(0, cluster.queryCalls, "no scheduler query");
+        assertEquals(0, cluster.downloadCalls, "no collection");
+        assertEquals("5000", job(0).get("jobId"));
+        assertTrue(output().contains("you can disconnect the VPN"), output());
+        assertTrue(output().contains("inference status " + submission), output());
+    }
+
+    @Test
+    void disconnectedWorkflowSubmitThenLaterStatusAndCollectKeepsTheSameJob() throws Exception {
+        prepare(3, 1, 4);
+        assertEquals(Outcome.DONE, remote().upload());
+        assertEquals(Outcome.DONE, remote().submit());
+        String job = cluster.lastJob();
+        // While "away": the cluster runs the job; the laptop does nothing.
+        cluster.connected = false;
+        cluster.workerResult(REMOTE, "W0001", 1, "COMPLETED_PROPOSED", null);
+        cluster.scheduler.get(job).put(0, "COMPLETED");
+        assertEquals(Outcome.RECONNECT, remote().status());
+        assertEquals(Outcome.RECONNECT, remote().collect());
+        assertEquals(Outcome.RECONNECT, remote().submit());
+
+        cluster.connected = true; // after `inference connect`
+        assertEquals(Outcome.DONE, remote().collect(), output());
+        assertEquals("COMPLETED_PROPOSED", prompt("W0001").get("status"));
+        assertEquals("NO_RESULT", prompt("W0002").get("status"));
+        byte[] answer = Files.readAllBytes(submission.resolve("remote/collected/results/W0001/attempt-001/answer.json"));
+
+        cluster.workerResult(REMOTE, "W0002", 1, "COMPLETED_INSUFFICIENT_EVIDENCE", null);
+        cluster.workerResult(REMOTE, "W0003", 1, "COMPLETED_PROPOSED", null);
+        cluster.setAll(job, "COMPLETED");
+        assertEquals(Outcome.DONE, remote().status(), output());
+        assertEquals(Outcome.DONE, remote().collect());
+        assertEquals(Outcome.DONE, remote().submit(), "already submitted: nothing new");
+        assertEquals(Outcome.DONE, remote().run(), output());
+        assertEquals(1, cluster.sbatchCalls.size(), "never resubmitted");
+        assertEquals(1, jobs().size());
+        assertEquals(job, job(0).get("jobId"));
+        assertTrue(java.util.Arrays.equals(answer, Files.readAllBytes(
+                submission.resolve("remote/collected/results/W0001/attempt-001/answer.json"))));
+        assertEquals(Long.valueOf(3), ((Map<?, ?>) collection().get("summary")).entrySet().stream()
+                .filter(e -> e.getKey().toString().startsWith("COMPLETED")).mapToLong(e -> (Long) e.getValue()).sum());
+    }
+
+    @Test
+    void transportLossDuringStatusIsReconnectWithCachedDataLabeled() throws Exception {
+        prepare(2, 1, 4);
+        assertEquals(Outcome.DONE, remote().upload());
+        assertEquals(Outcome.DONE, remote().submit());
+        cluster.scheduler.get("5000").put(0, "RUNNING");
+        cluster.workerResult(REMOTE, "W0002", 1, "COMPLETED_PROPOSED", null);
+        assertEquals(Outcome.DONE, remote().collect());
+        assertEquals(Outcome.DONE, remote().status());
+        assertTrue(output().contains("Fresh scheduler query at"), output());
+        assertTrue(output().contains("Prompt results: CACHED from the last collection"), output());
+        Object queriedAt = statusJson().get("queriedAt");
+        assertEquals(null, statusJson().get("refreshFailure"));
+
+        // The connection check passes, then the transport dies during squeue/sacct.
+        out.reset();
+        cluster.loseConnectionAtQuery = true;
+        assertEquals(Outcome.RECONNECT, remote().status());
+        String text = output();
+        assertTrue(text.contains("Broken pipe"), text);
+        assertTrue(text.contains("CACHED snapshot from " + queriedAt), text);
+        assertTrue(text.contains("{PENDING=1, RUNNING=1}"), text);
+        assertTrue(text.contains("Prompt results: CACHED"), text);
+        assertFalse(text.contains("Fresh scheduler query"), text);
+        assertFalse(text.contains("UNKNOWN  "), "no per-task UNKNOWN rows for a lost connection: " + text);
+        Map<?, ?> status = statusJson();
+        assertEquals(queriedAt, status.get("queriedAt"), "the earlier snapshot is kept");
+        assertEquals("RUNNING", ((Map<?, ?>) ((List<?>) status.get("tasks")).get(0)).get("state"));
+        assertTrue(((Map<?, ?>) status.get("refreshFailure")).get("reason").toString().contains("Broken pipe"));
+
+        // Back online: a fresh snapshot clears the failure.
+        cluster.loseConnectionAtQuery = false;
+        cluster.connected = true;
+        assertEquals(Outcome.DONE, remote().status());
+        assertEquals(null, statusJson().get("refreshFailure"));
+    }
+
+    @Test
+    void transportLossWhileMonitoringStopsWithReconnectAndKeepsTheJob() throws Exception {
+        prepare(2, 1, 4);
+        RemoteInference r = remote(d -> cluster.loseConnectionAtQuery = true);
+        assertEquals(Outcome.RECONNECT, r.run());
+        assertTrue(output().contains("the jobs keep running"), output());
+        assertEquals("SUBMITTED", job(0).get("status"));
+        assertTrue(statusJson().get("refreshFailure") != null);
+    }
+
+    @Test
+    void anUnknownRetryBlocksSubmitAndRunEvenAfterASuccessfulInitialJob() throws Exception {
+        prepare(2, 1, 4);
+        assertEquals(Outcome.DONE, remote().upload());
+        assertEquals(Outcome.DONE, remote().submit());
+        cluster.workerResult(REMOTE, "W0001", 1, "COMPLETED_PROPOSED", null);
+        cluster.workerResult(REMOTE, "W0002", 1, "FAILED", "TIMEOUT");
+        cluster.setAll("5000", "COMPLETED");
+        cluster.sbatchMode = FakeCluster.SbatchMode.UNKNOWN_AFTER_SUBMIT;
+        assertEquals(Outcome.INCOMPLETE, remote().retry());
+        assertEquals("UNKNOWN", job(1).get("status"));
+        assertEquals("RETRY", job(1).get("kind"));
+
+        cluster.connected = true;
+        cluster.sbatchMode = FakeCluster.SbatchMode.SUBMIT;
+        out.reset();
+        assertEquals(Outcome.INCOMPLETE, remote().submit());
+        assertFalse(output().contains("Already submitted"), "the shortcut must not hide the UNKNOWN retry");
+        assertTrue(output().contains("UNKNOWN"), output());
+        int queries = cluster.queryCalls;
+        assertEquals(Outcome.INCOMPLETE, remote().run());
+        assertEquals(queries, cluster.queryCalls, "run refuses before monitoring");
+        assertEquals(Outcome.INCOMPLETE, remote().retry());
+        assertEquals(2, cluster.sbatchCalls.size(), "sbatch never repeated");
+    }
+
+    @Test
+    void collectionWorksWithoutSchedulerHistoryAndNeverInfersCompletion() throws Exception {
+        prepare(2, 1, 4);
+        assertEquals(Outcome.DONE, remote().upload());
+        assertEquals(Outcome.DONE, remote().submit());
+        cluster.workerResult(REMOTE, "W0001", 1, "COMPLETED_PROPOSED", null);
+        cluster.scheduler.clear(); // sacct/squeue know nothing (purged or unavailable)
+        cluster.schedulerUnavailable = true;
+        int queries = cluster.queryCalls;
+        assertEquals(Outcome.DONE, remote().collect(), output());
+        assertEquals(queries, cluster.queryCalls, "collect does not depend on the scheduler");
+        assertEquals("COMPLETED_PROPOSED", prompt("W0001").get("status"));
+        assertEquals("NO_RESULT", prompt("W0002").get("status"), "not FAILED: there is just no result yet");
+        assertEquals(Outcome.INCOMPLETE, remote().status(), "unknown tasks are not finished");
+        assertEquals(Outcome.INCOMPLETE, remote().retry(), "no retry without verified terminal states");
+        assertEquals(1, cluster.sbatchCalls.size());
+    }
+
     @Test
     void arraySpecificationsCompressConsecutiveTasks() {
         assertEquals("0-40", RemoteInference.arraySpec(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
