@@ -12,8 +12,10 @@ Collected proposals can be applied to a fresh copy of the run snapshot (T6,
 answers can be evaluated as one annotation package against one baseline with
 the checker; answers proposing exactly the same set share the package. The
 results are recorded as an expanded graph (T8, T8b, T8c,
-`evaluate-annotations`). Annotation sequences, an append-only transition log
-and search are not implemented.
+`evaluate-annotations`). All packages of round 1 can also be applied together
+to one copy and checked once, saving every finding of that combined state
+(T8d, `apply-round`). Annotation sequences, inference on a combined state
+(round 2), an append-only transition log and search are not implemented.
 
 ## 1. Purpose
 
@@ -111,6 +113,7 @@ Out of scope for now:
 | **Warning graph** | Per-run graph of warning nodes and (later) other nodes and edges. The initial graph is built from a completed analysis only: one root warning node per finding, no edges. Saved as `warning-graph.json`. An evaluation's expanded graph (`evaluation-graph.json`, schema version 5) adds annotation nodes (one per unique package), result-state warning nodes and `resolved-by` / `introduces` edges. |
 | **Round** | One iteration of LLM inference and evaluation (not one annotation attempt, not a graph distance). Round 1 evaluates answers about the initial warnings. Introduced warnings carry their round's IDs (`W1001, ...` for round 1, `W2001, ...` for round 2), and the round is stored explicitly on nodes and records. |
 | **Baseline state** | `S0`: an evaluation's immutable copy of the run snapshot, checked once; every attempt starts from it. The state after edit `A` is `S0+A`. |
+| **Combined round state** | The run snapshot with every validated package of one round applied together (T8d, `apply-round`), checked once. Its ID is `round<r>-<key>`; it is not the state of any single attempt (`S0+A0001`), and its effects are not attributed to individual packages. |
 | **Annotation node** | One annotation package evaluated (or still to be evaluated) against one baseline state, holding all its edits, an explicit outcome and every originating answer (as associations, not edges). |
 | **Warning node** | A graph node for one checker finding observed in one run. Its ID (`W0001`, ...) identifies that *occurrence within the run*, not a warning identity across runs. It holds the complete diagnostic. |
 | **Root / distance** | Initial and baseline warning nodes are roots with distance 0. Provisionally (T8), a warning node's distance is the number of edits applied to the baseline in the state where it was observed, so warnings introduced by one evaluated edit have distance 1. Distance across longer sequences is not defined yet (§6). |
@@ -437,6 +440,33 @@ interface or in one named class), labeled provisional, and noted here.
     attempted);
   - whether introduced warnings of different attempts should ever be
     identified with each other.
+- **Combined round application (T8d).** Provisional, in
+  `evaluation.RoundApplication`:
+  - **Union.** All packages of the round are applied together. Their union is
+    deduplicated by `AnnotationEdit` equality and kept in canonical order.
+    Packages are never filtered by individual results.
+  - **Rejection.** The whole union is validated by the AST applier before any
+    file is written. Any rejected, conflicting or suppressing edit rejects
+    the round; conflicts are reported with packages and answers and are never
+    settled by order. How conflicting proposals of one round should be
+    reconciled (choose, drop, or ask again) is open.
+  - **Baseline.** An evaluation baseline is reused only if snapshot tree hash,
+    configuration fingerprint and matcher are equal and its source copy still
+    matches its recorded hash; otherwise a fresh baseline is run.
+  - **Warning IDs.** Every finding of the combined state is classified by
+    `anchored-1`. Persisting findings keep their baseline IDs. Introduced and
+    ambiguous findings get round IDs (`W1001, ...`) from a sequence scoped to
+    that round result, so the same ID can denote different warnings in an
+    evaluation graph and in a round result. The state ID tells them apart. A
+    run-wide warning-ID namespace across evaluations and combined states is
+    open (with §6.1).
+  - **Next round.** A completed result is laid out like a run directory
+    (`report.json`, a v1 `warning-graph.json` with every finding as a root
+    node, `workspace/target`). Whether round 2 should start from this combined
+    state, from an attempt state, or from a selected subset of packages is
+    open (§6.3, §6.4).
+  - **Publication.** Results are published by an atomic rename and never
+    overwritten. Failed attempts are kept as `-failed-<time>`.
 - Isolation mechanism for *multiple* repository states (copy per state, `git
   worktree`, overlay, etc.) and how states are identified. **Provisional (T8):**
   - Each attempt is an explicit file copy of the baseline copy
@@ -539,6 +569,7 @@ interface or in one named class), labeled provisional, and noted here.
 | 3. Extract context | Implemented for symbol usages: `context` command writes `context/<ID>.json`/`.txt` (one hop, symbol-based, no safe/unsafe policy). Unsafe-region usages (T12) blocked on §6.2. |
 | 4. Propose (manual / LLM) | Prompt units (`prompts`), Wulver submissions with a GPU worker (`prepare-inference`), and upload, submission, monitoring, collection and retry over one shared SSH connection (`inference`), with a submit, disconnect, reconnect and collect workflow (T13e). Used on Wulver (jobs 1628816 and 1629432); the T13e health check and stale-connection recovery are tested with fakes only. Proposals are applied by `apply-proposal` and evaluated by `evaluate-annotations`. |
 | 5. Apply and recheck | `apply-proposal` applies a proposal's edits, all or nothing, to a snapshot copy (`applications/`). `evaluate-annotations` applies each distinct complete edit set (equivalent answers merged) as one package to a copy of one baseline, reruns NullAway once on all source roots and compares findings with the provisional `anchored-1` rule (T8, T8b, T8c). Verified with fakes and manually on EventBus (39 answers, 27 unique packages, all completed). |
+| 5b. Apply a whole round | `apply-round --round 1` applies all validated packages together to one snapshot copy, checks it once and saves every finding with its comparison; the result can serve as the next round's run (T8d). Verified with fakes and manually on EventBus (27 packages, 42 → 19 findings). |
 | 6. Record | Partly: per-attempt records, summary and the expanded graph (T8). No append-only state-transition log (T9). |
 | 7. Explore and select | Not implemented; blocked on §6 decisions |
 | 8. Batch | Not implemented; blocked on §6 decisions |

@@ -914,7 +914,7 @@ public final class Evaluator {
         return new Result(Status.REFUSED, dir, message, List.of());
     }
 
-    private static ObservedFinding observe(String id, generalannotator.diagnostics.Diagnostic d,
+    static ObservedFinding observe(String id, generalannotator.diagnostics.Diagnostic d,
             Optional<String> targetPath, DeclarationAnchors anchors) {
         String path = targetPath.map(p -> p.replace('\\', '/')).orElse(d.sourcePath());
         ObservedFinding.Anchor anchor = targetPath.isPresent() ? anchors.anchor(path, d.line(), d.column())
@@ -948,7 +948,7 @@ public final class Evaluator {
     // ---------------------------------------------------------------------------------------------
     // Records, summary and helpers
 
-    private static List<Object> commands(CheckerRun run, Path base) {
+    static List<Object> commands(CheckerRun run, Path base) {
         List<Object> list = new ArrayList<>();
         for (RecordedCommand rc : run.commands()) {
             Map<String, Object> m = new LinkedHashMap<>();
@@ -971,7 +971,7 @@ public final class Evaluator {
         return f.startsWith(b) ? b.relativize(f).toString() : f.toString();
     }
 
-    private static Map<String, Object> coverage(CheckerRun run) {
+    static Map<String, Object> coverage(CheckerRun run) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("analyzedSourceRoots", run.coverage().analyzedSourceRoots());
         m.put("analyzedSourceFiles", run.coverage().analyzedSourceFiles());
@@ -1005,7 +1005,7 @@ public final class Evaluator {
         return Math.toIntExact((Long) m.get(key));
     }
 
-    private static String describe(AnnotationNode.Counts c) {
+    static String describe(AnnotationNode.Counts c) {
         String s = "findings " + c.baselineFindings() + " -> " + c.resultFindings() + ": " + c.resolved()
                 + " resolved, " + c.introduced() + " introduced, " + c.persisting() + " persisting";
         if (c.ambiguousBaseline() + c.ambiguousResult() > 0) {
@@ -1144,7 +1144,7 @@ public final class Evaluator {
         Files.move(from, to, StandardCopyOption.ATOMIC_MOVE);
     }
 
-    private static Map<?, ?> parse(Path file) throws IOException {
+    static Map<?, ?> parse(Path file) throws IOException {
         try {
             return (Map<?, ?>) JsonParser.parse(Files.readString(file, StandardCharsets.UTF_8));
         } catch (RuntimeException e) {
@@ -1152,7 +1152,7 @@ public final class Evaluator {
         }
     }
 
-    private static String firstLine(String text) {
+    static String firstLine(String text) {
         int newline = text.indexOf('\n');
         return newline < 0 ? text : text.substring(0, newline) + " ...";
     }

@@ -113,6 +113,19 @@ class MainTest {
     }
 
     @Test
+    void applyRoundCommandIsDispatchedAndRequiresRoundOne() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "apply-round", "dir"));
+        err.reset();
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "apply-round", "dir", "--round", "2"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("only round 1"));
+        err.reset();
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "apply-round", "no-such-dir", "--round", "1"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot apply the round"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("apply-round <submission dir> --round 1"));
+    }
+
+    @Test
     void migrateWarningIdsCommandIsDispatchedAndValidatesItsArgument() {
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "migrate-warning-ids", "no-such-dir"));
         assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot migrate warning IDs"));

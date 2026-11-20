@@ -1,6 +1,7 @@
 package generalannotator;
 
 import generalannotator.cli.ApplyProposalCommand;
+import generalannotator.cli.ApplyRoundCommand;
 import generalannotator.cli.CheckCommand;
 import generalannotator.checker.Checkers;
 import generalannotator.cli.ContextCommand;
@@ -92,6 +93,13 @@ public final class Main {
                       Checker settings as for check (GA_CHECKER, GA_CHECKER_HOME, GA_TARGET_CLASSPATH,
                       ...); GA_TARGET_PROJECT and GA_TARGET_SOURCE_ROOTS are not used. The answers
                       are inference round 1; warnings introduced in round 1 are W1001, W1002, ...
+              apply-round <submission dir> --round 1
+                      Apply every validated package of the collected answers together to one fresh
+                      copy of the run snapshot, check that combined state once on the configured
+                      source roots, and write rounds/<id>/ with the annotated workspace, changes.diff,
+                      every finding (findings.json, warnings.txt) and its comparison with the
+                      baseline. A conflict rejects the whole round. Checker settings as for
+                      evaluate-annotations. The result directory can be used as the next round's run.
               migrate-warning-ids <evaluation dir>
                       Convert an evaluation written with candidate-local introduced-warning IDs
                       (A0001-N1) to round IDs (W1001, ...), with a backup. Nothing is rerun.
@@ -104,6 +112,7 @@ public final class Main {
                         proposal or it was rejected; evaluate-annotations: nothing to evaluate,
                         baseline failed, evaluation busy, needs migration, --reuse-from not
                         equivalent or IDs exhausted;
+                        apply-round: nothing to apply, rejected, check failed or not comparable;
                         migrate-warning-ids: refused), 4 internal error,
                         5 inference: the shared SSH connection is not available (reconnect).""";
 
@@ -223,6 +232,21 @@ public final class Main {
                         (config, e) -> Checkers.create(config, e, new ProcessCommandRunner()),
                         new JavaParserAnnotationApplier(), new AnchoredWarningMatcher(), 1, Clock.systemUTC(), out,
                         err).run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        Optional<Map<String, String>> roundOptions = args.length >= 2 && args[0].equals("apply-round")
+                ? options(args, 2, Set.of("--round")).filter(o -> o.containsKey("--round")) : Optional.empty();
+        if (roundOptions.isPresent()) {
+            try {
+                return new ApplyRoundCommand(args[1], roundOptions.get().get("--round"), env,
+                        Path.of("").toAbsolutePath(), Path.of(System.getProperty("java.home")),
+                        (config, e) -> Checkers.create(config, e, new ProcessCommandRunner()),
+                        new JavaParserAnnotationApplier(), new AnchoredWarningMatcher(), Clock.systemUTC(), out, err)
+                        .run();
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);

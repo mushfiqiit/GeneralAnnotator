@@ -559,6 +559,87 @@ On a scratch copy of the EventBus run:
   graph, and every `changes.diff` matched;
 - the earlier evaluation directory stayed byte-identical.
 
+## T8d — Apply a whole round and recheck once · `done`
+
+`apply-round <submission> --round 1` applies **all** validated packages of
+round 1 together to one isolated copy of the run snapshot, runs NullAway once
+on that combined state, and saves every finding.
+- **Packages and union.** Packages and provenance come from `Candidates` (T8c
+  merging). Excluded answers are reported, so complete coverage is never
+  claimed. All edits form a union in canonical order: shared edits are
+  applied once and list every package and answer, multi-edit packages keep all
+  edits, and no package is selected by its individual result.
+- **Validation.** The AST applier validates the whole union against the
+  snapshot's declarations before writing anything:
+  - already-present annotations are NO_OP;
+  - ADD/REMOVE pairs, competing nullness annotations at one position,
+    missing or ambiguous targets, unsupported placements and suppressing
+    edits are rejected;
+  - one rejection rejects the round (status REJECTED, conflicts with packages
+    and answers, no workspace published, no checker run).
+- **Baseline.** An evaluation baseline is reused only if snapshot hash,
+  configuration fingerprint and matcher are equal and its source still has
+  its recorded hash; otherwise a fresh baseline is checked.
+- **Check and comparison.** One checker run on the combined workspace with
+  the baseline's settings; the analyzed scope and the unchecked modules are
+  reported. All findings are saved:
+  - matcher categories: persisting findings keep baseline IDs; introduced and
+    ambiguous ones get round-1 IDs scoped to the result;
+  - execution failures are kept as INCOMPLETE with logs and no comparison;
+  - a different checker build is NOT_COMPARABLE.
+- **Artifacts.** `runs/<run>/rounds/round1-<key>/` holds `round.json`,
+  `candidates.json`, `workspace/target/`, `changes.diff` (with per-file
+  hashes), `check/`, `findings.json`, `warnings.txt` and `comparison.json`.
+  - Completed results also get `report.json` and a v1 `warning-graph.json`,
+    so `targets`, `slice` and `context` accept the directory as the next
+    round's run.
+  - Results are built in a temporary directory and published by an atomic
+    rename, never overwritten. Completed, rejected and not-comparable results
+    are reused by key, a modified workspace is refused, and failed attempts
+    are kept as `-failed-<time>` and retried.
+- **Not done.** Nothing is attributed to annotation nodes, and evaluation
+  graphs are unchanged.
+
+Code:
+- `evaluation.RoundApplication` (new);
+- `cli.ApplyRoundCommand` (new);
+- `Main` (dispatch and usage);
+- package-visible helpers in `Evaluator`.
+
+Verified by:
+- `RoundApplicationTest` (fake checker, real applier) covers:
+  - several packages in one workspace and one post-edit check, with shared
+    edits applied once and multi-edit packages kept;
+  - interacting edits whose combined result differs from the independent
+    evaluation, with the evaluation baseline reused and left unchanged;
+  - complete findings with persisting and introduced categories, IDs and
+    published paths;
+  - ambiguous findings;
+  - ADD/REMOVE conflicts and missing members rejecting the round atomically,
+    and suppressing edits as unsupported;
+  - NO_OPs;
+  - an ignored parent git directory, with the snapshot and graph unchanged;
+  - a failed combined check (kept, incomplete, retried) and a failed baseline;
+  - reuse, another configuration, and a modified workspace refused;
+  - a different checker build;
+  - `targets` accepting the result as a run;
+  - round 2 refused.
+- `MainTest` covers dispatch.
+- No real-NullAway test was added; the real run below was manual.
+
+On a scratch copy of the EventBus run (NullAway 0.14.2-SNAPSHOT, JSpecify on
+the classpath):
+- all 27 packages (30 distinct edits from 39 answers) applied without
+  conflicts;
+- the evaluation baseline was verified and reused, and one NullAway run took
+  about 5 s;
+- 42 findings became 19: 40 resolved, 17 introduced, 2 persisting (W0008 and
+  W0011, which had no answer). The independent evaluations had 19 introduced
+  warnings in total;
+- a second invocation reused the result;
+- `targets` accepted the result directory;
+- the snapshot, inference results and evaluations stayed byte-identical.
+
 ## T9 — Record attempts and state transitions · `todo`
 
 Persist warning/action/resolution records and state transitions in a

@@ -1481,6 +1481,129 @@ on the classpath), the baseline reproduced the run's 42 findings exactly.
 - **Old directories.** The earlier evaluation directories were left
   byte-identical.
 
+## Applying a whole round (`apply-round`)
+
+`evaluate-annotations` checks each package alone. `apply-round` applies
+**every** validated package of a round together and checks the resulting
+source state once:
+
+```sh
+export GA_CHECKER=nullaway
+export GA_CHECKER_HOME=$HOME/Documents/NullAway
+export GA_TARGET_CLASSPATH=$HOME/.gradle/caches/modules-2/files-2.1/org.jspecify/jspecify/1.0.0/7425a601c1c7ec76645a78d22b8c6a627edee507/jspecify-1.0.0.jar
+$GA apply-round runs/<run id>/inference/<submission id> --round 1
+less runs/<run id>/rounds/<round id>/warnings.txt          # every warning of the combined state
+```
+
+The checker settings are the same as for `evaluate-annotations`. Only
+`--round 1` (answers about the run's initial warnings) is supported.
+
+What it does:
+
+1. **Packages.** The answers are imported and merged exactly as for
+   `evaluate-annotations`, keeping package boundaries and provenance.
+   Excluded answers (failed, missing, invalid, insufficient evidence) are
+   listed; the round then does not cover every warning. No package is left out
+   because it increased warnings when evaluated alone.
+2. **Union.** All edits of all packages are collected. An edit proposed by
+   several packages is applied once and lists every package and answer that
+   proposed it. Every package keeps all its edits.
+3. **Validation before anything is published.** The AST applier compares each
+   edit with the declarations of a fresh copy of the run snapshot.
+   - An annotation that is already present is NO_OP.
+   - These are rejected: ADD and REMOVE of the same annotation at one
+     position, two nullness annotations at one position, missing or ambiguous
+     targets, unsupported placements, and edits that would switch checking off
+     (`@SuppressWarnings`, `@NullUnmarked`, removing `@NullMarked`).
+   - One rejected edit rejects the round. Every conflict is reported with its
+     packages and answers, nothing is applied, and no workspace is
+     published. Conflicts are never settled by order, and no edit is dropped.
+   - `changes.diff` files of earlier evaluations are not used; edits are
+     matched structurally.
+4. **One combined state.** All edits are applied together to one full copy of
+   the run snapshot (an explicit file copy, so ignore rules of a parent git
+   repository don't matter; symlinks are skipped). The result is one
+   `changes.diff` with per-file hashes.
+5. **Baseline.** An evaluation baseline of the same run is reused only if its
+   snapshot tree hash, complete configuration fingerprint and matcher are
+   equal and its source copy still has its recorded hash. Otherwise a fresh
+   baseline is checked.
+6. **One check.** NullAway runs once on the combined workspace with the same
+   source roots, classpath, JDK, `--release` and annotated packages. The whole
+   repository is copied, but only the configured source roots are analyzed;
+   the output lists the Java files outside them as **not checked**.
+7. **Every finding.** All findings of the combined state are saved, not only
+   new ones. `anchored-1` classifies each one:
+   - persisting findings keep their baseline ID;
+   - introduced and ambiguous findings get round-1 IDs (`W1001, ...`, scoped
+     to this round result);
+   - resolved baseline warnings are listed by ID.
+   Nothing is inferred from counts, and independent attempt results are never
+   combined.
+8. **Failures.** A compilation error (for example a missing annotation jar),
+   crash or timeout is an execution failure, not zero warnings. The partial
+   findings are marked INCOMPLETE, the logs are kept, and no comparison is
+   made. If the checker build differs from the baseline's, the findings are
+   saved but not compared (NOT_COMPARABLE).
+
+```
+runs/<run>/rounds/round1-<key>/      published by an atomic rename, never overwritten
+  round.json         state ID, round, key (snapshot, configuration, packages, complete edit set, matcher),
+                     status, baseline (fresh or reused, verified), packages, excluded answers,
+                     every distinct edit with its packages, answers and applier outcome, conflicts,
+                     changed files with hashes, analyzed scope, check commands, comparison counts
+  candidates.json    the packages with full provenance
+  workspace/target/  the annotated full repository copy
+  changes.diff       every change of the round
+  check/             raw checker logs (they name the temporary build directory)
+  baseline/          a fresh baseline (source, check logs, result.json), if one was run
+  findings.json      every finding of the combined state, with ID, round, status, anchor and diagnostic
+  warnings.txt       the same list, readable
+  comparison.json    resolved, persisting, introduced and ambiguous findings (matcher anchored-1)
+  report.json, warning-graph.json   a run-directory view of the combined state (completed results only)
+runs/<run>/rounds/round1-<key>-failed-<time>/   a failed attempt (baseline or combined check), kept for inspection
+```
+
+- **Reuse.** The `<key>` covers the run, submission, snapshot tree hash,
+  checker configuration, package set with provenance, complete edit set and
+  matcher. A completed, rejected or not-comparable result is reported again
+  by later invocations without rerunning anything. A result whose
+  `workspace/target` was modified afterwards is refused. A failed attempt is
+  kept under `-failed-<time>`, and the next invocation tries again.
+- **State.** The state ID (`round1-<key>`) means the run snapshot `S0` with all
+  round-1 packages applied. It is not the state of any annotation attempt
+  (`S0+A0001`). Combined resolutions and introductions are not attributed to
+  individual packages or annotation nodes, and evaluation graphs are not
+  changed.
+- **Next round.** A completed result directory is laid out like a run
+  directory, so `targets`, `slice` and `context` accept it:
+  - `report.json` holds the effective configuration and points to
+    `workspace/target`;
+  - `warning-graph.json` holds every finding of the combined state as a root
+    node, with the IDs above.
+  Inference on it (round 2) is not implemented yet.
+
+| Exit | `apply-round` meaning |
+|---|---|
+| 0 | The combined state was checked completely and compared (or that result was reported again) |
+| 2 | Invalid arguments (`--round` other than 1), configuration or inference artifacts |
+| 3 | Nothing to apply, an edit was rejected or conflicts, the baseline or combined check failed, a different checker build (not comparable), or another process is writing the result |
+| 4 | Internal error, or the published workspace was modified |
+
+On a scratch copy of the EventBus run, all 27 packages (30 distinct edits from
+39 answers; W0008 and W0011 excluded) applied without conflicts.
+- **Timing.** The evaluation's baseline was verified and reused, and the one
+  NullAway run took about 5 seconds.
+- **Findings.** 42 became 19: 40 resolved, 17 introduced and 2 persisting. The
+  two persisting warnings are W0008 and W0011, the ones without an answer.
+  The 17 introduced warnings (`W1001`–`W1017`) are mostly dereferences of
+  fields the round made `@Nullable`.
+- **Interaction.** The independent evaluations together had 19 introduced
+  warnings, so the combined state is not the sum of the separate results.
+- **Next round.** `targets` accepted the result directory as a run.
+- **Originals.** The run snapshot, inference results and earlier evaluations
+  stayed byte-identical.
+
 ## How the local NullAway checkout is used
 
 1. **Setup.** GeneralAnnotator writes `generated/nullaway-processor-path.init.gradle`
@@ -1690,7 +1813,7 @@ mismatched javac counts, or an exit code inconsistent with the diagnostics).
 ```
 src/main/java/generalannotator/
   cli/          check, visualize, targets, slice, context, prompts, prepare-inference, inference,
-                apply-proposal and evaluate-annotations commands; exit codes
+                apply-proposal, evaluate-annotations, apply-round and migrate-warning-ids commands; exit codes
   config/       environment configuration and validation
   exec/         CommandRunner (ProcessBuilder-based; a terminal-attached variant for ssh login),
                 recorded command logs
@@ -1710,7 +1833,8 @@ src/main/java/generalannotator/
   edits/        annotation edit model (checker- and parser-independent), applier interface, diff
   edits/javaparser/  JavaParser-based declaration locator and annotation applier
   proposals/    import of collected proposals, application to a snapshot copy (applications/)
-  evaluation/   package import (equivalent answers merged), baseline and per-package attempts, reuse, resume and
+  evaluation/   package import (equivalent answers merged), baseline and per-package attempts, combined
+                round application (RoundApplication, rounds/), reuse, resume and
                 locking, expanded graph (evaluations/)
   evaluation/matching/  WarningMatcher interface, provisional anchored-1 rule, structural anchors
 src/main/resources/generalannotator/inference/ga_inference_worker.py   the GPU worker
