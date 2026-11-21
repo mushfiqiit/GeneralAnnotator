@@ -18,6 +18,7 @@ import generalannotator.edits.javaparser.JavaParserAnnotationApplier;
 import generalannotator.evaluation.matching.AnchoredWarningMatcher;
 import generalannotator.exec.ProcessCommandRunner;
 import generalannotator.exec.TerminalCommandRunner;
+import generalannotator.pipeline.Pipeline;
 import java.io.PrintStream;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -100,6 +101,20 @@ public final class Main {
                       every finding (findings.json, warnings.txt) and its comparison with the
                       baseline. A conflict rejects the whole round. Checker settings as for
                       evaluate-annotations. The result directory can be used as the next round's run.
+              pipeline start [--resume <pipeline dir>]
+                      Run the whole round-1 front half in one command: check (snapshot, findings,
+                      graph, targets), slice, context, prompts, prepare-inference (10 prompts per
+                      array task unless GA_INFERENCE_PROMPTS_PER_TASK is set), connect (one login
+                      if needed), upload and submit once. Returns after the job ID is saved; the
+                      run directory is the pipeline directory (pipeline.json, pipeline-summary.txt).
+                      --resume continues an interrupted start without submitting twice.
+              pipeline status <pipeline dir> [--connect]
+                      Recorded stages, then the job's scheduler states (fresh, or cached and
+                      labeled); --connect reconnects first (may prompt once).
+              pipeline finish <pipeline dir>
+                      Connect, check the job; once every task has ended: collect, evaluate each
+                      unique package (evaluate-annotations), apply all packages together and
+                      recheck once (apply-round). Safe to repeat.
               migrate-warning-ids <evaluation dir>
                       Convert an evaluation written with candidate-local introduced-warning IDs
                       (A0001-N1) to round IDs (W1001, ...), with a backup. Nothing is rerun.
@@ -113,6 +128,8 @@ public final class Main {
                         baseline failed, evaluation busy, needs migration, --reuse-from not
                         equivalent or IDs exhausted;
                         apply-round: nothing to apply, rejected, check failed or not comparable;
+                        pipeline: failed, blocked, waiting for jobs, unknown submission or
+                        nothing to submit/evaluate;
                         migrate-warning-ids: refused), 4 internal error,
                         5 inference: the shared SSH connection is not available (reconnect).""";
 
@@ -251,6 +268,29 @@ public final class Main {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);
                 return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length >= 2 && args[0].equals("pipeline")) {
+            boolean start = args[1].equals("start") && (args.length == 2 || (args.length == 4
+                    && args[2].equals("--resume")));
+            boolean status = args[1].equals("status") && (args.length == 3 || (args.length == 4
+                    && args[3].equals("--connect")));
+            boolean finish = args[1].equals("finish") && args.length == 3;
+            if (start || status || finish) {
+                try {
+                    Pipeline pipeline = new Pipeline(env, Path.of("").toAbsolutePath(),
+                            Path.of(System.getProperty("java.home")), new Pipeline.Tools(new ProcessCommandRunner(),
+                                    new TerminalCommandRunner(), System.console() != null,
+                                    (config, e) -> Checkers.create(config, e, new ProcessCommandRunner()),
+                                    InferenceCommand.sshClusters(), new JavaParserAnnotationApplier(),
+                                    new AnchoredWarningMatcher(), Clock.systemUTC()), out, err);
+                    return start ? pipeline.start(args.length == 4 ? Optional.of(args[3]) : Optional.empty())
+                            : status ? pipeline.status(args[2], args.length == 4) : pipeline.finish(args[2]);
+                } catch (RuntimeException e) {
+                    err.println("GeneralAnnotator: internal error:");
+                    e.printStackTrace(err);
+                    return ExitCode.INTERNAL_ERROR;
+                }
             }
         }
         if (args.length == 2 && args[0].equals("migrate-warning-ids")) {

@@ -24,33 +24,33 @@ import java.util.stream.Stream;
  * Failure injection covers lost connections, rejected and ambiguous submissions, corrupted uploads
  * and unavailable scheduler information. Tests play the worker by writing results remotely.
  */
-final class FakeCluster implements Cluster {
+public final class FakeCluster implements Cluster {
 
-    enum SbatchMode { SUBMIT, REJECT, UNKNOWN_AFTER_SUBMIT, UNKNOWN_BEFORE_REMOTE }
+    public enum SbatchMode { SUBMIT, REJECT, UNKNOWN_AFTER_SUBMIT, UNKNOWN_BEFORE_REMOTE }
 
     final Path root;
-    boolean connected = true;
+    public boolean connected = true;
     int disconnectAtUpload = -1;
     boolean corruptPromptAfterUpload;
     boolean disconnectAtDownload;
-    boolean schedulerUnavailable;
+    public boolean schedulerUnavailable;
     boolean loseConnectionAtQuery;
-    int queryCalls;
-    SbatchMode sbatchMode = SbatchMode.SUBMIT;
+    public int queryCalls;
+    public SbatchMode sbatchMode = SbatchMode.SUBMIT;
     String jobName = "ga-inference";
-    int uploadCalls;
-    int downloadCalls;
-    final List<String> sbatchCalls = new ArrayList<>();
+    public int uploadCalls;
+    public int downloadCalls;
+    public final List<String> sbatchCalls = new ArrayList<>();
     /** jobId → task → state. */
-    final Map<String, Map<Integer, String>> scheduler = new LinkedHashMap<>();
+    public final Map<String, Map<Integer, String>> scheduler = new LinkedHashMap<>();
     final Map<String, String> jobDirs = new LinkedHashMap<>();
     private int nextJob = 5000;
 
-    FakeCluster(Path root) {
+    public FakeCluster(Path root) {
         this.root = root;
     }
 
-    Path dir(String remote) {
+    public Path dir(String remote) {
         return root.resolve(remote.substring(1));
     }
 
@@ -184,11 +184,11 @@ final class FakeCluster implements Cluster {
         return tasks;
     }
 
-    void setAll(String jobId, String state) {
+    public void setAll(String jobId, String state) {
         scheduler.get(jobId).replaceAll((t, s) -> state);
     }
 
-    String lastJob() {
+    public String lastJob() {
         return new ArrayList<>(scheduler.keySet()).get(scheduler.size() - 1);
     }
 
@@ -270,8 +270,14 @@ final class FakeCluster implements Cluster {
     // ------------------------------------------------------------------ playing the worker
 
     /** Writes an attempt and {@code result.json} like the worker does. */
-    void workerResult(String remoteDir, String warningId, int attempt, String status, String errorKind)
+    public void workerResult(String remoteDir, String warningId, int attempt, String status, String errorKind)
             throws IOException {
+        workerResult(remoteDir, warningId, attempt, status, errorKind, null);
+    }
+
+    /** Like {@link #workerResult(String, String, int, String, String)} with this answer.json text. */
+    public void workerResult(String remoteDir, String warningId, int attempt, String status, String errorKind,
+            String answerJson) throws IOException {
         Path d = dir(remoteDir);
         Map<?, ?> submission = (Map<?, ?>) JsonParser.parse(Files.readString(d.resolve("submission.json")));
         Map<?, ?> prompt = ((List<?>) submission.get("prompts")).stream().map(o -> (Map<?, ?>) o)
@@ -294,8 +300,9 @@ final class FakeCluster implements Cluster {
             Files.writeString(attemptDir.resolve("raw-response.json"), "{\"choices\": []}\n");
             files.put("rawResponse", "raw-response.json");
             String answerStatus = status.equals("COMPLETED_PROPOSED") ? "PROPOSED" : "INSUFFICIENT_EVIDENCE";
-            Files.writeString(attemptDir.resolve("answer.json"), "{\"warningId\": \"" + warningId
-                    + "\", \"status\": \"" + answerStatus + "\", \"edits\": [], \"rationale\": \"r\"}\n");
+            Files.writeString(attemptDir.resolve("answer.json"), answerJson != null ? answerJson
+                    : "{\"warningId\": \"" + warningId + "\", \"status\": \"" + answerStatus
+                            + "\", \"edits\": [], \"rationale\": \"r\"}\n");
             files.put("answer", "answer.json");
         }
         m.put("files", files);

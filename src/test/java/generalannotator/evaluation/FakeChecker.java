@@ -22,23 +22,23 @@ import java.util.TreeMap;
  * A deterministic checker for evaluation tests: a rule turns the text of {@code src/p/A.java} in the
  * analyzed copy into an outcome. It records every request and never runs a process.
  */
-final class FakeChecker implements Checker {
+public final class FakeChecker implements Checker {
 
     /** Turns the analyzed source into findings or a failure. */
     @FunctionalInterface
-    interface Rule {
+    public interface Rule {
         CheckerOutcome analyze(Source source);
     }
 
     /** The analyzed file. */
-    record Source(Path root, Path file, String text) {
+    public record Source(Path root, Path file, String text) {
 
         List<String> lines() {
             return text.lines().toList();
         }
 
         /** A NullAway-like finding at the first line containing {@code marker}, column of the marker. */
-        Diagnostic at(String marker, String message) {
+        public Diagnostic at(String marker, String message) {
             List<String> lines = lines();
             for (int i = 0; i < lines.size(); i++) {
                 int col = lines.get(i).indexOf(marker);
@@ -52,7 +52,7 @@ final class FakeChecker implements Checker {
         }
 
         /** Findings at every line containing {@code marker}. */
-        List<Diagnostic> all(String marker, String message) {
+        public List<Diagnostic> all(String marker, String message) {
             List<Diagnostic> found = new ArrayList<>();
             List<String> lines = lines();
             for (int i = 0; i < lines.size(); i++) {
@@ -66,22 +66,22 @@ final class FakeChecker implements Checker {
         }
 
         /** Whether the first line containing {@code marker} carries an annotation. */
-        boolean annotated(String marker) {
+        public boolean annotated(String marker) {
             return lines().stream().filter(l -> l.contains(marker)).findFirst().orElse("").contains("@");
         }
     }
 
     private final Rule rule;
-    final List<AnalysisRequest> requests = new ArrayList<>();
+    public final List<AnalysisRequest> requests = new ArrayList<>();
     /** Run details by call number (1 = first call), for tool-identity tests. */
-    java.util.function.IntFunction<Map<String, Object>> details = n -> Map.of();
+    public java.util.function.IntFunction<Map<String, Object>> details = n -> Map.of();
 
-    FakeChecker(Rule rule) {
+    public FakeChecker(Rule rule) {
         this.rule = rule;
     }
 
     /** Fields x and y are reported until annotated; annotating x makes {@code return x} a new finding. */
-    static CheckerOutcome nullness(Source s) {
+    public static CheckerOutcome nullness(Source s) {
         List<Diagnostic> findings = new ArrayList<>();
         if (!s.annotated("Object x;")) {
             findings.add(s.at("x;", "@NonNull field 'x' not initialized"));
@@ -94,7 +94,7 @@ final class FakeChecker implements Checker {
         return new CheckerOutcome.CompletedAnalysis(findings, List.of());
     }
 
-    int calls() {
+    public int calls() {
         return requests.size();
     }
 

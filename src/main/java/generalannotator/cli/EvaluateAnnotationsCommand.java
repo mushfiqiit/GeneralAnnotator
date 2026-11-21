@@ -61,6 +61,7 @@ public final class EvaluateAnnotationsCommand {
     private final Clock clock;
     private final PrintStream out;
     private final PrintStream err;
+    private Path resultDirectory;
 
     public EvaluateAnnotationsCommand(String submissionArgument, Optional<String> warning, Map<String, String> env,
             Path workingDirectory, Path defaultJavaHome, CheckerFactory checkers, AnnotationApplier applier,
@@ -180,6 +181,7 @@ public final class EvaluateAnnotationsCommand {
             err.println("GeneralAnnotator: evaluation failed: " + e.getMessage());
             return ExitCode.INTERNAL_ERROR;
         }
+        resultDirectory = result.directory();
         switch (result.status()) {
             case REFUSED -> {
                 err.println("GeneralAnnotator: evaluation refused: " + result.message());
@@ -214,6 +216,11 @@ public final class EvaluateAnnotationsCommand {
                 + "successful packages are not shown to combine safely, and no fixes were inferred for introduced "
                 + "warnings.");
         return ExitCode.COMPLETED;
+    }
+
+    /** The evaluation directory of the last {@link #run()}, if one was determined. */
+    public Optional<Path> resultDirectory() {
+        return Optional.ofNullable(resultDirectory);
     }
 
     private ExitCode usage(String problem) {

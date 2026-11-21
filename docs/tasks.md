@@ -971,3 +971,70 @@ Blocked on project-spec §6.1, §6.3, and §6.4.
 ## T15 — Batching independent attempts · `blocked`
 
 Blocked on project-spec §6.5.
+
+## T16 — Resumable round-1 pipeline · `done`
+
+`pipeline start`, `pipeline status <dir> [--connect]` and `pipeline finish
+<dir>` (`generalannotator.pipeline.Pipeline`) chain the existing commands
+in-process. No stage is reimplemented.
+- **start:** validate every setting, then `check`, `slice`, `context`,
+  `prompts`, `prepare-inference` (`GA_INFERENCE_PROMPTS_PER_TASK` defaults to
+  10 here), `inference connect`, `upload` and `submit`. It returns once the job
+  ID is saved.
+- **status:** the recorded stages plus `inference status`; scheduler states
+  and prompt results are kept apart, and cached data is labeled.
+- **finish:** connect and query; once every task is terminal, `collect`,
+  `evaluate-annotations` and `apply-round`.
+- **Outcomes:** FAILED, NO_WARNINGS, NO_ELIGIBLE_PROMPTS, RECONNECT_REQUIRED,
+  SUBMISSION_UNKNOWN, SUBMITTED, WAITING_FOR_JOBS, NO_PACKAGES, BLOCKED,
+  PARTIAL and COMPLETED, each with exclusions per stage and warning.
+- **State:** the run directory is the pipeline directory. `pipeline.json`
+  holds the fingerprinted settings (every `GA_*` except SSH transport), the
+  snapshot hash, the checker identity, stage records, artifacts, submission
+  and job IDs, and exclusions; `pipeline-summary.txt` is the readable version.
+  Writes are atomic and one writer holds the lock.
+- **Resume:** only with unchanged settings and snapshot. Slicing resumes per
+  missing warning, the submission is prepared once, and sbatch is never
+  repeated (a recorded job is reused; UNKNOWN needs `inference attach`).
+  Repeated `finish` reuses the collection, evaluations and round result.
+
+Small hooks in existing commands:
+- `CheckCommand`: checker factory and run directory;
+- `EvaluateAnnotationsCommand.resultDirectory`;
+- `ApplyRoundCommand.result`;
+- `SliceCommand.configurationProblems`;
+- `FakeChecker` and `FakeCluster` made public for tests.
+
+Verified by `PipelineTest` (fake NullAway, Specimin, ssh, terminal, cluster and
+worker), which covers:
+- stage order without intervention, one login, task sizes [10, 2] for 12
+  prompts, one sbatch, no monitoring, and an unchanged target;
+- invalid settings creating no directory;
+- a failed baseline;
+- no warnings;
+- excluded prompts, and no eligible prompt;
+- an interrupted start: a failed login, then a mid-slicing interruption
+  resumed per warning; changed settings refused; one submission;
+- an UNKNOWN sbatch outcome never resubmitted and blocking finish;
+- status cached after a disconnect, and fresh with `--connect`;
+- finish while tasks are active (nothing collected);
+- a full finish with stale-master recovery: one new login, PARTIAL for a
+  failed prompt, merged packages, a two-edit package, independent
+  evaluations before the combined check, and the comparison;
+- a repeated finish that changes nothing;
+- a conflicting round (BLOCKED, evaluations kept);
+- a failed combined check (FAILED).
+
+`MainTest` covers dispatch.
+
+Manual, offline (an unreachable SSH target, no terminal): `pipeline start` with
+real NullAway and Specimin on EventBus ran stages 1–5 unattended in about 40 s.
+- It found 42 warnings and prepared 41 prompts in 5 tasks; W0033 was excluded
+  (initializer block).
+- It stopped as RECONNECT_REQUIRED without contacting anything.
+- `--resume` skipped every completed stage.
+- The EventBus checkout was unchanged.
+
+**Not verified:** a real submission, collection and disconnected run through
+`pipeline`, and a real `finish`. Its stages were verified separately on real
+data before (T8b–T8d).

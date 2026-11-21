@@ -40,6 +40,7 @@ public final class ApplyRoundCommand {
     private final Clock clock;
     private final PrintStream out;
     private final PrintStream err;
+    private RoundApplication.Result result;
 
     public ApplyRoundCommand(String submissionArgument, String roundArgument, Map<String, String> env,
             Path workingDirectory, Path defaultJavaHome, EvaluateAnnotationsCommand.CheckerFactory checkers,
@@ -121,11 +122,17 @@ public final class ApplyRoundCommand {
             err.println("GeneralAnnotator: apply-round failed: " + e.getMessage());
             return ExitCode.INTERNAL_ERROR;
         }
+        this.result = result;
         if (result.status() == RoundApplication.Status.BUSY) {
             return ExitCode.EXECUTION_FAILURE;
         }
         report(result);
         return result.status() == RoundApplication.Status.COMPLETED ? ExitCode.COMPLETED : ExitCode.EXECUTION_FAILURE;
+    }
+
+    /** The result of the last {@link #run()} that reached the round application. */
+    public java.util.Optional<RoundApplication.Result> result() {
+        return java.util.Optional.ofNullable(result);
     }
 
     private void report(RoundApplication.Result result) {

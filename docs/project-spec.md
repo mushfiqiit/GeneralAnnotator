@@ -14,8 +14,10 @@ the checker; answers proposing exactly the same set share the package. The
 results are recorded as an expanded graph (T8, T8b, T8c,
 `evaluate-annotations`). All packages of round 1 can also be applied together
 to one copy and checked once, saving every finding of that combined state
-(T8d, `apply-round`). Annotation sequences, inference on a combined state
-(round 2), an append-only transition log and search are not implemented.
+(T8d, `apply-round`). `pipeline start` and `pipeline finish` run the whole
+round with two commands, resumably (T16). Annotation sequences, inference on a
+combined state (round 2), an append-only transition log and search are not
+implemented.
 
 ## 1. Purpose
 
@@ -467,6 +469,22 @@ interface or in one named class), labeled provisional, and noted here.
     open (§6.3, §6.4).
   - **Publication.** Results are published by an atomic rename and never
     overwritten. Failed attempts are kept as `-failed-<time>`.
+- **Pipeline orchestration (T16).** Provisional, in `pipeline.Pipeline`:
+  - **Composition.** The existing commands are called in-process; the run
+    directory is the pipeline directory and `pipeline.json` its state.
+  - **Resume.** Completed stages are reused only while every `GA_*` setting
+    except SSH transport settings and the snapshot tree hash are unchanged.
+    Finer per-stage input tracking is open.
+  - **Batching.** `GA_INFERENCE_PROMPTS_PER_TASK` defaults to 10 in the
+    pipeline (1 for `prepare-inference` alone).
+  - **Partial results.** Excluded prompts or failed answers make a finished
+    pipeline PARTIAL; insufficient-evidence answers don't. Whether failed
+    prompts should be retried automatically is open (they are not).
+  - **No automatic retries.** Nothing is resubmitted automatically, and an
+    UNKNOWN sbatch outcome waits for `inference attach`.
+  - **Blocked rounds.** A rejected combined round is BLOCKED and keeps the
+    independent evaluations. How conflicting packages should be reconciled
+    is open (see T8d).
 - Isolation mechanism for *multiple* repository states (copy per state, `git
   worktree`, overlay, etc.) and how states are identified. **Provisional (T8):**
   - Each attempt is an explicit file copy of the baseline copy
@@ -570,6 +588,7 @@ interface or in one named class), labeled provisional, and noted here.
 | 4. Propose (manual / LLM) | Prompt units (`prompts`), Wulver submissions with a GPU worker (`prepare-inference`), and upload, submission, monitoring, collection and retry over one shared SSH connection (`inference`), with a submit, disconnect, reconnect and collect workflow (T13e). Used on Wulver (jobs 1628816 and 1629432); the T13e health check and stale-connection recovery are tested with fakes only. Proposals are applied by `apply-proposal` and evaluated by `evaluate-annotations`. |
 | 5. Apply and recheck | `apply-proposal` applies a proposal's edits, all or nothing, to a snapshot copy (`applications/`). `evaluate-annotations` applies each distinct complete edit set (equivalent answers merged) as one package to a copy of one baseline, reruns NullAway once on all source roots and compares findings with the provisional `anchored-1` rule (T8, T8b, T8c). Verified with fakes and manually on EventBus (39 answers, 27 unique packages, all completed). |
 | 5b. Apply a whole round | `apply-round --round 1` applies all validated packages together to one snapshot copy, checks it once and saves every finding with its comparison; the result can serve as the next round's run (T8d). Verified with fakes and manually on EventBus (27 packages, 42 → 19 findings). |
+| 5c. Whole pipeline | `pipeline start` (analysis to submission) and `pipeline finish` (collection, independent evaluation, combined application), resumable, with `pipeline status` (T16). Verified with fakes; stages 1–5 also with real tools offline. A real submission through `pipeline` is not verified. |
 | 6. Record | Partly: per-attempt records, summary and the expanded graph (T8). No append-only state-transition log (T9). |
 | 7. Explore and select | Not implemented; blocked on §6 decisions |
 | 8. Batch | Not implemented; blocked on §6 decisions |

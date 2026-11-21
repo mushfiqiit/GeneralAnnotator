@@ -56,9 +56,20 @@ public final class CheckCommand {
     private final Clock clock;
     private final PrintStream out;
     private final PrintStream err;
+    private final EvaluateAnnotationsCommand.CheckerFactory checkers;
+    private Path runDirectory;
 
     public CheckCommand(Map<String, String> env, Path workingDirectory, Path defaultJavaHome,
             CommandRunner runner, Clock clock, PrintStream out, PrintStream err) {
+        this(env, workingDirectory, defaultJavaHome, runner, (c, e) -> Checkers.create(c, e, runner), clock, out,
+                err);
+    }
+
+    /** With an explicit checker factory (the pipeline passes its own; tests pass fakes). */
+    public CheckCommand(Map<String, String> env, Path workingDirectory, Path defaultJavaHome,
+            CommandRunner runner, EvaluateAnnotationsCommand.CheckerFactory checkers, Clock clock, PrintStream out,
+            PrintStream err) {
+        this.checkers = checkers;
         this.env = Map.copyOf(env);
         this.workingDirectory = workingDirectory;
         this.defaultJavaHome = defaultJavaHome;
@@ -74,7 +85,7 @@ public final class CheckCommand {
         Checker checker;
         try {
             config = new ConfigLoader(env, workingDirectory, defaultJavaHome).load();
-            checker = Checkers.create(config, env, runner);
+            checker = checkers.create(config, env);
         } catch (ConfigurationException e) {
             err.println("GeneralAnnotator: invalid configuration:");
             e.problems().forEach(p -> err.println("  - " + p));
@@ -100,6 +111,7 @@ public final class CheckCommand {
             err.println("GeneralAnnotator: cannot create run directory in " + config.outputDirectory() + ": " + e);
             return ExitCode.INTERNAL_ERROR;
         }
+        runDirectory = runDir;
 
         WorkingCopy copy = null;
         List<RecordedCommand> isolationCommands = List.of();
@@ -154,6 +166,11 @@ public final class CheckCommand {
         printSummary(config, copy, checkerRun, outcome, reportFile, warningsFile, graphFile, graph, exit,
                 targetsFile, targets);
         return exit;
+    }
+
+    /** The run directory created by {@link #run()}, if it got that far. */
+    public Optional<Path> runDirectory() {
+        return Optional.ofNullable(runDirectory);
     }
 
     private void printSummary(AnalysisConfig config, WorkingCopy copy, CheckerRun run, CheckerOutcome outcome,

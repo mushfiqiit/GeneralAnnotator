@@ -128,6 +128,158 @@ reduced to minimal prefixes. NullAway already covers sub-packages, so for exampl
 packages are never merged into a common parent. Files in the unnamed package
 cannot be covered and are reported as a coverage limitation.
 
+## Running the whole pipeline (`pipeline start | status | finish`)
+
+Two commands do a whole round: `pipeline start` analyzes, prepares inference
+and submits it; `pipeline finish` collects the results and runs the whole
+local evaluation. They call the existing commands in-process, in order, and
+record everything in `pipeline.json` inside the run directory, which is the
+pipeline directory.
+
+**Setup.** One shell holds every setting. These are the same variables the
+individual commands use:
+
+```sh
+cd ~/Documents/GeneralAnnotator
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)
+./gradlew installDist                                  # the installed launcher can prompt for the login
+GA=build/install/GeneralAnnotator/bin/GeneralAnnotator
+
+# NullAway, target, source roots, classpath
+export GA_CHECKER=nullaway
+export GA_CHECKER_HOME=$HOME/Documents/NullAway
+export GA_TARGET_PROJECT=$HOME/Documents/EventBus
+export GA_TARGET_SOURCE_ROOTS=EventBus/src
+export GA_TARGET_CLASSPATH=$HOME/.gradle/caches/modules-2/files-2.1/org.jspecify/jspecify/1.0.0/7425a601c1c7ec76645a78d22b8c6a627edee507/jspecify-1.0.0.jar
+# export GA_CHECKER_JAVA_HOME=...  GA_JAVAC_RELEASE=...  GA_TIMEOUT_SECONDS=...  GA_OUTPUT_DIR=runs
+# Specimin
+export GA_SPECIMIN_HOME=$HOME/Documents/specimin
+# Cluster connection (defaults shown) and Slurm/LLM settings (see "Preparing Wulver inference")
+export GA_SSH_TARGET=mc2399@wulver.njit.edu
+export GA_REMOTE_BASE=/project/mjk76/mc2399
+# export GA_SLURM_ACCOUNT=mjk76 GA_SLURM_PARTITION=gpu GA_SLURM_TIME=02:00:00 GA_INFERENCE_MODEL=...
+export GA_INFERENCE_PROMPTS_PER_TASK=10                # 1-10; the pipeline's default is 10
+```
+
+**Commands:**
+
+```sh
+$GA pipeline start                       # analyze, slice, context, prompts, prepare, log in once, submit
+$GA pipeline status runs/<run id>        # recorded stages + scheduler states (cached if offline)
+$GA pipeline status runs/<run id> --connect   # reconnect first (may prompt once)
+$GA pipeline finish runs/<run id>        # once all tasks ended: collect, evaluate, apply the round
+$GA pipeline start --resume runs/<run id>     # continue an interrupted start; never submits twice
+```
+
+**`pipeline start`**
+1. **Validation.** Every setting (checker, classpath, Specimin, Slurm/LLM,
+   SSH) is checked before anything runs. Problems are listed, and no
+   directory is created.
+2. **Analysis (`check`).** A new run directory, a full snapshot copy of the
+   target, NullAway findings, `warning-graph.json` and `warning-targets.json`.
+   A failed analysis stops the pipeline (FAILED); a clean one ends it
+   (NO_WARNINGS).
+3. **Per warning.**
+   - `slice`: one Specimin run per warning. Unresolved targets are SKIPPED,
+     failed slices are FAILED, and slices are never reproduction-validated.
+   - `context`: usage context for each warning.
+   - `prompts`: one warning per prompt; OVERSIZED and SKIPPED prompts are
+     kept with their reasons.
+   Every exclusion is recorded in `pipeline.json`. If no prompt is
+   GENERATED, the pipeline ends as NO_ELIGIBLE_PROMPTS without a job.
+4. **Preparation (`prepare-inference`).** One immutable submission, with at
+   most `GA_INFERENCE_PROMPTS_PER_TASK` (default 10) prompts per array task.
+   Each prompt stays a separate LLM request.
+5. **Submission.** `inference connect` reuses a healthy SSH master, or stops
+   a stale managed one and opens one with a single login in this terminal.
+   Then `upload` (verified by hash) and `submit`. The job ID is saved and
+   the command returns; nothing is monitored.
+   - Without a terminal (for example under `./gradlew run`), or without a
+     connection, it stops as RECONNECT_REQUIRED with the exact login command.
+     Everything prepared is kept, and `--resume` continues.
+   - An ambiguous sbatch result is SUBMISSION_UNKNOWN. It is never
+     resubmitted; resolve it with `inference attach` (the command prints
+     how).
+
+After a confirmed submission, the job runs on the cluster without this
+terminal, the SSH master, the VPN or the laptop.
+
+**`pipeline status`** shows the recorded stages, then runs `inference status`.
+- **Scheduler states** (array tasks) and **prompt results** (from the last
+  collection) are shown separately.
+- Without a usable connection, the last scheduler snapshot is shown, labeled
+  CACHED, with the transport failure.
+- It never prompts unless `--connect` is given, and never resubmits.
+
+**`pipeline finish`**
+1. **Connect and check the job.** It reconnects (one login if needed; stale
+   masters are recovered) and queries the job. If any task is still active,
+   or the scheduler gives no information, it reports WAITING_FOR_JOBS and
+   collects nothing.
+2. **Collect.** Once every task has ended, `inference collect` downloads and
+   verifies the results. Hash or identity problems keep the affected results
+   out. Failed or missing prompts are recorded as exclusions and make the
+   pipeline PARTIAL; they are not retried automatically.
+3. **Evaluate (`evaluate-annotations`).** Each answer becomes one atomic
+   package, and answers with identical edit sets share one. Each unique
+   package is evaluated alone against the pipeline baseline, and the
+   expanded graph is written (`W -> A` resolved-by, `A -> N` introduces, round
+   IDs).
+4. **Apply the whole round (`apply-round`).** The union of all packages is
+   applied to one fresh full copy, and NullAway runs once on the combined
+   state. Its complete warning set and comparison are saved. A conflicting
+   edit set blocks this stage (BLOCKED) and keeps the independent
+   evaluations. A failed combined check is FAILED, never zero warnings.
+5. **Outcome.** COMPLETED, or PARTIAL when some prompts or answers were
+   excluded (answers with insufficient evidence don't count as failures).
+
+**State and resume.**
+- **`pipeline.json`** records:
+  - pipeline ID, round and status;
+  - the fingerprinted settings (every `GA_*` except SSH transport settings);
+  - snapshot hash and checker identity;
+  - each stage's status, details and artifacts;
+  - submission and job IDs;
+  - exclusions.
+  `pipeline-summary.txt` is the short readable version.
+- **Resuming.** Stages are resumed only if the settings and the snapshot
+  hash are unchanged; otherwise the command refuses and names what changed.
+  A stage interrupted while RUNNING is redone, and slicing continues with the
+  warnings that have no result yet.
+- **Repeating `finish`** is safe: the collection is not repeated once complete,
+  and evaluations and round results are reused by key, so nothing is
+  duplicated.
+- **Locking and writes.** One writer at a time holds the lock, and every
+  record is written atomically.
+- **Isolation.** All work stays in the pipeline directory: snapshot, reports,
+  graph, slices, context, prompts, submission, collected answers,
+  `evaluations/`, `rounds/`, `pipeline.json` and the summary. The target
+  checkout is only read. Baseline, independent and combined checks analyze
+  the same configured source roots, and modules outside them are reported as
+  not analyzed. The combined result can be the next round's run, but no
+  next round is started.
+
+| Exit | `pipeline` meaning |
+|---|---|
+| 0 | `start`: submitted or no warnings; `status`: fresh scheduler states (or nothing submitted); `finish`: COMPLETED or PARTIAL |
+| 2 | Invalid settings or arguments, or settings changed since the pipeline started |
+| 3 | FAILED, BLOCKED, NO_ELIGIBLE_PROMPTS, NO_PACKAGES, SUBMISSION_UNKNOWN or WAITING_FOR_JOBS, or another process holds the pipeline |
+| 4 | Internal error (completed stages are kept) |
+| 5 | The SSH connection is not available: reconnect (VPN), then rerun; progress is kept |
+
+**Verification so far.**
+- **Fakes:** the whole flow is covered by deterministic tests with fake
+  NullAway, Specimin, ssh, terminal login, cluster and worker.
+- **Real tools, offline:** `pipeline start` with real NullAway and Specimin
+  on EventBus used an unreachable SSH target, no terminal and an empty socket
+  directory. Stages 1–5 ran unattended in about 40 seconds: 42 warnings, and
+  41 prompts in 5 array tasks of at most 10. W0033 (an initializer block) was
+  excluded and reported. It stopped as RECONNECT_REQUIRED without contacting
+  anything, `--resume` skipped every completed stage, and EventBus stayed
+  unchanged.
+- **Not verified:** a real submission and a real disconnected run have not
+  been done through `pipeline`.
+
 ## Visualizing a warning graph
 
 `visualize` renders an existing `warning-graph.json` with Graphviz. It does
@@ -1812,6 +1964,7 @@ mismatched javac counts, or an exit code inconsistent with the diagnostics).
 
 ```
 src/main/java/generalannotator/
+  pipeline/     the resumable round-1 pipeline over the existing commands (pipeline.json)
   cli/          check, visualize, targets, slice, context, prompts, prepare-inference, inference,
                 apply-proposal, evaluate-annotations, apply-round and migrate-warning-ids commands; exit codes
   config/       environment configuration and validation

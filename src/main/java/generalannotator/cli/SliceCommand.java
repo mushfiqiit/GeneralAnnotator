@@ -70,6 +70,15 @@ public final class SliceCommand {
         this.err = err;
     }
 
+    /** Problems with the Specimin settings in {@code env}, checked without running anything. */
+    public static List<String> configurationProblems(Map<String, String> env, Path defaultJavaHome) {
+        List<String> problems = new ArrayList<>();
+        new SliceCommand(".", Optional.empty(), env, Path.of("."), defaultJavaHome, spec -> {
+            throw new IllegalStateException("nothing runs during validation");
+        }, System.out, System.err).config(problems);
+        return problems;
+    }
+
     /** Validated configuration. */
     record Config(Path speciminHome, Path javaHome, Optional<Path> jarPath, Duration timeout) {}
 

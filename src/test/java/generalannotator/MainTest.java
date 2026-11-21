@@ -113,6 +113,22 @@ class MainTest {
     }
 
     @Test
+    void pipelineCommandsAreDispatchedAndValidateTheirArguments() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "pipeline", "status", "no-such-dir"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("is not a pipeline directory"));
+        err.reset();
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "pipeline", "start"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("invalid pipeline configuration"));
+        err.reset();
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "pipeline", "finish"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("unknown arguments"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        String usage = out.toString(StandardCharsets.UTF_8);
+        assertTrue(usage.contains("pipeline start [--resume <pipeline dir>]") && usage.contains(
+                "pipeline status <pipeline dir> [--connect]") && usage.contains("pipeline finish <pipeline dir>"));
+    }
+
+    @Test
     void applyRoundCommandIsDispatchedAndRequiresRoundOne() {
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "apply-round", "dir"));
         err.reset();
