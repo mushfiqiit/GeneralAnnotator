@@ -283,6 +283,49 @@ class WorkerRunTest(unittest.TestCase):
         self.assertEqual("STARTUP_TIMEOUT", self.result("W0001")["errorKind"])
         self.assert_server_stopped()
 
+    def test_the_configured_1800_second_startup_deadline_is_honored(self):
+        # A fake clock: each health poll advances 60 virtual seconds, so an 1800 s deadline allows 30 polls
+        # (an old 1200 s deadline would have stopped after 20). Nothing really waits for half an hour.
+        self.submission = self.make_submission(["W0001"], tasks=[["W0001"]], startupTimeoutSeconds=1800)
+        clock = {"now": 0.0, "polls": 0}
+        poll = 0.1  # healthPollSeconds of make_submission
+
+        def monotonic():
+            return clock["now"]
+
+        def sleep(seconds):
+            if seconds == poll:
+                clock["polls"] += 1
+                clock["now"] += 60
+            else:
+                clock["now"] += seconds
+
+        with mock.patch.object(worker.time, "monotonic", monotonic), mock.patch.object(worker.time, "sleep", sleep):
+            self.assertEqual(worker.EXIT_TASK_FAILURE, self.run_task(mode="never-ready"))
+        r = self.result("W0001")
+        self.assertEqual(("FAILED", "STARTUP_TIMEOUT"), (r["status"], r["errorKind"]))
+        self.assertIn("not healthy after 1800s", r["error"])
+        self.assertEqual(30, clock["polls"], "the server got the whole 1800 s, not less")
+
+    def test_with_one_prompt_per_task_a_startup_failure_affects_only_that_prompt(self):
+        ids = ["W0001", "W0002", "W0003"]
+        self.submission = self.make_submission(ids, tasks=[[w] for w in ids])
+        self.responses = {w: {"content": json.dumps(answer(w))} for w in ids}
+
+        self.assertEqual(worker.EXIT_TASK_FAILURE, self.run_task(task=1, mode="crash"))
+        self.assertEqual(("FAILED", "STARTUP_FAILED"), (self.result("W0002")["status"], self.result("W0002")["errorKind"]))
+        for other in ("W0001", "W0003"):
+            self.assertFalse((self.submission / "results" / other).exists(), f"{other} belongs to another task")
+        task = json.loads((self.submission / "results" / "tasks" / "task-0001.json").read_text())
+        self.assertEqual("STARTUP_FAILED", task["taskError"]["kind"])
+        self.assertEqual(["W0002"], [p["warningId"] for p in task["prompts"]])
+
+        self.assertEqual(worker.EXIT_OK, self.run_task(task=0))
+        self.assertEqual(worker.EXIT_OK, self.run_task(task=2))
+        self.assertEqual("COMPLETED_PROPOSED", self.result("W0001")["status"])
+        self.assertEqual("COMPLETED_PROPOSED", self.result("W0003")["status"])
+        self.assertEqual("STARTUP_FAILED", self.result("W0002")["errorKind"], "the failed prompt is unchanged")
+
     def test_no_model_outside_a_gpu_job(self):
         self.assertEqual(worker.EXIT_TASK_FAILURE, self.run_task(drop=("SLURM_JOB_ID",)))
         self.assertEqual("NOT_IN_SLURM_JOB", self.result("W0001")["errorKind"])

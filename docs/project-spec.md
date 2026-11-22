@@ -306,7 +306,8 @@ interface or in one named class), labeled provisional, and noted here.
   historical served name, 32768 context and `qwen3` parser; sampling 0.6 /
   0.95 / top-k 20 / seed 0 from the Qwen3 model card; `max_tokens` 0 (rest of
   the context, because 16384 truncated answers historically); a minimum of
-  70000 MiB of GPU memory; 2 hours per task; array concurrency 4.
+  70000 MiB of GPU memory; 2 hours per task; array concurrency 4; one prompt
+  per task; an 1800 s startup timeout (raised from 1200 s in T16a).
 
 - **Wulver transfer and submission (T13c).** OpenSSH connection sharing: one
   interactive login (password and Duo) in the user's terminal opens a
@@ -473,10 +474,18 @@ interface or in one named class), labeled provisional, and noted here.
   - **Composition.** The existing commands are called in-process; the run
     directory is the pipeline directory and `pipeline.json` its state.
   - **Resume.** Completed stages are reused only while every `GA_*` setting
-    except SSH transport settings and the snapshot tree hash are unchanged.
-    Finer per-stage input tracking is open.
-  - **Batching.** `GA_INFERENCE_PROMPTS_PER_TASK` defaults to 10 in the
-    pipeline (1 for `prepare-inference` alone).
+    except transport, inference and Slurm settings, and the snapshot tree hash,
+    are unchanged. Inference and Slurm settings only shape the immutable
+    submission, which keeps its own `settings.json`. Finer per-stage input
+    tracking is open.
+  - **Defaults (T16a).** The pipeline adds no defaults of its own. It uses the
+    `InferenceSettings` defaults: one prompt per array task, an 1800 s vLLM
+    startup timeout, and concurrency 4.
+    - One prompt per task confines a server startup failure to one prompt.
+    - The timeout is the readiness deadline (loading, compilation, CUDA graph
+      capture), not the request timeout.
+    - On EventBus, two of five 10-prompt tasks hit the earlier 1200 s limit.
+      Whether 1800 s is enough on Wulver is unverified.
   - **Partial results.** Excluded prompts or failed answers make a finished
     pipeline PARTIAL; insufficient-evidence answers don't. Whether failed
     prompts should be retried automatically is open (they are not).

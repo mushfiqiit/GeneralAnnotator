@@ -158,8 +158,28 @@ export GA_SPECIMIN_HOME=$HOME/Documents/specimin
 export GA_SSH_TARGET=mc2399@wulver.njit.edu
 export GA_REMOTE_BASE=/project/mjk76/mc2399
 # export GA_SLURM_ACCOUNT=mjk76 GA_SLURM_PARTITION=gpu GA_SLURM_TIME=02:00:00 GA_INFERENCE_MODEL=...
-export GA_INFERENCE_PROMPTS_PER_TASK=10                # 1-10; the pipeline's default is 10
+# Defaults: one prompt per array task, 1800 s vLLM startup timeout, at most 4 tasks at once.
+# export GA_INFERENCE_PROMPTS_PER_TASK=1 GA_INFERENCE_STARTUP_TIMEOUT_SECONDS=1800 GA_INFERENCE_ARRAY_CONCURRENCY=4
+unset GA_OUTPUT_DIR                                    # runs go to ./runs (created if missing)
 ```
+
+**Starting from scratch.** The pipeline needs no earlier run, submission,
+answer, graph or application directory. `runs/` may be empty or absent; every
+run artifact is created from these inputs:
+- the target project (`GA_TARGET_PROJECT`);
+- the NullAway checkout (`GA_CHECKER_HOME`) and the Specimin checkout
+  (`GA_SPECIMIN_HOME`);
+- the classpath jar;
+- the model weights in the cluster's cache (`GA_INFERENCE_HF_HOME`).
+
+Two settings matter:
+- **`GA_TARGET_PROJECT`** must be a real source project that survives
+  deleting `runs/`, for example `~/Documents/EventBus`. It must not be a
+  generated workspace under `runs/` (`applications/<id>/workspace`,
+  `rounds/<id>/workspace/target`, or a snapshot).
+- **`GA_OUTPUT_DIR`** should be unset (the default is `runs`) or point outside
+  any earlier run. A leftover value from an earlier `apply-proposal` recheck
+  would nest new pipelines inside an old run.
 
 **Commands:**
 
@@ -187,9 +207,18 @@ $GA pipeline start --resume runs/<run id>     # continue an interrupted start; n
      kept with their reasons.
    Every exclusion is recorded in `pipeline.json`. If no prompt is
    GENERATED, the pipeline ends as NO_ELIGIBLE_PROMPTS without a job.
-4. **Preparation (`prepare-inference`).** One immutable submission, with at
-   most `GA_INFERENCE_PROMPTS_PER_TASK` (default 10) prompts per array task.
-   Each prompt stays a separate LLM request.
+4. **Preparation (`prepare-inference`).** One immutable submission. By default
+   each array task gets exactly one prompt (`GA_INFERENCE_PROMPTS_PER_TASK`,
+   1 to 10), and its vLLM server has 1800 s to become ready
+   (`GA_INFERENCE_STARTUP_TIMEOUT_SECONDS`). At most
+   `GA_INFERENCE_ARRAY_CONCURRENCY` (default 4) tasks run at once, and each
+   prompt is a separate LLM request. The command prints the effective batch
+   size, startup timeout and concurrency, and records them in `pipeline.json`.
+   - **Why one prompt per task:** a server that fails to start (STARTUP_FAILED,
+     STARTUP_TIMEOUT) then costs only its own prompt.
+   - **What the longer timeout does not do:** it guarantees nothing. Startup
+     failures stay separate from answer-validation failures (INVALID_ANSWER
+     and others), and answer validation is unchanged.
 5. **Submission.** `inference connect` reuses a healthy SSH master, or stops
    a stale managed one and opens one with a single login in this terminal.
    Then `upload` (verified by hash) and `submit`. The job ID is saved and
@@ -244,6 +273,9 @@ terminal, the SSH master, the VPN or the laptop.
   `pipeline-summary.txt` is the short readable version.
 - **Resuming.** Stages are resumed only if the settings and the snapshot
   hash are unchanged; otherwise the command refuses and names what changed.
+  Inference and Slurm settings (`GA_INFERENCE_*`, `GA_SLURM_*`) are not
+  compared: they only shape the immutable submission, which keeps its own
+  `settings.json`. If they differ, a note says so.
   A stage interrupted while RUNNING is redone, and slicing continues with the
   warnings that have no result yet.
 - **Repeating `finish`** is safe: the collection is not repeated once complete,
@@ -273,7 +305,8 @@ terminal, the SSH master, the VPN or the laptop.
 - **Real tools, offline:** `pipeline start` with real NullAway and Specimin
   on EventBus used an unreachable SSH target, no terminal and an empty socket
   directory. Stages 1–5 ran unattended in about 40 seconds: 42 warnings, and
-  41 prompts in 5 array tasks of at most 10. W0033 (an initializer block) was
+  41 prompts in 5 array tasks of at most 10 (the pipeline's default batch size at
+  the time; it is now one prompt per task). W0033 (an initializer block) was
   excluded and reported. It stopped as RECONNECT_REQUIRED without contacting
   anything, `--resume` skipped every completed stage, and EventBus stayed
   unchanged.
@@ -903,7 +936,7 @@ startup failure).
 | `GA_INFERENCE_MAX_TOKENS` | 0 | `max_tokens` per answer; 0 leaves the rest of the context |
 | `GA_INFERENCE_MIN_COMPLETION_TOKENS` | 4096 | answer tokens a prompt must leave free when `MAX_TOKENS` is 0 |
 | `GA_INFERENCE_PORT` / `_PORT_ATTEMPTS` | 0 / 3 | fixed port (0 picks a free one) and start attempts |
-| `GA_INFERENCE_STARTUP_TIMEOUT_SECONDS` | 1200 | wait for `/health` |
+| `GA_INFERENCE_STARTUP_TIMEOUT_SECONDS` | 1800 | deadline for the vLLM server to become ready (`/health`): model loading, compilation and CUDA graph capture. Not the request timeout. 10 to 86400 |
 | `GA_INFERENCE_HEALTH_POLL_SECONDS` | 5 | polling interval |
 | `GA_INFERENCE_REQUEST_TIMEOUT_SECONDS` | 2700 | one request |
 | `GA_INFERENCE_STOP_TIMEOUT_SECONDS` | 30 | grace period when stopping the server |

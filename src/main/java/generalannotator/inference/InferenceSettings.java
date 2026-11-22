@@ -101,7 +101,8 @@ public record InferenceSettings(
                     "answer tokens a prompt must leave free (checked before sending)"),
             new Variable("GA_INFERENCE_PORT", "0", "server port, or 0 for a free port"),
             new Variable("GA_INFERENCE_PORT_ATTEMPTS", "3", "server start attempts on port collisions"),
-            new Variable("GA_INFERENCE_STARTUP_TIMEOUT_SECONDS", "1200", "wait for /health"),
+            new Variable("GA_INFERENCE_STARTUP_TIMEOUT_SECONDS", "1800", "deadline for vLLM readiness (/health): "
+                    + "model loading, compilation and CUDA graph capture; not the request timeout"),
             new Variable("GA_INFERENCE_HEALTH_POLL_SECONDS", "5", "/health polling interval"),
             new Variable("GA_INFERENCE_REQUEST_TIMEOUT_SECONDS", "2700", "timeout of one request"),
             new Variable("GA_INFERENCE_STOP_TIMEOUT_SECONDS", "30", "grace period when stopping the server"),

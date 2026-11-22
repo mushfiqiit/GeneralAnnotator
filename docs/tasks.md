@@ -1008,7 +1008,8 @@ Small hooks in existing commands:
 Verified by `PipelineTest` (fake NullAway, Specimin, ssh, terminal, cluster and
 worker), which covers:
 - stage order without intervention, one login, task sizes [10, 2] for 12
-  prompts, one sbatch, no monitoring, and an unchanged target;
+  prompts (the batch default of that time; one prompt per task since T16a),
+  one sbatch, no monitoring, and an unchanged target;
 - invalid settings creating no directory;
 - a failed baseline;
 - no warnings;
@@ -1038,3 +1039,46 @@ real NullAway and Specimin on EventBus ran stages 1–5 unattended in about 40 s
 **Not verified:** a real submission, collection and disconnected run through
 `pipeline`, and a real `finish`. Its stages were verified separately on real
 data before (T8b–T8d).
+
+## T16a — One prompt per task and a 30-minute startup timeout · `done`
+
+On EventBus, two of the five 10-prompt array tasks failed with exit code 4:
+their vLLM servers were not ready within 1200 s, so all 20 of their prompts
+failed with them.
+- **New defaults.** `GA_INFERENCE_PROMPTS_PER_TASK` defaults to 1 (the
+  pipeline no longer forces 10), and `GA_INFERENCE_STARTUP_TIMEOUT_SECONDS` to
+  1800. Explicit values (1 to 10 prompts per task; 10 to 86400 seconds) still
+  apply and are validated, and array concurrency is unchanged (4).
+- **Propagation.** The defaults reach the submission's `settings.json` and
+  `submission.json` task assignments, the batch script's `--array` range, and
+  the worker's readiness deadline. The pipeline prints the effective batch
+  size, startup timeout and concurrency, and records them per preparation.
+- **Existing pipelines.** Inference and Slurm settings are no longer part of
+  the resume fingerprint, so a pipeline prepared under the old default still
+  finishes. A note reports the submission's own settings. Existing
+  submissions are immutable and keep theirs.
+- **Fresh starts.** A fresh start needs no earlier run artifacts. The docs say
+  that `GA_TARGET_PROJECT` must be a source project that survives deleting
+  `runs/`, and that `GA_OUTPUT_DIR` should be unset.
+- **Unchanged:** startup failures (STARTUP_FAILED, STARTUP_TIMEOUT) stay
+  distinct from answer-validation failures, and answer validation is not
+  weakened.
+
+Verified by:
+- `InferenceDefaultsTest`: the defaults; 41 eligible prompts becoming 41
+  single-prompt tasks, each assigned once, with `--array=0-40%4` and
+  `startupTimeoutSeconds` 1800; overrides and invalid values.
+- `PipelineTest`:
+  - a fresh start without `runs/` giving 41 single-prompt tasks and one
+    array job;
+  - explicit overrides applied and invalid ones refused;
+  - one task's startup failure excluding only its prompt (PARTIAL);
+  - a pipeline recorded under the old default still finishing;
+  - the earlier submission, reconnect, finish and resume scenarios.
+- Worker tests:
+  - the worker honours an 1800 s readiness deadline (30 polls of 60 virtual
+    seconds);
+  - with one prompt per task, a startup failure affects only that task's
+    prompt, and the other tasks complete.
+
+Not verified: whether 1800 s is enough for the 27B model on Wulver nodes.

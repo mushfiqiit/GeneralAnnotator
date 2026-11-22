@@ -264,7 +264,11 @@ class PipelineTest {
         }
         assertEquals("PENDING", stage("collection").get("status"));
         assertEquals(12L, stage("analysis").get("warnings"));
-        assertEquals(List.of(10L, 2L), stage("preparation").get("taskSizes"), "at most 10 prompts per array task");
+        assertEquals(java.util.Collections.nCopies(12, 1L), stage("preparation").get("taskSizes"),
+                "one prompt per array task by default");
+        assertEquals(1800L, stage("preparation").get("startupTimeoutSeconds"));
+        assertTrue(output().contains("1 prompt(s) per array task (each a separate LLM request), vLLM startup timeout "
+                + "1800 s, at most 4 task(s) at once"), output());
         assertEquals(12, speciminRuns, "every warning is sliced separately");
         assertEquals(1, logins, "one interactive authentication");
         assertEquals(1, cluster.sbatchCalls.size(), "one Slurm array job");
@@ -284,6 +288,56 @@ class PipelineTest {
         assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.of(dir.toString())), output());
         assertTrue(output().contains("nothing is submitted again"), output());
         assertEquals(1, cluster.sbatchCalls.size());
+    }
+
+    @Test
+    void aFreshStartWithoutAnyRunsDirectoryGivesFortyOneSinglePromptTasks() throws Exception {
+        setUp(42);
+        env.remove("GA_OUTPUT_DIR"); // the default: runs/ under the working directory, which does not exist
+        failingMembers.add("p.A#f33");
+        assertFalse(Files.exists(temp.resolve("runs")));
+
+        assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.empty()), output());
+
+        assertEquals("SUBMITTED", state().get("status"));
+        Map<?, ?> preparation = stage("preparation");
+        assertEquals(41L, preparation.get("prompts"));
+        assertEquals(java.util.Collections.nCopies(41, 1L), preparation.get("taskSizes"));
+        assertEquals(1L, preparation.get("promptsPerTask"));
+        assertEquals(1800L, preparation.get("startupTimeoutSeconds"));
+        assertEquals(4L, preparation.get("arrayConcurrency"));
+        Map<?, ?> submission = json(submission().resolve("submission.json"));
+        Set<Object> assigned = new java.util.HashSet<>();
+        for (Object t : (List<?>) submission.get("tasks")) {
+            List<?> ids = (List<?>) ((Map<?, ?>) t).get("warningIds");
+            assertEquals(1, ids.size());
+            assertTrue(assigned.add(ids.get(0)));
+        }
+        assertEquals(41, assigned.size());
+        assertFalse(assigned.contains("W0033"));
+        Map<?, ?> settings = json(submission().resolve("settings.json"));
+        assertEquals(1800L, ((Map<?, ?>) settings.get("server")).get("startupTimeoutSeconds"));
+        assertEquals(List.of("job-001 0-40%4"), cluster.sbatchCalls, "one array job, 41 tasks, at most 4 at once");
+    }
+
+    @Test
+    void explicitBatchAndTimeoutSettingsStillApply() throws Exception {
+        setUp(12);
+        env.put("GA_INFERENCE_PROMPTS_PER_TASK", "10");
+        env.put("GA_INFERENCE_STARTUP_TIMEOUT_SECONDS", "2400");
+        env.put("GA_INFERENCE_ARRAY_CONCURRENCY", "2");
+
+        assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.empty()), output());
+
+        assertEquals(List.of(10L, 2L), stage("preparation").get("taskSizes"));
+        assertEquals(2400L, stage("preparation").get("startupTimeoutSeconds"));
+        assertEquals(List.of("job-001 0-1%2"), cluster.sbatchCalls);
+        assertTrue(output().contains("10 prompt(s) per array task (each a separate LLM request), vLLM startup timeout "
+                + "2400 s, at most 2 task(s) at once"), output());
+
+        env.put("GA_INFERENCE_STARTUP_TIMEOUT_SECONDS", "5");
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, pipeline().start(Optional.empty()), output());
+        assertTrue(output().contains("GA_INFERENCE_STARTUP_TIMEOUT_SECONDS"), output());
     }
 
     @Test
@@ -435,7 +489,7 @@ class PipelineTest {
 
         assertEquals(ExitCode.COMPLETED, pipeline().status(dir.toString(), true), output());
         assertEquals(2, logins);
-        assertTrue(output().contains("Scheduler (array tasks): {ACTIVE=1}"), output());
+        assertTrue(output().contains("Scheduler (array tasks): {ACTIVE=2}"), output());
         assertTrue(output().contains("Prompt results: not collected yet"), output());
         assertEquals(1, cluster.sbatchCalls.size(), "a lost connection never resubmits");
     }
@@ -531,6 +585,53 @@ class PipelineTest {
         }
         assertEquals(stage("analysis").get("snapshotTreeSha256"), EvaluationFiles.treeHash(dir.resolve(
                 "workspace/target")), "the pipeline snapshot is never changed");
+    }
+
+    @Test
+    void oneTasksStartupFailureExcludesOnlyItsOwnPrompt() throws Exception {
+        setUp(3);
+        assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.empty()), output());
+        answer("W0001", List.of(field("f1", "ADD")));
+        cluster.workerResult(remoteDir(), "W0002", 1, "FAILED", "STARTUP_TIMEOUT");
+        answer("W0003", List.of(field("f3", "ADD")));
+        String job = cluster.lastJob();
+        cluster.setAll(job, "COMPLETED");
+        cluster.scheduler.get(job).put(1, "FAILED");
+
+        assertEquals(ExitCode.COMPLETED, pipeline().finish(runDir().toString()), output());
+
+        assertEquals("PARTIAL", state().get("status"));
+        List<?> exclusions = (List<?>) state().get("exclusions");
+        assertEquals(1, exclusions.size(), exclusions.toString());
+        Map<?, ?> x = (Map<?, ?>) exclusions.get(0);
+        assertEquals(List.of("W0002", "collection", "FAILED"), List.of(x.get("warningId"), x.get("stage"),
+                x.get("status")));
+        assertTrue(String.valueOf(x.get("reason")).contains("STARTUP_TIMEOUT"), x.toString());
+        assertEquals(2L, stage("evaluation").get("importedProposals"));
+        assertEquals("COMPLETED", stage("combined").get("status"));
+    }
+
+    @Test
+    void aPipelineRecordedWithTheOldBatchDefaultStillFinishes() throws Exception {
+        setUp(2);
+        env.put("GA_INFERENCE_PROMPTS_PER_TASK", "10"); // as the earlier pipeline default did
+        env.put("GA_INFERENCE_STARTUP_TIMEOUT_SECONDS", "1200");
+        assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.empty()), output());
+        Path dir = runDir();
+        // Earlier versions fingerprinted the inference settings; such a record must not block finish.
+        Files.writeString(dir.resolve(Pipeline.STATE), Files.readString(dir.resolve(Pipeline.STATE))
+                .replace("\"settings\": {", "\"settings\": {\n      \"GA_INFERENCE_PROMPTS_PER_TASK\": \"10\","));
+        env.remove("GA_INFERENCE_PROMPTS_PER_TASK");
+        env.remove("GA_INFERENCE_STARTUP_TIMEOUT_SECONDS");
+        answer("W0001", List.of(field("f1", "ADD")));
+        answer("W0002", List.of(field("f2", "ADD")));
+        allTasks("COMPLETED");
+
+        assertEquals(ExitCode.COMPLETED, pipeline().finish(dir.toString()), output());
+
+        assertTrue(output().contains("prepared with 10 prompt(s) per task and a 1200 s startup timeout; it is "
+                + "immutable"), output());
+        assertEquals("COMPLETED", state().get("status"));
     }
 
     @Test

@@ -52,7 +52,7 @@ import java.util.function.Function;
  *
  * <ol>
  *   <li>{@code start}: {@code check} (snapshot, findings, warning graph, targets), {@code slice}, {@code
- *       context}, {@code prompts}, {@code prepare-inference} (prompts per array task default 10), then
+ *       context}, {@code prompts}, {@code prepare-inference} (by default one prompt per array task and an 1800 s startup timeout), then
  *       {@code inference connect} (reuse a healthy master or one interactive login), {@code upload} and
  *       {@code submit}. It returns once the job ID is saved; it never monitors.
  *   <li>{@code status}: the recorded stages, then {@code inference status} (a fresh scheduler query, or the
@@ -63,7 +63,7 @@ import java.util.function.Function;
  * </ol>
  *
  * <p>Stages are resumed only while the recorded configuration fingerprint (every {@code GA_*} setting
- * except SSH transport settings) and the snapshot tree hash are unchanged. A stage interrupted while
+ * except transport, inference and Slurm settings) and the snapshot tree hash are unchanged. A stage interrupted while
  * RUNNING is redone; slicing continues per warning, because slice results are never overwritten. An sbatch
  * call is never repeated: a recorded job is reused, and an UNKNOWN outcome must be resolved with {@code
  * inference attach}. Later stages are idempotent (collection merges, evaluations and round results are
@@ -75,12 +75,14 @@ public final class Pipeline {
     public static final String SUMMARY = "pipeline-summary.txt";
     public static final int SCHEMA_VERSION = 1;
     public static final int ROUND = 1;
-    /** The pipeline's default for {@code GA_INFERENCE_PROMPTS_PER_TASK} (prepare-inference's own default is 1). */
-    public static final String DEFAULT_PROMPTS_PER_TASK = "10";
-    static final String PROMPTS_PER_TASK = "GA_INFERENCE_PROMPTS_PER_TASK";
-    /** Settings that change how the cluster is reached, not what is computed: not fingerprinted. */
-    static final List<String> TRANSPORT = List.of("GA_SSH_", "GA_RSYNC_", "GA_REMOTE_POLL_SECONDS",
-            "GA_REMOTE_MAX_UNKNOWN_POLLS");
+    /**
+     * Settings that are not fingerprinted: how the cluster is reached, and the inference and Slurm settings,
+     * which only shape the submission. A prepared submission is immutable and keeps its own settings.json;
+     * the pipeline adds no defaults of its own (prompts per task, startup timeout and concurrency are
+     * {@link InferenceSettings}' defaults unless set).
+     */
+    static final List<String> NOT_FINGERPRINTED = List.of("GA_SSH_", "GA_RSYNC_", "GA_REMOTE_POLL_SECONDS",
+            "GA_REMOTE_MAX_UNKNOWN_POLLS", "GA_INFERENCE_", "GA_SLURM_");
     static final List<String> STAGES = List.of("analysis", "slices", "context", "prompts", "preparation",
             "submission", "collection", "evaluation", "combined");
 
@@ -104,9 +106,7 @@ public final class Pipeline {
 
     public Pipeline(Map<String, String> env, Path workingDirectory, Path defaultJavaHome, Tools tools, PrintStream out,
             PrintStream err) {
-        Map<String, String> effective = new TreeMap<>(env);
-        effective.putIfAbsent(PROMPTS_PER_TASK, DEFAULT_PROMPTS_PER_TASK);
-        this.env = Map.copyOf(effective);
+        this.env = Map.copyOf(env);
         this.workingDirectory = workingDirectory;
         this.defaultJavaHome = defaultJavaHome;
         this.tools = tools;
@@ -280,8 +280,9 @@ public final class Pipeline {
         // 5. Submission preparation (one immutable submission per pipeline).
         Map<String, Object> preparation = stage(state, "preparation");
         if (!"COMPLETED".equals(preparation.get("status"))) {
-            stageHeader(5, "inference submission (prepare-inference, " + env.get(PROMPTS_PER_TASK)
-                    + " prompt(s) per array task)");
+            InferenceSettings settings = InferenceSettings.fromEnvironment(env, new ArrayList<>());
+            stageHeader(5, "inference submission (prepare-inference): " + effective(settings.promptsPerTask(),
+                    settings.startupTimeoutSeconds(), settings.arrayConcurrency()));
             beginStage(dir, state, preparation);
             Optional<Path> existing = submission(dir);
             if (existing.isEmpty()) {
@@ -303,12 +304,20 @@ public final class Pipeline {
             }
             state.put("submission", new LinkedHashMap<>(Map.of("id", sub.getFileName().toString(), "directory",
                     dir.relativize(sub).toString())));
+            Map<?, ?> prepared = parse(sub.resolve("settings.json"));
+            int perTask = ((Number) map(prepared.get("slurm")).get("promptsPerTask")).intValue();
+            int startup = ((Number) map(prepared.get("server")).get("startupTimeoutSeconds")).intValue();
+            int concurrency = ((Number) map(prepared.get("slurm")).get("arrayConcurrency")).intValue();
             preparation.put("prompts", ((List<?>) json.get("prompts")).size());
-            preparation.put("promptsPerTask", Integer.parseInt(env.get(PROMPTS_PER_TASK)));
+            preparation.put("promptsPerTask", perTask);
+            preparation.put("startupTimeoutSeconds", startup);
+            preparation.put("arrayConcurrency", concurrency);
             preparation.put("taskSizes", List.copyOf(tasks.values()));
+            out.println("  effective:  " + effective(perTask, startup, concurrency) + " (from the submission's "
+                    + "settings.json)");
             artifacts(preparation, Map.of("submission", dir.relativize(sub).toString()));
             finishStage(preparation, "COMPLETED", ((List<?>) json.get("prompts")).size() + " prompt(s) in "
-                    + tasks.size() + " array task(s); each prompt is a separate LLM request");
+                    + tasks.size() + " array task(s); " + effective(perTask, startup, concurrency));
             save(dir, state);
         }
         Path sub = dir.resolve(String.valueOf(map(state.get("submission")).get("directory")));
@@ -377,6 +386,12 @@ public final class Pipeline {
         out.println("  inference attach " + sub + " --not-submitted   # verified that none exists");
         out.println("then: pipeline start --resume " + dir);
         return conclude(dir, state, Status.SUBMISSION_UNKNOWN, ExitCode.EXECUTION_FAILURE);
+    }
+
+    /** The effective batch size, startup deadline and concurrency, as printed and recorded. */
+    static String effective(int promptsPerTask, int startupTimeoutSeconds, int arrayConcurrency) {
+        return promptsPerTask + " prompt(s) per array task (each a separate LLM request), vLLM startup timeout "
+                + startupTimeoutSeconds + " s, at most " + arrayConcurrency + " task(s) at once";
     }
 
     private void slice(Path dir, Optional<String> warning) {
@@ -662,15 +677,19 @@ public final class Pipeline {
         return problems;
     }
 
-    /** The fingerprinted settings: every {@code GA_*} variable except SSH transport settings. */
+    /** The fingerprinted settings: every {@code GA_*} variable except {@link #NOT_FINGERPRINTED} ones. */
     Map<String, String> fingerprintedSettings() {
         Map<String, String> m = new TreeMap<>();
         env.forEach((k, v) -> {
-            if (k.startsWith("GA_") && TRANSPORT.stream().noneMatch(k::startsWith)) {
+            if (fingerprinted(k)) {
                 m.put(k, v);
             }
         });
         return m;
+    }
+
+    static boolean fingerprinted(String key) {
+        return key.startsWith("GA_") && NOT_FINGERPRINTED.stream().noneMatch(key::startsWith);
     }
 
     private Optional<ExitCode> verifyInputs(Path dir, Map<String, Object> state) throws IOException {
@@ -678,7 +697,8 @@ public final class Pipeline {
         Map<String, String> now = fingerprintedSettings();
         Set<String> changed = new LinkedHashSet<>();
         Set<String> keys = new java.util.TreeSet<>();
-        recorded.keySet().forEach(k -> keys.add(String.valueOf(k)));
+        // pipelines recorded before inference settings stopped being fingerprinted may list them; they are ignored
+        recorded.keySet().stream().map(String::valueOf).filter(Pipeline::fingerprinted).forEach(keys::add);
         keys.addAll(now.keySet());
         for (String k : keys) {
             if (!String.valueOf(recorded.get(k)).equals(String.valueOf(now.get(k)))) {
@@ -692,6 +712,20 @@ public final class Pipeline {
             return Optional.of(ExitCode.USAGE_OR_CONFIGURATION_ERROR);
         }
         Object hash = stage(state, "analysis").get("snapshotTreeSha256");
+        if (state.get("submission") instanceof Map<?, ?> s && s.get("directory") != null
+                && Files.isRegularFile(dir.resolve(String.valueOf(s.get("directory"))).resolve("settings.json"))) {
+            Map<?, ?> prepared = parse(dir.resolve(String.valueOf(s.get("directory"))).resolve("settings.json"));
+            InferenceSettings current = InferenceSettings.fromEnvironment(env, new ArrayList<>());
+            Object perTask = map(prepared.get("slurm")).get("promptsPerTask");
+            Object startup = map(prepared.get("server")).get("startupTimeoutSeconds");
+            if (perTask instanceof Number p && startup instanceof Number t
+                    && (p.intValue() != current.promptsPerTask() || t.intValue() != current.startupTimeoutSeconds())) {
+                out.println("Note: this pipeline's submission was prepared with " + p + " prompt(s) per task and a "
+                        + t + " s startup timeout; it is immutable and keeps them (the current settings would give "
+                        + current.promptsPerTask() + " and " + current.startupTimeoutSeconds() + " s for a new "
+                        + "pipeline).");
+            }
+        }
         if (hash != null && !hash.equals(EvaluationFiles.treeHash(dir.resolve("workspace").resolve("target")))) {
             err.println("GeneralAnnotator: the pipeline snapshot " + dir.resolve("workspace/target") + " changed after "
                     + "the analysis; its results no longer describe it. Start a new pipeline.");
@@ -736,8 +770,8 @@ public final class Pipeline {
         Map<String, Object> configuration = new LinkedHashMap<>();
         configuration.put("settings", fingerprintedSettings());
         configuration.put("settingsSha256", EvaluationFiles.sha256(Json.write(fingerprintedSettings())));
-        configuration.put("note", "Every GA_* setting except SSH transport settings (" + TRANSPORT + "); "
-                + PROMPTS_PER_TASK + " defaults to " + DEFAULT_PROMPTS_PER_TASK + " in the pipeline.");
+        configuration.put("note", "Every GA_* setting except " + NOT_FINGERPRINTED + " (transport settings, and the "
+                + "inference and Slurm settings, which only shape the immutable submission; see its settings.json).");
         state.put("configuration", configuration);
         Map<String, Object> stages = new LinkedHashMap<>();
         for (String s : STAGES) {

@@ -103,8 +103,8 @@ public final class Main {
                       evaluate-annotations. The result directory can be used as the next round's run.
               pipeline start [--resume <pipeline dir>]
                       Run the whole round-1 front half in one command: check (snapshot, findings,
-                      graph, targets), slice, context, prompts, prepare-inference (10 prompts per
-                      array task unless GA_INFERENCE_PROMPTS_PER_TASK is set), connect (one login
+                      graph, targets), slice, context, prompts, prepare-inference (by default one
+                      prompt per array task, 1800 s vLLM startup timeout), connect (one login
                       if needed), upload and submit once. Returns after the job ID is saved; the
                       run directory is the pipeline directory (pipeline.json, pipeline-summary.txt).
                       --resume continues an interrupted start without submitting twice.
