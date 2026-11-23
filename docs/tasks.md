@@ -1412,3 +1412,141 @@ Verified by:
   - 10 of 23 warnings matched, giving 9 packages, all COMPLETED. The
     combined check went from 23 to 18 findings: 10 resolved, 5 introduced
     (W2006-W2010).
+
+## T20 — Propagate nullable returns through overridden and implemented contracts · `done`
+
+The return rule skipped every overriding method (`EXPLICIT_CONTRACT`: "its
+inherited return contract is kept"), for example EventBus's
+`ThrowableFailureEvent#getExecutionScope()` implementing
+`HasExecutionScope`.
+
+- **Ancestors** (`NullabilityPropagation.ancestors`, rules `nullable-flow-4`):
+  - **Found:** every method declaration the returning method overrides or
+    implements, in all supertypes (multi-level, several interfaces), by
+    javac's `Elements.overrides` with type arguments substituted. Overloads
+    are excluded.
+  - **Inherited implementations:** for a source subclass that inherits the
+    method as an implementation, the interface methods it implements there.
+  - **Not touched:** overrides and sibling implementations keep their
+    stronger non-null returns.
+- **Edits:** `@Nullable` at `RETURN` of the method and of each ancestor, in
+  one `Match` (`hierarchy`), so one package and one annotation node.
+  - Already-`@Nullable` ancestors are kept.
+  - Explicit non-null returns, on the method itself or on an ancestor, are
+    replaced (REMOVE + ADD) and listed in `contractChange`. Fields with an
+    explicit non-null annotation are still skipped.
+- **Skipped as a whole** (`INCOMPLETE_HIERARCHY`): an ancestor outside the
+  editable sources (for example `Supplier#get`, `Object#toString`), or an
+  unresolvable explicit non-null annotation.
+- **Stage:** generator `nullability-propagation-4`; the rule version is in
+  every cache key, so `nullable-flow-3` results are not reused. Parameter
+  hierarchies (T19) and the other rules are unchanged.
+
+Verified by:
+- `PropagationReturnHierarchyTest` (fake NullAway that also reports a
+  nullable return under a non-null ancestor):
+  - **Matched:**
+    - an interface getter, with the sibling implementation untouched;
+    - abstract and superclass overrides across three levels, with the
+      subclass override and the overload untouched;
+    - two interface contracts;
+    - `Source<String>.get()` (generic), with `get(int)` untouched;
+    - an already-`@Nullable` contract kept;
+    - explicit `@NonNull` replaced on the method and its interface;
+    - an inherited implementation's interface contract.
+  - **Skipped as a whole:** `Supplier#get` and `Object#toString`.
+  - **Application:** every package evaluates without contract
+    inconsistencies, and the combined source has every edit and no
+    `@NonNull`.
+  - **One pass:** a caller's new dereference is recorded, not propagated,
+    and reruns reuse everything.
+- The existing propagation tests pass unchanged, apart from the rule
+  version.
+- A run on a copy of the EventBus pipeline after round 1 (real NullAway):
+  - **The getter warning:** the input diagnostic "returning @Nullable
+    expression from method with @NonNull return type" at
+    `ThrowableFailureEvent.java:50:9` (`return executionContext;`) matched.
+    One package annotates `HasExecutionScope#getExecutionScope()` and
+    `ThrowableFailureEvent#getExecutionScope()`.
+  - **Its evaluation:** that diagnostic resolved, 23 -> 22 findings, and
+    nothing was introduced. `getExecutionScope()` has no callers in
+    `EventBus/src`.
+  - **Whole run:** 11 of 23 warnings matched, giving 10 packages, all
+    COMPLETED. The combined check went from 23 to 17: 11 resolved and 5
+    introduced, the same five as in T19.
+
+## T21 — Run propagation round 3 (and later rounds) on demand · `done`
+
+`pipeline propagate` ran only round 2, on the combined round-1 result, and
+several pieces assumed that.
+
+- **Command:** `pipeline propagate <dir> [--round n]`. Round 2 is the
+  default; `--round 2` is the same execution. Round 1 and non-numbers are
+  usage errors. Each command runs exactly one pass.
+- **Input** (`PropagationStage.Input.fromPipeline(dir, n)`): round n > 2
+  reads the combined result named by round n - 1's own stage.
+  - **Checked before any record changes:**
+    - the stage is COMPLETED with outcome COMPLETED;
+    - its artifacts lie under `propagation/`, `rounds/` and `evaluations/`;
+    - `propagation.json` is round n - 1 and names the same combined result,
+      evaluation and graph;
+    - round n - 1's input still has the identity it was computed on (checked
+      recursively, so a regenerated earlier round makes later rounds stale);
+    - the combined result verifies like round 1's, and its base state is
+      round n - 1's input state.
+  - Every failure gives an actionable message, and nothing falls back.
+- **Records:** round n is recorded in stage `propagation-r<n>`; round 2 stays
+  in `propagation`. An identical rerun is not added to `previous`, while a
+  changed result keeps the old one there. The pipeline summary and status
+  list every round's stage.
+- **IDs and keys:**
+  - stage IDs `propagation<n>-<key>`, with the round, input identity and
+    rule version in the key;
+  - packages `P<n>-0001, ...` (round 2 keeps `P0001`);
+  - new warnings `W<n>001, ...`;
+  - `rounds/round<n>-<key>`.
+- **Graph** (`HistoryGraph.build` overload): the earlier graph may itself be
+  an extended graph. The evidence is the earlier round's evaluation, and
+  persisting base warnings map to nodes through that round's
+  `reportToGraph`, whatever their round, instead of having to be roots.
+  Round 2 is unchanged.
+- **Rebuild:** `propagate --rebuild-graph` resolves a stage's input by its
+  recorded round.
+
+Verified by:
+- `PipelineTest`, on a three-round chain fixture:
+  - **Round 3:**
+    - reads round 2's combined result, keeps round 2's record
+      byte-identical, and records `propagation-r3`;
+    - keeps every earlier annotation;
+    - matches a persisting original W0 warning whose origin round 2 made
+      `@Nullable`, round 2's introduced warnings, and a return hierarchy
+      (`A#val` with `Src#val`);
+    - uses P3-0001..3;
+    - leaves the introduced `k = h` as W3001, not propagated, with only one
+      W3 node;
+    - keeps the round-2 graph whole, with no duplicate nodes.
+  - **Repeat and rebuild:** repeating reuses everything, adds no history
+    entry and keeps the graph identical; `--rebuild-graph` reproduces it.
+  - **Round 4:** takes up W3001 and creates no W4 nodes.
+  - **Refusals:** a missing round 2, an inconsistent stage record, a stale
+    round-2 input and a modified round-2 snapshot are each refused without
+    running anything; round 1 and garbage are usage errors.
+  - **Default:** `--round 2` equals the default.
+- All earlier pipeline and propagation tests pass unchanged.
+- A run on a copy of the EventBus pipeline, reading its saved round-2 result
+  `round2-fc06b8b3c12e` (17 warnings), with real NullAway:
+  - **Matched:** 4 warnings, all introduced in round 2: W2006
+    `handleSubscriberException` parameter `event`, W2008
+    `PendingPostQueue#poll(int)`, W2009 `SubscriberExceptionEvent#throwable`
+    and W2010 `AsyncExecutor#scope`. Packages P3-0001..4, all COMPLETED.
+  - **Introduced by the packages' own evaluations:**
+    - P3-0001: W3001, the dereference `event` at EventBus.java:540, and
+      W3002, `event` passed on at :544;
+    - P3-0004: W3003, `scope` passed on at AsyncExecutor.java:126.
+  - **Combined:** 17 -> 16 findings, with 4 resolved, 3 introduced and 13
+    persisting.
+  - **Graph:** 116 nodes and 88 edges. Input warnings are placed 12
+    persisting-from-base and 5 linked-to-package-warning.
+  - **Untouched:** round 2's record and artifacts.
+  - **Repeat:** about 1 s with no checker run, and an identical graph.

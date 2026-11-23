@@ -127,9 +127,10 @@ public final class Main {
               pipeline status <pipeline dir> [--connect]
                       Recorded stages, then the job's scheduler states (fresh, or cached and
                       labeled); --connect reconnects first (may prompt once).
-              pipeline propagate <pipeline dir>
-                      The propagation stage on the pipeline's combined round-1 result (after
-                      pipeline finish), recorded in pipeline.json; no LLM, nothing submitted.
+              pipeline propagate <pipeline dir> [--round <n>]
+                      One propagation pass, recorded in pipeline.json; no LLM, nothing submitted.
+                      Round 2 (the default) reads the combined round-1 result (after pipeline
+                      finish); round n > 2 reads the combined result of the completed round n-1.
               pipeline finish <pipeline dir>
                       Connect, check the job; once every task has ended: collect, evaluate each
                       unique package (evaluate-annotations), apply all packages together and
@@ -296,7 +297,8 @@ public final class Main {
             boolean status = args[1].equals("status") && (args.length == 3 || (args.length == 4
                     && args[3].equals("--connect")));
             boolean finish = args[1].equals("finish") && args.length == 3;
-            boolean propagate = args[1].equals("propagate") && args.length == 3;
+            boolean propagate = args[1].equals("propagate") && (args.length == 3
+                    || (args.length == 5 && args[3].equals("--round")));
             if (start || status || finish || propagate) {
                 try {
                     Pipeline pipeline = new Pipeline(env, Path.of("").toAbsolutePath(),
@@ -307,7 +309,8 @@ public final class Main {
                                     new AnchoredWarningMatcher(), Clock.systemUTC()), out, err);
                     return start ? pipeline.start(args.length == 4 ? Optional.of(args[3]) : Optional.empty())
                             : status ? pipeline.status(args[2], args.length == 4)
-                            : propagate ? pipeline.propagate(args[2]) : pipeline.finish(args[2]);
+                            : propagate ? pipeline.propagate(args[2], args.length == 5 ? args[4] : null)
+                            : pipeline.finish(args[2]);
                 } catch (RuntimeException e) {
                     err.println("GeneralAnnotator: internal error:");
                     e.printStackTrace(err);

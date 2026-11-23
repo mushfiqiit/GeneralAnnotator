@@ -43,11 +43,24 @@ public final class PropagateCommand {
     private final Clock clock;
     private final PrintStream out;
     private final PrintStream err;
+    private final java.util.OptionalInt round;
     private PropagationStage.Result result;
 
     public PropagateCommand(String runArgument, Map<String, String> env, Path workingDirectory, Path defaultJavaHome,
             EvaluateAnnotationsCommand.CheckerFactory checkers, AnnotationApplier applier, WarningMatcher matcher,
             Clock clock, PrintStream out, PrintStream err) {
+        this(runArgument, java.util.OptionalInt.empty(), env, workingDirectory, defaultJavaHome, checkers, applier,
+                matcher, clock, out, err);
+    }
+
+    /**
+     * @param round the propagation round to run, for a pipeline directory (round {@code n} reads the combined
+     *     result of round {@code n - 1}); empty for the default (round 2 for a pipeline)
+     */
+    public PropagateCommand(String runArgument, java.util.OptionalInt round, Map<String, String> env,
+            Path workingDirectory, Path defaultJavaHome, EvaluateAnnotationsCommand.CheckerFactory checkers,
+            AnnotationApplier applier, WarningMatcher matcher, Clock clock, PrintStream out, PrintStream err) {
+        this.round = round;
         this.runArgument = runArgument;
         this.env = Map.copyOf(env);
         this.workingDirectory = workingDirectory;
@@ -72,7 +85,7 @@ public final class PropagateCommand {
         }
         PropagationStage.Input input;
         try {
-            input = PropagationStage.Input.resolve(runDir);
+            input = PropagationStage.Input.resolve(runDir, round);
         } catch (NullabilityPropagation.InvalidException e) {
             err.println("GeneralAnnotator: cannot propagate: " + e.getMessage());
             return ExitCode.EXECUTION_FAILURE;
@@ -108,7 +121,8 @@ public final class PropagateCommand {
             err.println("GeneralAnnotator: cannot fingerprint the configuration: " + e);
             return ExitCode.INTERNAL_ERROR;
         }
-        out.println("GeneralAnnotator propagate (single pass, " + NullabilityPropagation.RULES + ", no LLM): " + runDir);
+        out.println("GeneralAnnotator propagate (round " + input.round() + ", single pass, " + NullabilityPropagation.RULES
+                + ", no LLM): " + runDir);
         try {
             result = new PropagationStage(input, config, checker, applier, matcher, clock, out).run();
         } catch (NullabilityPropagation.InvalidException e) {

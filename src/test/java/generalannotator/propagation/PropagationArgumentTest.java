@@ -346,7 +346,7 @@ class PropagationArgumentTest {
         Map<?, ?> r = json(dir.resolve(PropagationStage.RESULT));
         assertEquals("COMPLETED", r.get("outcome"), output());
         assertEquals(NullabilityPropagation.RULES, r.get("rules"));
-        assertEquals("nullable-flow-3", json(dir.resolve(PropagationStage.ANALYSIS)).get("rules"),
+        assertEquals("nullable-flow-4", json(dir.resolve(PropagationStage.ANALYSIS)).get("rules"),
                 "the rule version is part of the analysis, hence of every cache key");
         assertEquals(12L, ((Map<?, ?>) r.get("counts")).get("uniquePackages"), "use's two warnings share one package");
         assertEquals(14, checker.calls(), "evaluation baseline, twelve packages, one combined check\n" + output());

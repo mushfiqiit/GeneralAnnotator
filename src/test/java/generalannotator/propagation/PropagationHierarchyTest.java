@@ -346,7 +346,7 @@ class PropagationHierarchyTest {
         Path dir = only(run.resolve(PropagationStage.DIR));
         Map<?, ?> r = json(dir.resolve(PropagationStage.RESULT));
         assertEquals("COMPLETED", r.get("outcome"), out.toString(StandardCharsets.UTF_8));
-        assertEquals("nullable-flow-3", json(dir.resolve(PropagationStage.ANALYSIS)).get("rules"));
+        assertEquals("nullable-flow-4", json(dir.resolve(PropagationStage.ANALYSIS)).get("rules"));
         assertTrue(Files.readString(dir.resolve(PropagationStage.ANALYSIS)).contains("\"hierarchy\""));
         assertEquals(8L, ((Map<?, ?>) r.get("counts")).get("uniquePackages"), "both log warnings share one package");
         assertEquals(10, checker.calls(), "evaluation baseline, eight packages, one combined check");

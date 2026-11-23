@@ -60,8 +60,12 @@ import javax.lang.model.type.TypeMirror;
  *       (directly or through other locals) from one, and whose destination is a field of the editable sources
  *       without a nullness annotation;
  *   <li>{@link Rule#RETURN}: "returning @Nullable expression from method with @NonNull return type" on a
- *       {@code return} of such a value from an enclosing method of the editable sources without a nullness
- *       annotation on its return type (and not overriding another method);
+ *       {@code return} of such a value from an enclosing method of the editable sources that is not already
+ *       {@code @Nullable}. The same package annotates the return type of every declaration the method overrides or
+ *       implements (all supertypes, several interfaces, generic substitutions, and interface methods it implements
+ *       for a subclass), never its overrides, siblings or overloads. Explicit non-null return annotations are
+ *       replaced (recorded contract changes); already-nullable ancestors are kept. If an ancestor is declared outside
+ *       the editable sources, the whole package is skipped ({@link SkipCategory#INCOMPLETE_HIERARCHY});
  *   <li>{@link Rule#ARGUMENT}: "passing @Nullable parameter 'e' where @NonNull is required" on an argument
  *       of a method or constructor call. The invoked executable is the one javac resolved (so overloads are
  *       told apart by attribution, never by name), the argument index maps to its formal parameter, and the
@@ -81,14 +85,14 @@ import javax.lang.model.type.TypeMirror;
  * an argument without an annotated origin, the project's single nullable annotation type, if it uses exactly
  * one. Every other warning is skipped with its reason: other categories (for example dereferences of
  * {@code @Nullable} values), unsupported values ({@code null}, conditionals), unresolved or ambiguous positions
- * and symbols, explicit non-null contracts on fields and returns, overriding methods, and destinations outside
+ * and symbols, explicit non-null contracts on fields, and destinations outside
  * the editable sources. Nothing is applied here; every candidate comes from the unchanged baseline, and
  * warnings that its edits introduce are left to a later pass.
  */
 public final class NullabilityPropagation {
 
     /** The rule set's version, recorded with every result. */
-    public static final String RULES = "nullable-flow-3";
+    public static final String RULES = "nullable-flow-4";
     static final String ASSIGN = "assigning @Nullable expression to @NonNull field";
     static final String RETURN = "returning @Nullable expression from method with @NonNull return type";
     static final String PASS = "passing @Nullable parameter";
@@ -112,7 +116,7 @@ public final class NullabilityPropagation {
         NOT_A_NULLABLE_FIELD_OR_METHOD,
         /** The position, tree or symbol could not be resolved unambiguously. */
         UNRESOLVED,
-        /** The destination carries an explicit nullness annotation or inherits a return contract. */
+        /** The destination is already {@code @Nullable}, or is a field with an explicit non-null annotation. */
         EXPLICIT_CONTRACT,
         /** The destination is not declared in the editable project sources (or cannot be edited). */
         NOT_EDITABLE,
@@ -122,10 +126,11 @@ public final class NullabilityPropagation {
          */
         UNSUPPORTED_TARGET,
         /**
-         * The receiving method can be edited, but a declaration that must accept null with it (an implementation
-         * or override found in the editable sources' hierarchy) cannot be changed consistently: it is declared
-         * outside the editable sources, in an anonymous or local class, or carries an explicit non-null annotation
-         * that cannot be replaced. The whole package is skipped.
+         * The receiving method can be edited, but a declaration that must change with it (for a parameter, an
+         * implementation or override in the editable sources; for a return, a declaration it overrides or
+         * implements) cannot be changed consistently: it is declared outside the editable sources, in an anonymous
+         * or local class, or carries an explicit non-null annotation that cannot be replaced. The whole package is
+         * skipped.
          */
         INCOMPLETE_HIERARCHY
     }
@@ -135,9 +140,10 @@ public final class NullabilityPropagation {
      *
      * @param edit the {@code @Nullable} annotation added to the receiving declaration
      * @param removal the explicit non-null annotation removed at the same position (a contract change), if any
-     * @param hierarchy for an argument passed to an overridable method: the edits that make the same parameter
-     *     of every implementation and override found in the editable sources nullable too (per declaration, the
-     *     removal of an explicit non-null annotation, if any, then the addition); empty otherwise
+     * @param hierarchy the edits to the receiving declaration's hierarchy, per declaration the removal of an
+     *     explicit non-null annotation (if any) then the addition: for an argument passed to an overridable method,
+     *     the same parameter of every implementation and override found in the editable sources; for a return, the
+     *     return type of every declaration the method overrides or implements; empty otherwise
      */
     public record Match(String warningId, Rule rule, AnnotationEdit edit, Optional<AnnotationEdit> removal,
             List<AnnotationEdit> hierarchy, String evidence) {
@@ -382,6 +388,9 @@ public final class NullabilityPropagation {
             return new Skip(id, SkipCategory.EXPLICIT_CONTRACT, "'" + destinationText + "' is already @"
                     + AnnotationKinds.simpleName(explicitNullable.get()));
         }
+        if (rule == Rule.RETURN) {
+            return classifyReturn(id, (ExecutableElement) destination, valueText, origin, nullable.get());
+        }
         Optional<String> nonNull = nullness(destination, "non-null");
         if (nonNull.isPresent()) {
             return new Skip(id, SkipCategory.EXPLICIT_CONTRACT, "'" + destinationText + "' has an explicit non-null "
@@ -391,13 +400,6 @@ public final class NullabilityPropagation {
         if (declaration.isEmpty()) {
             return new Skip(id, SkipCategory.NOT_EDITABLE, "'" + destinationText + "' is declared outside the editable "
                     + "project sources");
-        }
-        if (destination instanceof ExecutableElement m) {
-            Optional<String> overridden = overridden(m);
-            if (overridden.isPresent()) {
-                return new Skip(id, SkipCategory.EXPLICIT_CONTRACT, destinationText + " overrides " + overridden.get()
-                        + "; its inherited return contract is kept");
-            }
         }
         Element owner = destination.getEnclosingElement();
         if (!(owner instanceof TypeElement type0) || type0.getQualifiedName().isEmpty()) {
@@ -442,11 +444,154 @@ public final class NullabilityPropagation {
                     + " to the unannotated field " + type0.getQualifiedName() + "#" + member;
             case FIELD_INITIALIZER -> "the initializer of field " + type0.getQualifiedName() + "#" + member
                     + " is " + origin.description();
-            case RETURN -> "'return " + valueText + "' returns " + origin.description()
-                    + " from the unannotated method " + type0.getQualifiedName() + "#" + member;
-            case ARGUMENT -> throw new IllegalStateException();
+            case RETURN, ARGUMENT -> throw new IllegalStateException();
         };
         return new Match(id, rule, edit, evidence);
+    }
+
+    /**
+     * The {@link Rule#RETURN} flow, once the value is known to be explicitly {@code @Nullable}: the returning
+     * method's return type is annotated, together with the return type of every declaration it overrides or
+     * implements (its ancestors, which would otherwise promise a non-null result the method no longer keeps).
+     * Overrides of the method and sibling implementations are left alone: a narrower, non-null return is
+     * compatible with a nullable one.
+     */
+    private Object classifyReturn(String id, ExecutableElement m, String valueText, Origin origin, String nullable) {
+        String target = describe(m);
+        Optional<String> nonNull = nullness(m, "non-null");
+        if (nonNull.isPresent() && !nonNull.get().contains(".")) {
+            return new Skip(id, SkipCategory.UNRESOLVED, "the explicit @" + nonNull.get() + " return of " + target
+                    + " does not resolve to a qualified type, so it cannot be replaced");
+        }
+        if (model.declaration(m).isEmpty()) {
+            return new Skip(id, SkipCategory.NOT_EDITABLE, target + " is declared outside the editable project "
+                    + "sources");
+        }
+        if (!(m.getEnclosingElement() instanceof TypeElement owner) || owner.getQualifiedName().isEmpty()) {
+            return new Skip(id, SkipCategory.NOT_EDITABLE, "'" + m.getSimpleName() + "()' is declared in an anonymous "
+                    + "or local class");
+        }
+        Location at;
+        try {
+            at = locate(m);
+        } catch (Incomplete e) {
+            return new Skip(id, SkipCategory.NOT_EDITABLE, e.getMessage());
+        }
+        AnnotationEdit edit = new AnnotationEdit(at.root(), at.file(), at.declaringClass(), at.member(),
+                AnnotationPosition.returnType(), EditAction.ADD, nullable);
+        Optional<AnnotationEdit> removal = nonNull.map(n -> new AnnotationEdit(at.root(), at.file(),
+                at.declaringClass(), at.member(), AnnotationPosition.returnType(), EditAction.REMOVE, n));
+
+        List<ExecutableElement> ancestors;
+        try {
+            ancestors = ancestors(m);
+        } catch (Incomplete e) {
+            return new Skip(id, SkipCategory.INCOMPLETE_HIERARCHY, "a @Nullable return of " + target + " requires "
+                    + "the return contracts it overrides or implements to be @Nullable too, but " + e.getMessage()
+                    + "; the whole package is skipped");
+        }
+        List<AnnotationEdit> hierarchy = new ArrayList<>();
+        List<String> changed = new ArrayList<>();
+        List<String> kept = new ArrayList<>();
+        List<String> replaced = new ArrayList<>();
+        nonNull.ifPresent(n -> replaced.add(target + " (@" + AnnotationKinds.simpleName(n) + ")"));
+        for (ExecutableElement a : ancestors) {
+            String which = describe(a);
+            if (nullness(a, "nullable").isPresent()) {
+                kept.add(which);
+                continue;
+            }
+            Optional<String> aNonNull = nullness(a, "non-null");
+            if (aNonNull.isPresent() && !aNonNull.get().contains(".")) {
+                return new Skip(id, SkipCategory.INCOMPLETE_HIERARCHY, "a @Nullable return of " + target
+                        + " requires changing " + which + " too, but its explicit @" + aNonNull.get() + " does not "
+                        + "resolve to a qualified type, so it cannot be replaced; the whole package is skipped");
+            }
+            Location aa;
+            try {
+                aa = locate(a);
+            } catch (Incomplete e) {
+                return new Skip(id, SkipCategory.INCOMPLETE_HIERARCHY, "a @Nullable return of " + target
+                        + " requires changing " + which + " too, but " + e.getMessage()
+                        + "; the whole package is skipped");
+            }
+            aNonNull.ifPresent(n -> {
+                hierarchy.add(new AnnotationEdit(aa.root(), aa.file(), aa.declaringClass(), aa.member(),
+                        AnnotationPosition.returnType(), EditAction.REMOVE, n));
+                replaced.add(which + " (@" + AnnotationKinds.simpleName(n) + ")");
+            });
+            hierarchy.add(new AnnotationEdit(aa.root(), aa.file(), aa.declaringClass(), aa.member(),
+                    AnnotationPosition.returnType(), EditAction.ADD, nullable));
+            changed.add(which);
+        }
+        StringBuilder evidence = new StringBuilder("'return " + valueText + "' returns " + origin.description()
+                + " from the " + (nonNull.isPresent() ? "" : "unannotated ") + "method " + owner.getQualifiedName()
+                + "#" + at.member().canonical());
+        if (!ancestors.isEmpty()) {
+            evidence.append("; the return contracts it overrides or implements: ")
+                    .append(changed.isEmpty() ? "" : "also annotated " + String.join(", ", changed))
+                    .append(!changed.isEmpty() && !kept.isEmpty() ? "; " : "")
+                    .append(kept.isEmpty() ? "" : "already @Nullable, kept: " + String.join(", ", kept))
+                    .append("; overrides and sibling implementations keep their non-null returns");
+        }
+        if (!replaced.isEmpty()) {
+            evidence.append("; contract change: the explicit non-null return annotation of ")
+                    .append(String.join(", ", replaced)).append(" is replaced by @").append(nullable);
+        }
+        return new Match(id, Rule.RETURN, edit, removal, hierarchy, evidence.toString());
+    }
+
+    /**
+     * Every method declaration that {@code m} overrides or implements, sorted: in every supertype of its class
+     * (multi-level and through several interfaces), and, for an implementation inherited by a subclass of the
+     * editable sources ({@code class Impl extends Helper implements I}), the interface methods it implements
+     * there. The relation is javac's ({@link javax.lang.model.util.Elements#overrides}, with type arguments
+     * substituted), so overloads are excluded.
+     *
+     * @throws Incomplete if one of them is declared outside the editable sources
+     */
+    private List<ExecutableElement> ancestors(ExecutableElement m) throws Incomplete {
+        if (!(m.getEnclosingElement() instanceof TypeElement owner) || m.getModifiers().contains(Modifier.STATIC)
+                || m.getModifiers().contains(Modifier.PRIVATE)) {
+            return List.of();
+        }
+        TypeMirror ownerType = model.types().erasure(owner.asType());
+        List<TypeElement> origins = new ArrayList<>(List.of(owner));
+        for (TypeElement t : sourceTypes()) {
+            if (!t.equals(owner) && model.types().isSubtype(model.types().erasure(t.asType()), ownerType)) {
+                origins.add(t);
+            }
+        }
+        Set<ExecutableElement> found = new LinkedHashSet<>();
+        for (TypeElement origin : origins) {
+            Set<TypeElement> seen = new java.util.HashSet<>();
+            List<TypeMirror> pending = new ArrayList<>(model.types().directSupertypes(origin.asType()));
+            while (!pending.isEmpty()) {
+                TypeMirror t = pending.remove(0);
+                if (!(model.types().asElement(t) instanceof TypeElement te) || !seen.add(te)) {
+                    continue;
+                }
+                pending.addAll(model.types().directSupertypes(t));
+                if (!te.equals(owner) && model.types().isSubtype(model.types().erasure(te.asType()), ownerType)) {
+                    continue; // between m's class and a subclass: overrides of m, not contracts above it
+                }
+                for (Element member : te.getEnclosedElements()) {
+                    if (member instanceof ExecutableElement other && other != m && other.getKind() == ElementKind.METHOD
+                            && model.elements().overrides(m, other, origin)) {
+                        found.add(other);
+                    }
+                }
+            }
+        }
+        for (ExecutableElement a : found) {
+            if (model.declaration(a).isEmpty()) {
+                throw new Incomplete(describe(a) + ", which " + describe(m) + " overrides or implements, is declared "
+                        + "outside the editable project sources (library or JDK); external contracts are not changed");
+            }
+        }
+        List<ExecutableElement> sorted = new ArrayList<>(found);
+        sorted.sort(java.util.Comparator.comparing(NullabilityPropagation::describe));
+        return sorted;
     }
 
     /**
@@ -956,26 +1101,6 @@ public final class NullabilityPropagation {
                 return Optional.of(t instanceof TypeElement te && !te.getQualifiedName().isEmpty()
                         ? te.getQualifiedName().toString() : simple);
             }
-        }
-        return Optional.empty();
-    }
-
-    /** A method {@code m} overrides, as {@code Type#name}, if any. */
-    private Optional<String> overridden(ExecutableElement m) {
-        TypeElement owner = (TypeElement) m.getEnclosingElement();
-        List<TypeMirror> pending = new ArrayList<>(model.types().directSupertypes(owner.asType()));
-        while (!pending.isEmpty()) {
-            TypeMirror t = pending.remove(0);
-            Element e = model.types().asElement(t);
-            if (!(e instanceof TypeElement te)) {
-                continue;
-            }
-            for (Element member : te.getEnclosedElements()) {
-                if (member instanceof ExecutableElement other && model.elements().overrides(m, other, owner)) {
-                    return Optional.of(te.getQualifiedName() + "#" + other.getSimpleName() + "()");
-                }
-            }
-            pending.addAll(model.types().directSupertypes(t));
         }
         return Optional.empty();
     }

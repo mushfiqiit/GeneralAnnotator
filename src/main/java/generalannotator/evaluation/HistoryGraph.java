@@ -82,6 +82,21 @@ public final class HistoryGraph {
      */
     public static Built build(Optional<Path> earlierGraph, Optional<Path> roundResult, Path runDir, WarningGraph layer,
             Path layerEvaluation, String inputState, int inputRound, WarningMatcher matcher) throws IOException {
+        return build(earlierGraph, earlierGraph.map(Path::getParent), Optional.empty(), roundResult, runDir, layer,
+                layerEvaluation, inputState, inputRound, matcher);
+    }
+
+    /**
+     * Like the other overload, for an earlier graph that is itself an extended graph (round 3 and later).
+     *
+     * @param earlierEvaluation the evaluation whose packages the combined round result applied (its {@code
+     *     baseline/} and {@code attempts/} are the evidence); by default the earlier graph's own directory
+     * @param baseToGraph how that evaluation's baseline warning IDs map to nodes of the earlier graph (the earlier
+     *     stage's {@code reportToGraph}); when empty, a base warning is its own ID and must be a root (round 2)
+     */
+    public static Built build(Optional<Path> earlierGraph, Optional<Path> earlierEvaluation,
+            Optional<Map<String, String>> baseToGraph, Optional<Path> roundResult, Path runDir, WarningGraph layer,
+            Path layerEvaluation, String inputState, int inputRound, WarningMatcher matcher) throws IOException {
         Map<String, GraphNode> nodes = new LinkedHashMap<>();
         Map<String, GraphEdge> edges = new LinkedHashMap<>();
         Map<String, Object> record = new LinkedHashMap<>();
@@ -113,7 +128,8 @@ public final class HistoryGraph {
             earlier.nodes().forEach(n -> nodes.put(n.id(), n));
             earlier.edges().forEach(e -> edges.putIfAbsent(e.key(), e));
             record.put("earlierGraph", rel(runDir, history));
-            Path evaluationDir = history.getParent();
+            Path evaluationDir = earlierEvaluation.orElse(history.getParent());
+            record.put("earlierEvaluation", rel(runDir, evaluationDir));
             Path roundDir = roundResult.get();
             roundRef = rel(runDir, roundDir);
             Map<?, ?> round = parse(roundDir.resolve(RoundApplication.RECORD));
@@ -216,17 +232,21 @@ public final class HistoryGraph {
                 prov.put("matcher", matcher.id());
                 if ("PERSISTING".equals(f.get("status"))) {
                     String b = String.valueOf(f.get("baselineWarningId"));
-                    boolean verified = nodes.get(b) instanceof WarningNode n && n.root() && base.containsKey(b)
+                    String node = baseToGraph.isPresent() ? baseToGraph.get().get(b) : b;
+                    boolean verified = node != null && nodes.get(node) instanceof WarningNode n
+                            && (baseToGraph.isPresent() || n.root()) && base.containsKey(b)
                             && matcher.compare(List.of(base.get(b)), List.of(observed(w.id(), f))).persisting()
                                     .size() == 1;
                     prov.put("baseState", baseState);
                     if (verified) {
                         prov.put("evidence", "the combined result's comparison and the matcher pair it with base "
-                                + "warning " + b + " (" + rel(runDir, evaluationDir.resolve("baseline")) + ")");
-                        place(w, b, "persisting-from-base", prov, toGraph, identities, counts);
+                                + "warning " + b + " (" + rel(runDir, evaluationDir.resolve("baseline")) + ")"
+                                + (node.equals(b) ? "" : ", which the earlier graph records as node " + node));
+                        place(w, node, "persisting-from-base", prov, toGraph, identities, counts);
                     } else {
                         prov.put("limitation", "recorded as persisting from " + b + ", but " + b + " is not a matching "
-                                + "root of the earlier graph; kept as a separate node without history");
+                                + (baseToGraph.isPresent() ? "warning mapped to a node of the earlier graph"
+                                        : "root of the earlier graph") + "; kept as a separate node without history");
                         separate(w, "unverified-persisting", prov, unplaced, identities, counts);
                     }
                     continue;

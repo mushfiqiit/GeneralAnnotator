@@ -189,7 +189,8 @@ $GA pipeline status runs/<run id>        # recorded stages + scheduler states (c
 $GA pipeline status runs/<run id> --connect   # reconnect first (may prompt once)
 $GA pipeline finish runs/<run id>        # once all tasks ended: collect, evaluate, apply the round
 $GA pipeline start --resume runs/<run id>     # continue an interrupted start; never submits twice
-$GA pipeline propagate runs/<run id>     # optional, deterministic: single-pass nullability propagation
+$GA pipeline propagate runs/<run id>     # optional, deterministic: propagation round 2 (one pass)
+$GA pipeline propagate runs/<run id> --round 3   # one more pass, on the combined round-2 result
 ```
 
 **`pipeline start`**
@@ -1799,9 +1800,51 @@ called. The checker settings are the same as for `evaluate-annotations`
 `GA_CHECKER_JAVA_HOME`, ...).
 
 ```sh
-$GA pipeline propagate runs/<run id>    # after pipeline finish: reads the combined round-1 result
-$GA propagate runs/<run id>             # the same input selection, without recording the pipeline stage
+$GA pipeline propagate runs/<run id>    # after pipeline finish: round 2, on the combined round-1 result
+$GA pipeline propagate runs/<run id> --round 3   # round 3, on the combined round-2 result
+$GA propagate runs/<run id>             # round 2's input selection, without recording the pipeline stage
 ```
+
+**Rounds.** Each command runs exactly one pass; nothing iterates on its own.
+- **Round 2** is the default (`--round 2` is the same execution). It reads
+  the combined round-1 result and records itself in pipeline stage
+  `propagation`.
+- **Round `n > 2`** reads the combined result of the completed round
+  `n - 1` and records itself in its own stage, `propagation-r<n>`. Earlier
+  rounds' records are never overwritten. Round 1 is the LLM round
+  (`pipeline start` / `finish`) and is not accepted.
+- **Input checks for round `n`, before anything runs or is recorded:**
+  - stage `n - 1` is COMPLETED with outcome COMPLETED;
+  - its `propagation.json` is round `n - 1` and names the same combined
+    result, evaluation and graph as the stage;
+  - its input still has the identity it was computed on. A regenerated
+    earlier round makes later ones stale: refused, and kept only as
+    history.
+  - The combined result is then verified like round 1's (snapshot tree
+    hash, run IDs, complete findings).
+  - Any failure stops the command (exit 3) with what to run first. Nothing
+    falls back to an earlier round, a package workspace or another
+    directory.
+- **Output of round `n`:**
+  - `propagation/propagation<n>-<key>/`: analysis with skip reasons,
+    record, summary and extended graph;
+  - `evaluations/propagation<n>-<key>-<key>/`: the independent package
+    evaluations;
+  - `rounds/round<n>-<key>/`: the full annotated copy with `changes.diff`,
+    `warnings.txt`, `report.json`, `findings.json` and the comparisons.
+- **IDs:**
+  - Packages are `P<n>-0001, ...` (round 2 keeps `P0001, ...`), so every
+    round's packages are distinct graph nodes.
+  - Warnings first introduced in round `n` get `W<n>001, ...`.
+- **Keys:** the round, the input's identity (snapshot, report, graph) and
+  the rule version are in the stage key; the checker configuration is in
+  the evaluation key. Repeating a command reuses its results, and an
+  identical rerun is not added to the stage's `previous` history.
+- **Graph:** round `n` extends round `n - 1`'s extended graph. The
+  persisting input warnings are placed on round `n - 1`'s nodes through
+  its saved `reportToGraph` and the matcher, whatever their round (`W0`,
+  `W1`, `W2`, ...). Introduced input warnings are linked through round
+  `n - 1`'s own package evaluations, as in round 2.
 
 **Input.** The input is chosen from the directory, never by sorting
 directory names:
@@ -1832,13 +1875,35 @@ the resolved symbols all agree:
 |---|---|---|---|
 | `FIELD_ASSIGNMENT` | assigning @Nullable expression to @NonNull field | `f = x` where `x` reads a field, or calls a method, explicitly annotated `@Nullable`, and `f` is a field | `@Nullable` on `f`'s type |
 | `FIELD_INITIALIZER` | the same | a field declaration `T f = x` with such an `x` | `@Nullable` on `f`'s type |
-| `RETURN` | returning @Nullable expression from method with @NonNull return type | `return x` with such an `x`, in a method (not a lambda) | `@Nullable` on the method's return type |
+| `RETURN` | returning @Nullable expression from method with @NonNull return type | `return x` with such an `x`, in a method (not a lambda) | `@Nullable` on the method's return type, and on the return type of every declaration it overrides or implements; explicit non-null return annotations are replaced in the same package |
 | `ARGUMENT` | passing @Nullable parameter 'x' where @NonNull is required | an argument `x` (a field read, a method call, or a local or parameter) of a call whose method or constructor javac resolved; the argument index gives the formal parameter | `@Nullable` on that parameter, and on the same parameter of every implementation and override in the editable sources; explicit non-null annotations are removed in the same package |
 
 For the assignment and return rules, `x` may also be a local variable
 initialized (directly or through other locals, up to four) from such a field
 read or call. The proposed annotation is the value origin's own `@Nullable`
 (for example `org.jspecify.annotations.Nullable`).
+
+For `RETURN`, a method that overrides or implements other methods would
+break their non-null return contracts. So the package also annotates every
+declaration above it:
+- **What is found:** every supertype, through several interfaces and
+  multi-level inheritance. Matching uses javac's `Elements.overrides`, so
+  `String get()` implementing `Source<String>.get()` (`T get()`) is found
+  and `get(int)` is not. An implementation inherited by a source subclass
+  (`class Impl extends Helper implements Handler`) also gets the interface
+  method it implements there.
+- **What isn't touched:** overrides of the method and sibling
+  implementations keep their non-null returns, because a narrower return
+  is compatible.
+- **Existing annotations:** already-`@Nullable` contracts are kept.
+  Explicit non-null return annotations, on the method or an ancestor, are
+  replaced and listed in `contractChange`.
+- **Skipped as a whole:** a required contract outside the editable sources,
+  such as `Supplier#get` or `Object#toString`, skips the whole package
+  (`INCOMPLETE_HIERARCHY`). Library code is never changed.
+- **Example (EventBus, W1022):** `ThrowableFailureEvent#getExecutionScope()`
+  returns its `@Nullable` field `executionContext`. One package gives both
+  it and `HasExecutionScope#getExecutionScope()` `@Nullable Object` returns.
 
 For `ARGUMENT`, the NullAway diagnostic is the evidence that the value may be
 null; the argument needs no annotation of its own:
@@ -1904,21 +1969,24 @@ Regression examples (EventBus, round 1):
   assignments and returns) a source, or a local's origin, that is not
   explicitly `@Nullable`.
 - **`UNRESOLVED`:** positions or symbols that don't resolve to a matching tree.
-- **`EXPLICIT_CONTRACT`:** a destination that is already `@Nullable`, has a
-  non-null annotation, or is a method that overrides another method.
+- **`EXPLICIT_CONTRACT`:** a destination that is already `@Nullable`, or a
+  field with an explicit non-null annotation.
 - **`NOT_EDITABLE`:** a destination outside the configured source roots, in an
   anonymous or local class, or a field declared together with others.
 - **`UNSUPPORTED_TARGET`:** a varargs position or an anonymous class
   creation (see `ARGUMENT`).
-- **`INCOMPLETE_HIERARCHY`:** an implementation or override that the package
-  would also have to change cannot be edited (see `ARGUMENT`); nothing of the
-  package is proposed.
+- **`INCOMPLETE_HIERARCHY`:** a declaration the package would also have to
+  change cannot be edited. For an argument, that is an implementation or
+  override; for a return, a contract it overrides or implements (see
+  `ARGUMENT` and `RETURN`). Nothing of the package is proposed.
 
-The rule set is versioned (`nullable-flow-3`, generator
-`nullability-propagation-3`). Its version is part of `analysis.json` and so
+The rule set is versioned (`nullable-flow-4`, generator
+`nullability-propagation-4`). Its version is part of `analysis.json` and so
 of every cache key. Results from earlier versions are never reused:
-`nullable-flow-1` skipped argument warnings, and `nullable-flow-2` skipped
-interface, abstract and overridden targets.
+- `nullable-flow-1` skipped argument warnings;
+- `nullable-flow-2` skipped interface, abstract and overridden argument
+  targets;
+- `nullable-flow-3` skipped returns from overriding methods.
 
 **What happens next.**
 - **Candidates.** All candidates come from the fixed input, before any edit.
@@ -1932,7 +2000,7 @@ interface, abstract and overridden targets.
   - New warnings get the next round's IDs: `W2001, ...` after round 1.
   - There is one annotation node per package; its proposals are named
     `<warning>@propagation-1`, and the generator is recorded as
-    `nullability-propagation-3`.
+    `nullability-propagation-4`.
   - The graph gets `W -> A` for every resolved warning and `A -> N` for every
     introduced one.
   - Failed or incomplete evaluations claim nothing.

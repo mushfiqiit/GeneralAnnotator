@@ -168,13 +168,15 @@ interface or in one named class), labeled provisional, and noted here.
    introduced warnings, or some weighted combination.
 5. **Criteria for independent annotation batches.** When can several edits be
    attempted together without their effects interfering?
-6. **Widening parameter contracts with unseen implementations.** May a
+6. **Widening contracts with unseen implementations or callers.** May a
    propagated package widen an interface or overridable method's parameter
    when implementations may exist outside the analyzed sources (other
    modules, generated code, downstream users)? T19 provisionally widens it
    across the hierarchy found in the configured source roots, and says in
    the evidence that nothing outside them was searched
-   (`NullabilityPropagation.implementations`).
+   (`NullabilityPropagation.implementations`). T20's return packages widen
+   ancestor return contracts the same way, which callers outside the analyzed
+   sources may rely on (`NullabilityPropagation.ancestors`).
 
 ### Engineering decisions settled for stage 1 (revisit if they stop fitting)
 
@@ -478,7 +480,7 @@ interface or in one named class), labeled provisional, and noted here.
   - **Publication.** Results are published by an atomic rename and never
     overwritten. Failed attempts are kept as `-failed-<time>`.
 - **Single-pass nullability propagation (T17).** Provisional, in
-  `propagation.NullabilityPropagation` (rules `nullable-flow-3`) and
+  `propagation.NullabilityPropagation` (rules `nullable-flow-4`) and
   `propagation.PropagationStage`:
   - **Matching.** A warning matches only if the NullAway message ("assigning
     @Nullable expression to @NonNull field" or "returning @Nullable
@@ -521,16 +523,33 @@ interface or in one named class), labeled provisional, and noted here.
   - **Not followed:** values NullAway considers nullable for other reasons
     in assignments and returns (library models, conditionals, `null`
     literals, locals without an explicitly `@Nullable` origin).
-  - **Overriding methods are skipped.** The pass doesn't decide whether a
-    supertype's return contract should change. This is conservative and
-    open.
+  - **Return hierarchies (T20).** A return from a method that overrides or
+    implements other methods also annotates every return contract above it,
+    in one atomic package. It covers all supertypes, multiple interfaces and
+    generic substitutions, plus interface methods that a source subclass
+    implements through the inherited method, matched by javac's
+    `Elements.overrides`. Overrides and siblings keep their non-null
+    returns. Explicit non-null returns are replaced and recorded;
+    already-`@Nullable` contracts are kept. Provisional: a contract outside
+    the editable sources skips the whole package (`INCOMPLETE_HIERARCHY`).
+    That holds even where NullAway would treat an unannotated library
+    supertype as imposing no contract.
   - **Input (T17a).** For a pipeline, the input is the completed combined
     round-1 result named in pipeline.json. Its snapshot hash, report and graph
     run IDs, finding counts and IDs are verified; there is no fallback. A
     plain run uses its own baseline (round 0).
+  - **Later rounds (T21).** `pipeline propagate --round n` (n > 2) reads the
+    combined result of round n - 1 from that round's own pipeline stage
+    (`PropagationStage.stageName`: `propagation` for round 2,
+    `propagation-r<n>` later), after checking three things: its record, its
+    artifacts, and that its input identity is unchanged (otherwise it is
+    stale). Each command runs exactly one pass. Packages are `P<n>-0001`;
+    new warnings get `W<n>001`. The extended graph of round n - 1 is
+    extended in turn (`HistoryGraph` with the earlier round's evaluation as
+    evidence and its `reportToGraph` for base identities).
   - **Evaluation.** Candidates come only from that fixed input and are merged
     by edit set (`P0001, ...`, origins `<warning>@propagation-r<source
-    round>`, generator `nullability-propagation-3`). `Evaluator` evaluates
+    round>`, generator `nullability-propagation-4`). `Evaluator` evaluates
     them with round = source round + 1 on copies of the input snapshot.
     - Baseline warning IDs are inherited from the input
       (`Evaluator.inheriting`); the fresh baseline must reproduce its
@@ -692,7 +711,7 @@ interface or in one named class), labeled provisional, and noted here.
 | 5. Apply and recheck | `apply-proposal` applies a proposal's edits, all or nothing, to a snapshot copy (`applications/`). `evaluate-annotations` applies each distinct complete edit set (equivalent answers merged) as one package to a copy of one baseline, reruns NullAway once on all source roots and compares findings with the provisional `anchored-1` rule (T8, T8b, T8c). Verified with fakes and manually on EventBus (39 answers, 27 unique packages, all completed). |
 | 5b. Apply a whole round | `apply-round --round 1` applies all validated packages together to one snapshot copy, checks it once and saves every finding with its comparison; the result can serve as the next round's run (T8d). Verified with fakes and manually on EventBus (27 packages, 42 → 19 findings). |
 | 5c. Whole pipeline | `pipeline start` (analysis to submission) and `pipeline finish` (collection, independent evaluation, combined application), resumable, with `pipeline status` (T16). Verified with fakes; stages 1–5 also with real tools offline. A real submission through `pipeline` is not verified. |
-| 5d. Deterministic propagation | `propagate` / `pipeline propagate`: one pass of nullable assignment/return propagation from the baseline, independent evaluation, combined application (T17). Verified with fakes and with real NullAway on a small project. |
+| 5d. Deterministic propagation | `propagate` / `pipeline propagate [--round n]`: one pass of nullable assignment/return/argument propagation per explicitly selected round, on the previous round's combined result; independent evaluation, combined application, extended graph (T17-T21). Verified with fakes and with real NullAway on EventBus (rounds 2 and 3). |
 | 6. Record | Partly: per-attempt records, summary and the expanded graph (T8). No append-only state-transition log (T9). |
 | 7. Explore and select | Not implemented; blocked on §6 decisions |
 | 8. Batch | Not implemented; blocked on §6 decisions |

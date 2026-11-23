@@ -25,6 +25,7 @@ import generalannotator.inference.remote.Cluster;
 import generalannotator.inference.remote.RemoteSettings;
 import generalannotator.inference.remote.SshConnection;
 import generalannotator.prompts.PromptManifestJson;
+import generalannotator.propagation.NullabilityPropagation;
 import generalannotator.propagation.PropagationStage;
 import generalannotator.report.Json;
 import generalannotator.report.JsonParser;
@@ -42,6 +43,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
@@ -657,24 +659,54 @@ public final class Pipeline {
 
     // ============================================================== propagation
 
-    /**
-     * The explicitly selected, deterministic nullability-propagation stage on the pipeline's baseline (see
-     * {@link PropagationStage}). It needs only a completed analysis, calls no LLM, and leaves the LLM stages
-     * and the pipeline status unchanged.
-     */
+    /** {@link #propagate(String, String)} for the default round (2). */
     public ExitCode propagate(String argument) {
+        return propagate(argument, null);
+    }
+
+    /**
+     * One explicitly selected, deterministic nullability-propagation pass (see {@link PropagationStage}). Round 2
+     * (the default, {@code roundText} null) reads the combined round-1 result; round {@code n > 2} reads the
+     * combined result of the completed propagation round {@code n - 1}. Each round is recorded in its own stage
+     * ({@link PropagationStage#stageName}); no LLM is called, and the LLM stages, the earlier rounds' records and
+     * the pipeline status are left unchanged.
+     */
+    public ExitCode propagate(String argument, String roundText) {
+        int round = PropagationStage.DEFAULT_ROUND;
+        if (roundText != null) {
+            try {
+                round = Integer.parseInt(roundText);
+            } catch (NumberFormatException e) {
+                round = -1;
+            }
+            if (round < PropagationStage.DEFAULT_ROUND) {
+                err.println("GeneralAnnotator: --round must be a propagation round (2 or later; round 1 is the LLM "
+                        + "round of pipeline start / finish), not '" + roundText + "'");
+                return ExitCode.USAGE_OR_CONFIGURATION_ERROR;
+            }
+        }
+        int selected = round;
         Optional<Path> found = pipelineDirectory(argument);
         if (found.isEmpty()) {
             return ExitCode.USAGE_OR_CONFIGURATION_ERROR;
         }
         Path dir = found.get();
         return locked(dir, false, state -> {
-            out.println("GeneralAnnotator pipeline propagate " + dir);
+            out.println("GeneralAnnotator pipeline propagate " + dir + (roundText == null ? "" : " --round "
+                    + selected));
             Optional<ExitCode> refused = verifyInputs(dir, state);
             if (refused.isPresent()) {
                 return refused.get();
             }
-            if (!"COMPLETED".equals(stage(state, "combined").get("status"))) {
+            if (selected > PropagationStage.DEFAULT_ROUND) {
+                // the input must be complete and consistent before any record changes; nothing falls back
+                try {
+                    PropagationStage.Input.fromPipeline(dir, selected);
+                } catch (NullabilityPropagation.InvalidException e) {
+                    out.println("Cannot run propagation round " + selected + ": " + e.getMessage());
+                    return ExitCode.EXECUTION_FAILURE;
+                }
+            } else if (!"COMPLETED".equals(stage(state, "combined").get("status"))) {
                 out.println("Propagation reads the combined round-1 result (its annotated code and warnings), but this "
                         + "pipeline's combined stage is " + stage(state, "combined").get("status") + ". Run `pipeline "
                         + "finish " + dir + "` until it completes, then rerun `pipeline propagate " + dir + "`. Nothing "
@@ -682,20 +714,30 @@ public final class Pipeline {
                 return ExitCode.EXECUTION_FAILURE;
             }
             out.println();
-            out.println("== [propagation] single-pass nullability propagation (propagate; deterministic, no LLM)");
-            Map<String, Object> propagation = stage(state, "propagation");
+            String stageName = PropagationStage.stageName(selected);
+            out.println("== [" + stageName + "] propagation round " + selected + ": one nullability propagation pass "
+                    + "(deterministic, no LLM)");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> propagation = (Map<String, Object>) ((Map<String, Object>) state.get("stages"))
+                    .computeIfAbsent(stageName, k -> new LinkedHashMap<>(Map.of("status", "PENDING")));
+            Map<String, Object> archived = null;
             if (propagation.get("outcome") != null) {
                 // an earlier result (possibly for another input, for example the original baseline) is kept as history
                 List<Object> previous = list(propagation.get("previous"));
-                Map<String, Object> copy = new LinkedHashMap<>(propagation);
-                copy.remove("previous");
-                previous.add(copy);
+                archived = new LinkedHashMap<>(propagation);
+                archived.remove("previous");
+                if (archived.get("artifacts") instanceof Map<?, ?> files) {
+                    archived.put("artifacts", new LinkedHashMap<>(files)); // artifacts() updates the live map
+                }
+                previous.add(archived);
                 propagation.put("previous", previous);
                 propagation.remove("input");
             }
+            propagation.put("round", selected);
             beginStage(dir, state, propagation);
-            PropagateCommand command = new PropagateCommand(dir.toString(), env, workingDirectory, defaultJavaHome,
-                    tools.checkers(), tools.applier(), tools.matcher(), tools.clock(), out, err);
+            PropagateCommand command = new PropagateCommand(dir.toString(), java.util.OptionalInt.of(selected), env,
+                    workingDirectory, defaultJavaHome, tools.checkers(), tools.applier(), tools.matcher(),
+                    tools.clock(), out, err);
             ExitCode code = command.run();
             Optional<PropagationStage.Result> result = command.result();
             if (result.isEmpty()) {
@@ -719,6 +761,15 @@ public final class Pipeline {
                     files.put("combined", String.valueOf(c.get("directory")));
                 }
                 artifacts(propagation, files);
+                // compared as JSON: the archived copy was parsed (Long numbers), the new one is fresh (Integer)
+                if (archived != null && Json.write(archived.get("artifacts")).equals(Json.write(propagation.get(
+                        "artifacts"))) && Objects.equals(archived.get("outcome"), propagation.get("outcome"))
+                        && Json.write(archived.get("input")).equals(Json.write(propagation.get("input")))) {
+                    list(propagation.get("previous")).remove(archived); // the same execution, reused: not history
+                    if (list(propagation.get("previous")).isEmpty()) {
+                        propagation.remove("previous");
+                    }
+                }
                 finishStage(propagation, code == ExitCode.COMPLETED ? "COMPLETED" : "FAILED",
                         result.get().outcome() + ": " + record.get("detail"));
             }
@@ -906,7 +957,7 @@ public final class Pipeline {
         b.append("Pipeline ").append(state.get("pipelineId")).append(" (round ").append(state.get("round"))
                 .append("): ").append(state.get("status")).append('\n');
         b.append("  directory: ").append(dir).append('\n');
-        for (String s : STAGES) {
+        for (String s : stageNames(state)) {
             Map<String, Object> st = stage(state, s);
             b.append(String.format("  %-12s %-10s %s%n", s, st.get("status"), st.get("detail") == null ? ""
                     : st.get("detail")));
@@ -939,7 +990,7 @@ public final class Pipeline {
 
     private void printStages(Map<String, Object> state) {
         out.println("  status: " + state.get("status"));
-        for (String s : STAGES) {
+        for (String s : stageNames(state)) {
             Map<String, Object> st = stage(state, s);
             out.println(String.format("  %-12s %-10s %s", s, st.get("status"), st.get("detail") == null ? ""
                     : st.get("detail")));
@@ -948,6 +999,17 @@ public final class Pipeline {
             out.println("  submission: " + sub.get("id") + (sub.get("jobIds") == null ? "" : ", Slurm job "
                     + sub.get("jobIds")));
         }
+    }
+
+    /** The fixed stages, then any later propagation rounds ({@code propagation-r3, ...}) in round order. */
+    @SuppressWarnings("unchecked")
+    private static List<String> stageNames(Map<String, Object> state) {
+        List<String> names = new ArrayList<>(STAGES);
+        ((Map<String, Object>) state.get("stages")).keySet().stream()
+                .filter(k -> k.matches("propagation-r\\d+"))
+                .sorted(java.util.Comparator.comparingInt(k -> Integer.parseInt(k.substring("propagation-r".length()))))
+                .forEach(names::add);
+        return names;
     }
 
     @SuppressWarnings("unchecked")

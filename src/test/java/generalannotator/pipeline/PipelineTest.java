@@ -713,4 +713,279 @@ class PipelineTest {
         assertEquals("FAILED", stage("combined").get("status"));
         assertEquals("CHECK_FAILED", stage("combined").get("roundStatus"));
     }
+
+    // -------------------------------------------------------------------------------------- propagation rounds
+
+    static final String CHAIN = """
+            package p;
+
+            /** Fixture. */
+            public class A implements Src {
+                Object f1;
+                Object m;
+                Object h;
+                Object k;
+
+                Object get() { return f1; }
+
+                public Object val() { return get(); }
+
+                void init() {
+                    m = get();
+                    h = get();
+                    k = h;
+                }
+            }
+            """;
+
+    static final String ASSIGN = "assigning @Nullable expression to @NonNull field";
+    static final String RETURN = "returning @Nullable expression from method with @NonNull return type";
+
+    /**
+     * Like NullAway on {@link #CHAIN}: round 1 annotates f1, which makes {@code return f1} warn; round 2 annotates
+     * get(), which makes {@code h = get()} and {@code return get()} (in val(), implementing Src) warn and gives the
+     * original {@code m = get()} a nullable origin; round 3 annotates m, h and val() (with Src#val), and h makes
+     * {@code k = h} warn, which only a later round may take up.
+     */
+    static CheckerOutcome chain(FakeChecker.Source s) {
+        List<Diagnostic> f = new ArrayList<>();
+        if (!s.annotated("Object f1;")) {
+            f.add(s.at("Object f1;", "@NonNull field 'f1' not initialized"));
+        }
+        if (!s.annotated("Object m;")) {
+            f.add(s.at("m = get();", ASSIGN));
+        }
+        if (s.annotated("Object f1;") && !s.annotated("Object get()")) {
+            f.add(s.at("return f1", RETURN));
+        }
+        if (s.annotated("Object get()")) {
+            if (!s.annotated("Object h;")) {
+                f.add(s.at("h = get();", ASSIGN));
+            }
+            if (!s.annotated("Object val()")) {
+                f.add(s.at("return get();", RETURN));
+            }
+        }
+        if (s.annotated("Object h;") && !s.annotated("Object k;")) {
+            f.add(s.at("k = h;", ASSIGN));
+        }
+        return new CompletedAnalysis(f, List.of());
+    }
+
+    /** The chain target, pipeline round 1 finished (f1 annotated) and propagation round 2 completed. */
+    private Path roundsOneAndTwo() throws Exception {
+        setUp(1, PipelineTest::chain);
+        Files.writeString(target.resolve("src/p/A.java"), CHAIN);
+        Files.writeString(target.resolve("src/p/Src.java"), "package p;\n\ninterface Src {\n    Object val();\n}\n");
+        Files.createDirectories(target.resolve("src/org/jspecify/annotations"));
+        Files.writeString(target.resolve("src/org/jspecify/annotations/Nullable.java"),
+                "package org.jspecify.annotations;\n\npublic @interface Nullable {}\n");
+        assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.empty()), output());
+        Path dir = runDir();
+        answer("W0001", List.of(field("f1", "ADD")));
+        cluster.workerResult(remoteDir(), "W0002", 1, "FAILED", "STARTUP_TIMEOUT");
+        allTasks("COMPLETED");
+        assertEquals(ExitCode.COMPLETED, pipeline().finish(dir.toString()), output());
+        assertEquals(ExitCode.COMPLETED, pipeline().propagate(dir.toString()), output());
+        assertEquals("COMPLETED", stage("propagation").get("outcome"), output());
+        return dir;
+    }
+
+    private static String artifact(Map<?, ?> stage, String key) {
+        return (String) ((Map<?, ?>) stage.get("artifacts")).get(key);
+    }
+
+    private static List<String> edges(WarningGraph g) {
+        return g.edges().stream().map(e -> e.source() + " " + e.kind() + " " + e.target()).toList();
+    }
+
+    @Test
+    void roundThreeReadsTheCombinedRoundTwoResultAndExtendsItsGraphInOnePass() throws Exception {
+        Path dir = roundsOneAndTwo();
+        Map<?, ?> roundTwo = stage("propagation");
+        String roundTwoRecord = Json.write(roundTwo);
+        Path roundTwoCombined = dir.resolve(artifact(roundTwo, "combined"));
+        Path roundTwoGraph = dir.resolve(artifact(roundTwo, "graph"));
+        String roundTwoGraphText = Files.readString(roundTwoGraph);
+        String roundTwoTree = EvaluationFiles.treeHash(roundTwoCombined);
+        WarningGraph before = WarningGraphJson.load(roundTwoGraph);
+        String targetBefore = EvaluationFiles.treeHash(target);
+
+        assertEquals(ExitCode.COMPLETED, pipeline().propagate(dir.toString(), "3"), output());
+
+        // round 2's record is untouched; round 3 has its own
+        assertEquals(roundTwoRecord, Json.write(stage("propagation")), "round 3 never overwrites round 2's record");
+        Map<?, ?> three = stage("propagation-r3");
+        assertEquals("COMPLETED", three.get("status"), output());
+        assertEquals(3L, three.get("round"));
+        Map<?, ?> input = (Map<?, ?>) three.get("input");
+        assertEquals(2L, input.get("sourceRound"));
+        assertEquals(roundTwoCombined.getFileName().toString(), input.get("state"),
+                "the combined round-2 result named in round 2's record, not round 1 or a package workspace");
+        assertTrue(artifact(three, "directory").startsWith("propagation/propagation3-"), three.toString());
+        assertTrue(artifact(three, "combined").startsWith("rounds/round3-"), three.toString());
+        Map<?, ?> record = json(dir.resolve(artifact(three, "directory")).resolve("propagation.json"));
+        assertEquals(3L, record.get("round"));
+
+        // candidates: the persisting original m = get() (its origin became @Nullable in round 2), and round 2's
+        // h = get() and return get(), the latter as one hierarchy package with Src#val
+        Map<?, ?> analysis = json(dir.resolve(artifact(three, "directory")).resolve("analysis.json"));
+        assertEquals(3, ((List<?>) analysis.get("matches")).size(), analysis.toString());
+        List<?> packages = (List<?>) record.get("packages");
+        assertEquals(List.of("P3-0001", "P3-0002", "P3-0003"), packages.stream()
+                .map(p -> ((Map<?, ?>) p).get("id")).sorted().toList(), "round-3 package IDs never collide with "
+                + "round 2's P0001");
+        assertTrue(packages.stream().anyMatch(p -> ((Map<?, ?>) p).get("edits").toString().contains("p.Src#val()")
+                && ((Map<?, ?>) p).get("edits").toString().contains("p.A#val()")), packages.toString());
+
+        // the full annotated copy keeps every earlier round's annotations
+        Path combined = dir.resolve(artifact(three, "combined"));
+        String a = Files.readString(combined.resolve("workspace/target/src/p/A.java"));
+        for (String annotated : List.of("@org.jspecify.annotations.Nullable Object f1;",
+                "@org.jspecify.annotations.Nullable Object get()", "@org.jspecify.annotations.Nullable Object m;",
+                "@org.jspecify.annotations.Nullable Object h;",
+                "public @org.jspecify.annotations.Nullable Object val()")) {
+            assertTrue(a.contains(annotated), annotated + " in\n" + a);
+        }
+        assertTrue(a.contains("    Object k;"), "one pass: k = h is introduced by round 3 and not propagated\n" + a);
+        assertTrue(Files.readString(combined.resolve("workspace/target/src/p/Src.java"))
+                .contains("@org.jspecify.annotations.Nullable Object val();"));
+        for (String file : List.of("changes.diff", "warnings.txt", "report.json", "findings.json", "round.json")) {
+            assertTrue(Files.isRegularFile(combined.resolve(file)), file);
+        }
+        Map<?, ?> comparison = (Map<?, ?>) ((Map<?, ?>) record.get("combined")).get("comparison");
+        assertEquals(3L, comparison.get("resolved"), comparison.toString());
+        assertEquals(1L, comparison.get("introduced"));
+
+        // the graph: round 2's graph kept whole, round 3's packages and edges added, W3001 for k = h
+        WarningGraph g = WarningGraphJson.load(dir.resolve(artifact(three, "graph")));
+        before.nodes().forEach(n -> assertEquals(n, g.node(n.id()).orElseThrow(), "kept: " + n.id()));
+        before.edges().forEach(e -> assertTrue(g.edges().contains(e), "kept: " + e));
+        Set<String> ids = new java.util.HashSet<>();
+        g.nodes().forEach(n -> assertTrue(ids.add(n.id()), "duplicate node " + n.id()));
+        assertTrue(g.nodes().stream().allMatch(n -> n instanceof AnnotationNode
+                || n instanceof generalannotator.graph.WarningNode));
+        assertTrue(g.edges().stream().allMatch(e -> e.kind().equals("resolved-by") || e.kind().equals("introduces")));
+        List<String> edges = edges(g);
+        String mPackage = packages.stream().map(p -> (Map<?, ?>) p).filter(p -> p.get("edits").toString()
+                .contains("p.A#m ")).findFirst().orElseThrow().get("id").toString();
+        String hPackage = packages.stream().map(p -> (Map<?, ?>) p).filter(p -> p.get("edits").toString()
+                .contains("p.A#h ")).findFirst().orElseThrow().get("id").toString();
+        assertTrue(edges.contains("W0002 resolved-by " + mPackage), "an original (W0) warning persisting through two "
+                + "rounds is resolved in round 3\n" + edges);
+        assertTrue(edges.contains(hPackage + " introduces W3001"), edges.toString());
+        assertTrue(edges.stream().anyMatch(e -> e.matches("W2\\d{3} resolved-by " + hPackage)),
+                "round 2's introduced h = get() is resolved in round 3\n" + edges);
+        assertEquals(1, g.warningNodes().stream().filter(w -> w.id().startsWith("W3")).count(),
+                "only the genuinely new warning gets a round-3 ID");
+        Map<?, ?> history = (Map<?, ?>) record.get("history");
+        assertEquals(Map.of("linked-to-package-warning", 2L, "persisting-from-base", 1L), history.get("counts"));
+
+        // nothing earlier was modified
+        assertEquals(roundTwoGraphText, Files.readString(roundTwoGraph));
+        assertEquals(roundTwoTree, EvaluationFiles.treeHash(roundTwoCombined));
+        assertEquals(targetBefore, EvaluationFiles.treeHash(target));
+        assertTrue(Files.readString(dir.resolve(Pipeline.SUMMARY)).contains("propagation-r3"));
+
+        // repeating the command reuses everything and duplicates nothing
+        int calls = checker.calls();
+        String graphText = Files.readString(dir.resolve(artifact(three, "graph")));
+        assertEquals(ExitCode.COMPLETED, pipeline().propagate(dir.toString(), "3"), output());
+        assertEquals(calls, checker.calls(), "nothing is rechecked");
+        assertEquals(graphText, Files.readString(dir.resolve(artifact(stage("propagation-r3"), "graph"))));
+        assertEquals(List.of(), stage("propagation-r3").get("previous") == null ? List.of()
+                : stage("propagation-r3").get("previous"), "an identical rerun is not archived as history");
+        try (Stream<Path> rounds = Files.list(dir.resolve("rounds"))) {
+            assertEquals(1, rounds.filter(p -> p.getFileName().toString().startsWith("round3-")).count());
+        }
+
+        // the graph can be rebuilt from saved artifacts alone, identically
+        PrintStream sink = new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8);
+        assertEquals(ExitCode.COMPLETED, generalannotator.cli.PropagateCommand.rebuildGraph(
+                dir.resolve(artifact(three, "directory")).toString(), temp, new AnchoredWarningMatcher(),
+                PrepareInferenceCommandTest.CLOCK, sink, sink));
+        assertEquals(graphText, Files.readString(dir.resolve(artifact(three, "graph"))));
+        assertEquals(calls, checker.calls());
+
+        // the same logic serves round 4: k = h, introduced in round 3, is taken up only now
+        assertEquals(ExitCode.COMPLETED, pipeline().propagate(dir.toString(), "4"), output());
+        Map<?, ?> four = stage("propagation-r4");
+        assertEquals(artifact(three, "combined"), ((String) ((Map<?, ?>) four.get("input")).get("directory"))
+                .substring(dir.toString().length() + 1));
+        WarningGraph g4 = WarningGraphJson.load(dir.resolve(artifact(four, "graph")));
+        assertTrue(edges(g4).contains("W3001 resolved-by P4-0001"), edges(g4).toString());
+        assertTrue(g4.warningNodes().stream().noneMatch(w -> w.id().startsWith("W4")), "no W4 nodes: none introduced");
+    }
+
+    @Test
+    void roundThreeRefusesAMissingIncompleteOrStaleRoundTwoWithoutFallingBack() throws Exception {
+        setUp(1, PipelineTest::chain);
+        Files.writeString(target.resolve("src/p/A.java"), CHAIN);
+        Files.writeString(target.resolve("src/p/Src.java"), "package p;\n\ninterface Src {\n    Object val();\n}\n");
+        assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.empty()), output());
+        Path dir = runDir();
+
+        // no round 2 (and not even round 1): refused, nothing recorded or written
+        assertEquals(ExitCode.EXECUTION_FAILURE, pipeline().propagate(dir.toString(), "3"), output());
+        assertTrue(output().contains("pipeline stage propagation is PENDING") && output().contains("pipeline "
+                + "propagate " + dir + "`"), output());
+        assertFalse(((Map<?, ?>) state().get("stages")).containsKey("propagation-r3"));
+        assertFalse(Files.exists(dir.resolve("propagation")));
+        // round 1 is not a propagation round, nor is garbage
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, pipeline().propagate(dir.toString(), "1"), output());
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, pipeline().propagate(dir.toString(), "x"), output());
+    }
+
+    @Test
+    void roundThreeRefusesAnInconsistentOrStaleRoundTwoRecord() throws Exception {
+        Path dir = roundsOneAndTwo();
+        Path state = dir.resolve(Pipeline.STATE);
+        String original = Files.readString(state);
+        Path record = dir.resolve(artifact(stage("propagation"), "directory")).resolve("propagation.json");
+        String recordText = Files.readString(record);
+        int calls = checker.calls();
+
+        // the stage names another combined directory than its record: inconsistent
+        String combined = artifact(stage("propagation"), "combined");
+        Files.writeString(state, original.replace("\"combined\": \"" + combined + "\"",
+                "\"combined\": \"rounds/" + json(state).get("pipelineId") + "\""));
+        assertEquals(ExitCode.EXECUTION_FAILURE, pipeline().propagate(dir.toString(), "3"), output());
+        assertTrue(output().contains("does not describe a completed round 2") || output().contains("missing"),
+                output());
+        Files.writeString(state, original);
+
+        // round 2 was computed on another input than round 1 now resolves to: stale, refused
+        Map<?, ?> input = (Map<?, ?>) json(record).get("input");
+        Files.writeString(record, recordText.replace((String) input.get("identity"), "0".repeat(64)));
+        assertEquals(ExitCode.EXECUTION_FAILURE, pipeline().propagate(dir.toString(), "3"), output());
+        assertTrue(output().contains("stale") && output().contains("pipeline propagate " + dir + "`"), output());
+        Files.writeString(record, recordText);
+
+        // round 2's combined snapshot was modified: its warnings no longer describe it
+        Path a = dir.resolve(combined).resolve("workspace/target/src/p/A.java");
+        String source = Files.readString(a);
+        Files.writeString(a, source + "\n// edited\n");
+        assertEquals(ExitCode.EXECUTION_FAILURE, pipeline().propagate(dir.toString(), "3"), output());
+        assertTrue(output().contains("no longer matches round.json"), output());
+        Files.writeString(a, source);
+
+        assertEquals(calls, checker.calls(), "nothing ran");
+        assertFalse(((Map<?, ?>) state().get("stages")).containsKey("propagation-r3"));
+        assertEquals(ExitCode.COMPLETED, pipeline().propagate(dir.toString(), "3"), "restored, it runs\n" + output());
+    }
+
+    @Test
+    void theDefaultRoundIsStillRoundTwo() throws Exception {
+        Path dir = roundsOneAndTwo();
+        String record = Json.write(stage("propagation"));
+        int calls = checker.calls();
+
+        assertEquals(ExitCode.COMPLETED, pipeline().propagate(dir.toString(), "2"), output());
+
+        assertEquals(calls, checker.calls(), "--round 2 is the same execution as the default");
+        assertEquals(artifact((Map<?, ?>) JsonParser.parse(record), "directory"),
+                artifact(stage("propagation"), "directory"));
+        assertTrue(artifact(stage("propagation"), "directory").startsWith("propagation/propagation2-"));
+        assertFalse(((Map<?, ?>) state().get("stages")).containsKey("propagation-r2"));
+    }
 }

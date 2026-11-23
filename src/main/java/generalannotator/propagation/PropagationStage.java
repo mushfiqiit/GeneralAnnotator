@@ -72,7 +72,7 @@ import java.util.TreeMap;
 public final class PropagationStage {
 
     public static final String DIR = "propagation";
-    public static final String GENERATOR = "nullability-propagation-3";
+    public static final String GENERATOR = "nullability-propagation-4";
     /** Package IDs of this stage ({@code P0001, ...}), distinct from answer packages ({@code A0001, ...}). */
     public static final String ID_PREFIX = "P";
     /** The extended graph: earlier history plus this stage's nodes and edges. */
@@ -84,6 +84,25 @@ public final class PropagationStage {
     /** Origins are named {@code <warning>@propagation-r<source round>}. */
     public static String group(int sourceRound) {
         return "propagation-r" + sourceRound;
+    }
+
+    /** The round a pipeline propagation runs when none is selected: round 2, on the combined round-1 result. */
+    public static final int DEFAULT_ROUND = 2;
+
+    /**
+     * The pipeline stage that records propagation round {@code round}: {@code propagation} for round 2 (as before
+     * rounds could be selected), {@code propagation-r<round>} for later rounds, so no round overwrites another's.
+     */
+    public static String stageName(int round) {
+        return round == DEFAULT_ROUND ? "propagation" : "propagation-r" + round;
+    }
+
+    /**
+     * Package IDs of round {@code round}: {@code P0001, ...} in round 2, {@code P<round>-0001, ...} later, so the
+     * packages of every round are distinct nodes of one extended graph.
+     */
+    public static String idPrefix(int round) {
+        return round <= DEFAULT_ROUND ? ID_PREFIX : ID_PREFIX + round + "-";
     }
 
     /**
@@ -100,13 +119,142 @@ public final class PropagationStage {
      * @param originRounds the round each warning ID was introduced in
      * @param identity a digest of the snapshot, report and warning graph, part of every cache key
      * @param inherit whether evaluations keep these IDs (always for a combined result)
+     * @param historyEvaluation the evaluation whose packages the input state applied (the evidence for linking
+     *     the input's warnings); by default the history graph's own directory
+     * @param historyIds how that evaluation's baseline IDs map to nodes of the history graph (the earlier
+     *     propagation's {@code reportToGraph}); empty for round 2, whose base warnings are the graph's roots
      */
     public record Input(Path dir, Path output, int sourceRound, String state, String description,
             Optional<Path> historyGraph, List<WarningNode> nodes, Map<String, Integer> originRounds, String identity,
-            boolean inherit) {
+            boolean inherit, Optional<Path> historyEvaluation, Optional<Map<String, String>> historyIds) {
+
+        public Input(Path dir, Path output, int sourceRound, String state, String description,
+                Optional<Path> historyGraph, List<WarningNode> nodes, Map<String, Integer> originRounds,
+                String identity, boolean inherit) {
+            this(dir, output, sourceRound, state, description, historyGraph, nodes, originRounds, identity, inherit,
+                    Optional.empty(), Optional.empty());
+        }
 
         public Path snapshot() {
             return dir.resolve("workspace").resolve("target");
+        }
+
+        /** The round this input feeds: the source round plus one. */
+        public int round() {
+            return sourceRound + 1;
+        }
+
+        /**
+         * Like {@link #resolve(Path)}, with an explicitly selected round: for a pipeline, round {@code n} reads the
+         * completed combined result of round {@code n - 1} recorded in {@code pipeline.json} (round 2: the combined
+         * round-1 result); a round is accepted only for a pipeline directory.
+         */
+        public static Input resolve(Path dir, java.util.OptionalInt round)
+                throws NullabilityPropagation.InvalidException, IOException {
+            if (round.isEmpty()) {
+                return resolve(dir);
+            }
+            if (!Files.isRegularFile(dir.resolve("pipeline.json"))) {
+                throw new NullabilityPropagation.InvalidException("--round " + round.getAsInt() + " selects a "
+                        + "propagation round of a pipeline, but " + dir + " has no pipeline.json");
+            }
+            return fromPipeline(dir, round.getAsInt());
+        }
+
+        /**
+         * Round {@code round} of a pipeline: round 2 reads the combined round-1 result; round {@code n > 2} reads
+         * the combined result of the completed propagation round {@code n - 1} recorded in its own pipeline stage
+         * ({@link #stageName}), after verifying that round's record, its artifacts, and that its input is still
+         * what it was computed on (so a regenerated earlier round makes every later one stale, never silently
+         * reused). Directories are never chosen by name or modification time; nothing falls back.
+         */
+        public static Input fromPipeline(Path runDir, int round)
+                throws IOException, NullabilityPropagation.InvalidException {
+            if (round < DEFAULT_ROUND) {
+                throw new NullabilityPropagation.InvalidException("round " + round + " is not a propagation round: "
+                        + "round 1 is the LLM round (pipeline start / finish); propagation rounds start at "
+                        + DEFAULT_ROUND);
+            }
+            if (round == DEFAULT_ROUND) {
+                return fromPipeline(runDir);
+            }
+            int previousRound = round - 1;
+            String previousStage = stageName(previousRound);
+            String rerunPrevious = "`pipeline propagate " + runDir + (previousRound == DEFAULT_ROUND ? ""
+                    : " --round " + previousRound) + "`";
+            String fix = " Run " + rerunPrevious + " until it completes, then rerun `pipeline propagate " + runDir
+                    + " --round " + round + "`; round " + round + " never falls back to an earlier round.";
+            Map<?, ?> state = parse(runDir.resolve("pipeline.json"));
+            Map<?, ?> stages = state.get("stages") instanceof Map<?, ?> m ? m : Map.of();
+            Map<?, ?> stage = stages.get(previousStage) instanceof Map<?, ?> m ? m : Map.of();
+            if (!"COMPLETED".equals(stage.get("status")) || !"COMPLETED".equals(stage.get("outcome"))) {
+                throw new NullabilityPropagation.InvalidException("round " + round + " reads the completed combined "
+                        + "result of round " + previousRound + ", but pipeline stage " + previousStage + " is "
+                        + (stage.isEmpty() ? "absent" : stage.get("status") + " (outcome " + stage.get("outcome")
+                                + ")") + "." + fix);
+            }
+            Map<?, ?> artifacts = stage.get("artifacts") instanceof Map<?, ?> m ? m : Map.of();
+            for (String key : List.of("directory", "combined", "graph", "evaluations")) {
+                if (!(artifacts.get(key) instanceof String)) {
+                    throw new NullabilityPropagation.InvalidException("pipeline stage " + previousStage + " records no "
+                            + key + " artifact, so round " + previousRound + "'s result is incomplete." + fix);
+                }
+            }
+            Path stageDir = inside(runDir, DIR, (String) artifacts.get("directory"), previousStage, fix);
+            Path combined = inside(runDir, RoundApplication.DIR, (String) artifacts.get("combined"), previousStage, fix);
+            Path evaluation = inside(runDir, Evaluator.DIR, (String) artifacts.get("evaluations"), previousStage, fix);
+            Path graph = inside(runDir, DIR, (String) artifacts.get("graph"), previousStage, fix);
+            if (!Files.isRegularFile(stageDir.resolve(RESULT)) || !Files.isRegularFile(graph)
+                    || !Files.isDirectory(evaluation)) {
+                throw new NullabilityPropagation.InvalidException("the round-" + previousRound + " artifacts named by "
+                        + "pipeline stage " + previousStage + " are missing (" + stageDir.resolve(RESULT) + ", " + graph
+                        + ", " + evaluation + ")." + fix);
+            }
+            Map<?, ?> record = parse(stageDir.resolve(RESULT));
+            Map<?, ?> recordCombined = record.get("combined") instanceof Map<?, ?> m ? m : Map.of();
+            Map<?, ?> recordEvaluation = record.get("evaluation") instanceof Map<?, ?> m ? m : Map.of();
+            Map<?, ?> recordInput = record.get("input") instanceof Map<?, ?> m ? m : Map.of();
+            Map<?, ?> history = record.get("history") instanceof Map<?, ?> m ? m : Map.of();
+            boolean consistent = record.get("round") instanceof Number r && r.intValue() == previousRound
+                    && "COMPLETED".equals(record.get("outcome")) && "COMPLETED".equals(recordCombined.get("status"))
+                    && artifacts.get("combined").equals(recordCombined.get("directory"))
+                    && artifacts.get("evaluations").equals(recordEvaluation.get("directory"))
+                    && artifacts.get("graph").equals(recordEvaluation.get("extendedGraph"))
+                    && history.get("reportToGraph") instanceof Map<?, ?>;
+            if (!consistent) {
+                throw new NullabilityPropagation.InvalidException(stageDir.resolve(RESULT) + " does not describe a "
+                        + "completed round " + previousRound + " with the combined result, evaluation and graph that "
+                        + "pipeline stage " + previousStage + " names." + fix);
+            }
+            Input previous = fromPipeline(runDir, previousRound);
+            if (!previous.identity().equals(recordInput.get("identity"))) {
+                throw new NullabilityPropagation.InvalidException("round " + previousRound + " (" + stageDir + ") was "
+                        + "computed on input " + recordInput.get("state") + " (identity " + recordInput.get("identity")
+                        + "), but its input now resolves to " + previous.state() + " (identity " + previous.identity()
+                        + "); its results are stale and kept only as history." + fix);
+            }
+            Input in = fromRoundResult(combined, runDir, Optional.of(graph), "the combined round-" + previousRound
+                    + " result recorded in " + runDir.resolve("pipeline.json") + " (stage " + previousStage + ")");
+            Object baseState = parse(combined.resolve(RoundApplication.RECORD)).get("baseState");
+            if (in.sourceRound() != previousRound || !previous.state().equals(baseState)) {
+                throw new NullabilityPropagation.InvalidException("the combined result " + combined + " is round "
+                        + in.sourceRound() + " on state " + baseState + ", not round " + previousRound + " on "
+                        + previous.state() + "." + fix);
+            }
+            Map<String, String> ids = new TreeMap<>();
+            ((Map<?, ?>) history.get("reportToGraph")).forEach((k, v) -> ids.put(String.valueOf(k), String.valueOf(v)));
+            return new Input(in.dir(), runDir, in.sourceRound(), in.state(), in.description(), in.historyGraph(),
+                    in.nodes(), in.originRounds(), in.identity(), true, Optional.of(evaluation), Optional.of(ids));
+        }
+
+        private static Path inside(Path runDir, String area, String relative, String stage, String fix)
+                throws NullabilityPropagation.InvalidException {
+            Path p = runDir.resolve(relative).normalize();
+            if (!p.startsWith(runDir.resolve(area))) {
+                throw new NullabilityPropagation.InvalidException("pipeline stage " + stage + " names " + relative
+                        + ", which is not under " + runDir.resolve(area) + "." + fix);
+            }
+            return p;
         }
 
         /**
@@ -289,7 +437,9 @@ public final class PropagationStage {
         NullabilityPropagation.Analysis analysis = NullabilityPropagation.analyze(input.dir());
         String analysisJson = Json.write(analysisJson(analysis));
         // keyed by the input's identity (snapshot, report, graph): results for another baseline are never reused
-        String id = "propagation2-" + EvaluationFiles.sha256(input.identity() + "\n" + analysisJson).substring(0, 12);
+        // the round is part of the ID (propagation<round>-), the input identity and the rule version part of its key
+        String id = "propagation" + round + "-" + EvaluationFiles.sha256(input.identity() + "\n" + analysisJson)
+                .substring(0, 12);
         Path dir = runDir.resolve(DIR).resolve(id);
         Path analysisFile = dir.resolve(ANALYSIS);
         if (Files.isRegularFile(analysisFile)
@@ -354,7 +504,7 @@ public final class PropagationStage {
                     rationale, "deterministic rule; the checker evaluation decides the effect"));
         }
         Candidates candidates = Candidates.fromProposals(id, analysis.runId(), runDir, snapshot,
-                analysis.sourceRoots(), proposals, GENERATOR, group(input.sourceRound()), ID_PREFIX);
+                analysis.sourceRoots(), proposals, GENERATOR, group(input.sourceRound()), idPrefix(round));
         counts.put("uniquePackages", candidates.candidates().size());
         out.println("  packages:   " + analysis.matches().size() + " match(es) -> " + candidates.candidates().size()
                 + " unique package(s); each is evaluated alone on a fresh baseline copy");
@@ -459,6 +609,7 @@ public final class PropagationStage {
     static Map<String, Object> writeGraph(Input input, Path dir, WarningGraph layer, Path evaluationDir,
             WarningMatcher matcher, PrintStream out) throws IOException {
         HistoryGraph.Built built = HistoryGraph.build(input.historyGraph(),
+                input.historyEvaluation().or(() -> input.historyGraph().map(Path::getParent)), input.historyIds(),
                 input.inherit() ? Optional.of(input.dir()) : Optional.empty(), input.output(), layer, evaluationDir,
                 input.state(), input.sourceRound(), matcher);
         Path file = dir.resolve(GRAPH);
@@ -504,7 +655,8 @@ public final class PropagationStage {
             throw new NullabilityPropagation.InvalidException(stageDir + " has no completed evaluation (outcome "
                     + record.get("outcome") + "), so there is no graph to rebuild");
         }
-        Input input = Files.isRegularFile(runDir.resolve("pipeline.json")) ? Input.resolve(runDir)
+        int round = record.get("round") instanceof Number r ? r.intValue() : DEFAULT_ROUND;
+        Input input = Files.isRegularFile(runDir.resolve("pipeline.json")) ? Input.fromPipeline(runDir, round)
                 : Input.resolve(Path.of(String.valueOf(in.get("directory"))));
         if (!input.identity().equals(in.get("identity"))) {
             throw new NullabilityPropagation.InvalidException("the input of " + stageDir + " was " + in.get("state")
