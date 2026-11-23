@@ -72,7 +72,7 @@ import java.util.TreeMap;
 public final class PropagationStage {
 
     public static final String DIR = "propagation";
-    public static final String GENERATOR = "nullability-propagation-2";
+    public static final String GENERATOR = "nullability-propagation-3";
     /** Package IDs of this stage ({@code P0001, ...}), distinct from answer packages ({@code A0001, ...}). */
     public static final String ID_PREFIX = "P";
     /** The extended graph: earlier history plus this stage's nodes and edges. */
@@ -636,7 +636,13 @@ public final class PropagationStage {
         x.put("canonical", m.edit().canonical());
         if (m.removal().isPresent()) {
             x.put("removes", Candidates.editFields(m.removal().get()));
-            x.put("contractChange", m.removal().get().canonical() + "; replaced by @" + m.edit().annotation());
+        }
+        if (!m.hierarchy().isEmpty()) {
+            x.put("hierarchy", m.hierarchy().stream().map(Candidates::editFields).toList());
+        }
+        if (!m.removals().isEmpty()) {
+            x.put("contractChange", m.removals().stream().map(r -> r.canonical() + "; replaced by @"
+                    + m.edit().annotation()).toList());
         }
         x.put("evidence", m.evidence());
         return x;

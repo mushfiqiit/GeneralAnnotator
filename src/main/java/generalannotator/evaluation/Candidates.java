@@ -51,7 +51,7 @@ import java.util.Set;
  * @param candidates the unique packages
  * @param excluded the answers that yielded no package, with reasons
  * @param generator what proposed the packages: {@value #LLM_GENERATOR} for collected LLM answers, or a
- *     deterministic pass such as {@code nullability-propagation-2}
+ *     deterministic pass such as {@code nullability-propagation-3}
  */
 public record Candidates(String submissionId, String runId, Path runDir, Path snapshot, List<String> sourceRoots,
         List<Candidate> candidates, List<Excluded> excluded, String generator) {

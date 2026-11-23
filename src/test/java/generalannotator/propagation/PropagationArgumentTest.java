@@ -157,8 +157,12 @@ class PropagationArgumentTest {
         f.add(s.at("a.toString()", "dereferenced expression 'a' is @Nullable"));
         f.add(arg(s, "// varargs", "vargs(", "a"));
         f.add(arg(s, "// jdk", "identityHashCode(", "a"));
-        f.add(arg(s, "// abstract", "take(", "a"));
-        f.add(arg(s, "// overridden", "m(", "a"));
+        if (!t.contains("void take(@p.Nullable Object o)")) {
+            f.add(arg(s, "// abstract", "take(", "a"));
+        }
+        if (!t.contains("static class Base { void m(@p.Nullable Object o) {} }")) {
+            f.add(arg(s, "// overridden", "m(", "a"));
+        }
         if (!t.contains("inherited(@p.Nullable")) {
             f.add(arg(s, "// inherited", "inherited(", "a"));
         }
@@ -254,7 +258,7 @@ class PropagationArgumentTest {
         Map<String, NullabilityPropagation.Skip> skips = new HashMap<>();
         a.skipped().forEach(s -> skips.put(s.warningId(), s));
         assertEquals(17, a.warnings());
-        assertEquals(11, matches.size(), skips.toString());
+        assertEquals(13, matches.size(), skips.toString());
         assertTrue(a.matches().stream().allMatch(m -> m.rule() == NullabilityPropagation.Rule.ARGUMENT));
 
         // direct field argument
@@ -276,7 +280,8 @@ class PropagationArgumentTest {
                 "ADD @p.Nullable at PARAMETER[0] of p.A#strict(Object) in src/p/A.java"),
                 strict.edits().stream().map(AnnotationEdit::canonical).toList());
         assertEquals(EditAction.REMOVE, strict.removal().orElseThrow().action());
-        assertTrue(strict.evidence().contains("contract change: its explicit @q.NonNull is replaced by @p.Nullable"));
+        assertTrue(strict.evidence().contains("contract change: the explicit non-null annotation of "
+                + "p.A#strict(java.lang.Object) (@NonNull) is replaced by @p.Nullable"), strict.evidence());
         // overloads: told apart by attribution
         assertEquals("p.A#over(Object)", "p.A#" + matches.get(warning("// overload object")).edit().member()
                 .canonical());
@@ -297,17 +302,21 @@ class PropagationArgumentTest {
         assertEquals(NullabilityPropagation.SkipCategory.UNSUPPORTED_TARGET, skips.get(warning("// varargs")).category());
         assertTrue(skips.get(warning("// varargs")).reason().contains("varargs"));
         assertEquals(NullabilityPropagation.SkipCategory.NOT_EDITABLE, skips.get(warning("// jdk")).category());
-        assertEquals(NullabilityPropagation.SkipCategory.UNSUPPORTED_TARGET, skips.get(warning("// abstract")).category());
-        assertTrue(skips.get(warning("// abstract")).reason().contains("abstract"));
-        assertEquals(NullabilityPropagation.SkipCategory.UNSUPPORTED_TARGET,
-                skips.get(warning("// overridden")).category());
-        assertTrue(skips.get(warning("// overridden")).reason().contains("overridden by p.A.Sub#m"),
-                skips.get(warning("// overridden")).reason());
+        // an interface method without implementations in the sources: the interface alone, coverage stated
+        NullabilityPropagation.Match take = matches.get(warning("// abstract"));
+        assertEquals(List.of("ADD @p.Nullable at PARAMETER[0] of p.A.I#take(Object) in src/p/A.java"),
+                take.edits().stream().map(AnnotationEdit::canonical).toList());
+        assertTrue(take.evidence().contains("no implementation or override found"), take.evidence());
+        assertTrue(take.evidence().contains("are not discovered"), take.evidence());
+        // an overridden method: the override is annotated in the same package
+        assertEquals(List.of("ADD @p.Nullable at PARAMETER[0] of p.A.Base#m(Object) in src/p/A.java",
+                "ADD @p.Nullable at PARAMETER[0] of p.A.Sub#m(Object) in src/p/A.java"),
+                matches.get(warning("// overridden")).edits().stream().map(AnnotationEdit::canonical).toList());
         assertEquals(NullabilityPropagation.SkipCategory.NOT_A_NULLABLE_FIELD_OR_METHOD,
                 skips.get(warning("// literal")).category());
-        // never the receiver or an unrelated overload
-        assertTrue(a.matches().stream().noneMatch(m -> m.edit().member().canonical().startsWith("take")
-                || m.edit().member().canonical().startsWith("m(")));
+        // an overridable method without overrides: the package is the method alone
+        assertEquals(1, matches.get(warning("// direct")).edits().size());
+        assertTrue(matches.get(warning("// direct")).evidence().contains("no implementation or override found"));
     }
 
     @Test
@@ -337,10 +346,10 @@ class PropagationArgumentTest {
         Map<?, ?> r = json(dir.resolve(PropagationStage.RESULT));
         assertEquals("COMPLETED", r.get("outcome"), output());
         assertEquals(NullabilityPropagation.RULES, r.get("rules"));
-        assertEquals("nullable-flow-2", json(dir.resolve(PropagationStage.ANALYSIS)).get("rules"),
+        assertEquals("nullable-flow-3", json(dir.resolve(PropagationStage.ANALYSIS)).get("rules"),
                 "the rule version is part of the analysis, hence of every cache key");
-        assertEquals(10L, ((Map<?, ?>) r.get("counts")).get("uniquePackages"), "use's two warnings share one package");
-        assertEquals(12, checker.calls(), "evaluation baseline, ten packages, one combined check\n" + output());
+        assertEquals(12L, ((Map<?, ?>) r.get("counts")).get("uniquePackages"), "use's two warnings share one package");
+        assertEquals(14, checker.calls(), "evaluation baseline, twelve packages, one combined check\n" + output());
         assertTrue(Files.readString(dir.resolve(PropagationStage.ANALYSIS)).contains("\"contractChange\""));
 
         Path evaluation = only(run.resolve("evaluations"));
@@ -374,13 +383,12 @@ class PropagationArgumentTest {
                 "void over(@p.Nullable Object o)", "void over(@p.Nullable String s)",
                 "void pair(@p.Nullable Object first, @p.Nullable Object second)",
                 "static class Base2 { void inherited(@p.Nullable Object o) {} }",
-                "void fallback(@p.Nullable Object x)")) {
+                "void fallback(@p.Nullable Object x)", "interface I { void take(@p.Nullable Object o); }",
+                "static class Base { void m(@p.Nullable Object o) {} }", "@Override void m(@p.Nullable Object o) {}")) {
             assertTrue(source.contains(annotated), annotated + " in\n" + source);
         }
         assertFalse(source.contains("@NonNull"), source);
-        for (String unchanged : List.of("void inner(Object y)", "void vargs(Object... xs)",
-                "interface I { void take(Object o); }", "static class Base { void m(Object o) {} }",
-                "@Override void m(Object o) {}")) {
+        for (String unchanged : List.of("void inner(Object y)", "void vargs(Object... xs)")) {
             assertTrue(source.contains(unchanged), unchanged + " in\n" + source);
         }
         // one pass: inner(x) is a new warning, recorded, not propagated

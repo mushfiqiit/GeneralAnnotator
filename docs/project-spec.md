@@ -168,6 +168,13 @@ interface or in one named class), labeled provisional, and noted here.
    introduced warnings, or some weighted combination.
 5. **Criteria for independent annotation batches.** When can several edits be
    attempted together without their effects interfering?
+6. **Widening parameter contracts with unseen implementations.** May a
+   propagated package widen an interface or overridable method's parameter
+   when implementations may exist outside the analyzed sources (other
+   modules, generated code, downstream users)? T19 provisionally widens it
+   across the hierarchy found in the configured source roots, and says in
+   the evidence that nothing outside them was searched
+   (`NullabilityPropagation.implementations`).
 
 ### Engineering decisions settled for stage 1 (revisit if they stop fitting)
 
@@ -471,7 +478,7 @@ interface or in one named class), labeled provisional, and noted here.
   - **Publication.** Results are published by an atomic rename and never
     overwritten. Failed attempts are kept as `-failed-<time>`.
 - **Single-pass nullability propagation (T17).** Provisional, in
-  `propagation.NullabilityPropagation` (rules `nullable-flow-2`) and
+  `propagation.NullabilityPropagation` (rules `nullable-flow-3`) and
   `propagation.PropagationStage`:
   - **Matching.** A warning matches only if the NullAway message ("assigning
     @Nullable expression to @NonNull field" or "returning @Nullable
@@ -492,9 +499,23 @@ interface or in one named class), labeled provisional, and noted here.
     - When the value has no annotated origin, the project's single nullable
       annotation type is used, and the warning is skipped if there is not
       exactly one.
-    - Varargs positions, parameters of abstract methods and of methods
-      overridden in the sources are skipped. Whether a parameter contract
-      should change for implementations outside the sources is open.
+    - Varargs positions are skipped.
+  - **Overridable targets (T19).** For an interface, abstract or overridden
+    method, one atomic package also annotates the same parameter of every
+    method of the editable sources that overrides or implements it, by
+    javac's `Elements.overrides` relation. Inherited implementations and
+    overrides of overrides are included; ancestors, siblings and overloads
+    are not. Implementations already `@Nullable` are kept and explicit
+    non-null ones are replaced. If any required declaration cannot be edited
+    (outside the sources, or in an anonymous or local class), the whole
+    package is skipped (`INCOMPLETE_HIERARCHY`). Provisional:
+    - Only the configured source roots are searched. Implementations in other
+      modules, generated code or libraries (EventBus's `AndroidLogger`,
+      generated `SubscriberInfoIndex` classes) are not discovered and are not
+      changed. Whether a public interface's parameter contract may be widened
+      without them is open.
+    - Lambdas and method references implementing the method are not edited.
+      Problems they cause appear as introduced warnings in the evaluation.
     - Replacing `@NonNull` changes an explicit contract; the change is
       recorded, and the evaluation decides its effect.
   - **Not followed:** values NullAway considers nullable for other reasons
@@ -509,7 +530,7 @@ interface or in one named class), labeled provisional, and noted here.
     plain run uses its own baseline (round 0).
   - **Evaluation.** Candidates come only from that fixed input and are merged
     by edit set (`P0001, ...`, origins `<warning>@propagation-r<source
-    round>`, generator `nullability-propagation-2`). `Evaluator` evaluates
+    round>`, generator `nullability-propagation-3`). `Evaluator` evaluates
     them with round = source round + 1 on copies of the input snapshot.
     - Baseline warning IDs are inherited from the input
       (`Evaluator.inheriting`); the fresh baseline must reproduce its

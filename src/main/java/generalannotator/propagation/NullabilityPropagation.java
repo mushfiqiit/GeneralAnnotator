@@ -67,9 +67,15 @@ import javax.lang.model.type.TypeMirror;
  *       told apart by attribution, never by name), the argument index maps to its formal parameter, and the
  *       argument is a field read, a method call or a local variable (or parameter); the diagnostic itself is
  *       the evidence that the value may be null. The receiving parameter is annotated {@code @Nullable}; an
- *       explicit non-null annotation on it is removed in the same package (a recorded contract change).
- *       Varargs positions, parameters of abstract methods and of methods overridden in the editable sources,
- *       anonymous class creations, and executables declared outside the editable sources are skipped.
+ *       explicit non-null annotation on it is removed in the same package (a recorded contract change). For an
+ *       overridable method (interface, abstract or overridden), the same package also annotates the parameter of
+ *       every implementation and override found in the editable sources, by javac's override relation (inherited
+ *       implementations and overrides of overrides included, never the method's ancestors, siblings or
+ *       overloads); implementations that are already {@code @Nullable} are kept, explicit non-null ones replaced.
+ *       If one of them cannot be edited (declared outside the editable sources or in an anonymous or local class)
+ *       the whole package is skipped ({@link SkipCategory#INCOMPLETE_HIERARCHY}). Implementations outside the
+ *       configured source roots are not discovered, and the evidence says so. Varargs positions, anonymous class
+ *       creations, and executables declared outside the editable sources are skipped.
  * </ul>
  * The {@code @Nullable} annotation added is the one on the value's origin (the field, method or local); for
  * an argument without an annotated origin, the project's single nullable annotation type, if it uses exactly
@@ -82,7 +88,7 @@ import javax.lang.model.type.TypeMirror;
 public final class NullabilityPropagation {
 
     /** The rule set's version, recorded with every result. */
-    public static final String RULES = "nullable-flow-2";
+    public static final String RULES = "nullable-flow-3";
     static final String ASSIGN = "assigning @Nullable expression to @NonNull field";
     static final String RETURN = "returning @Nullable expression from method with @NonNull return type";
     static final String PASS = "passing @Nullable parameter";
@@ -111,33 +117,68 @@ public final class NullabilityPropagation {
         /** The destination is not declared in the editable project sources (or cannot be edited). */
         NOT_EDITABLE,
         /**
-         * The receiving declaration is resolved but this pass does not change it: a varargs position, a parameter
-         * of an abstract method or of a method overridden in the project, or an anonymous class creation.
+         * The receiving declaration is resolved but this pass does not change it: a varargs position or an
+         * anonymous class creation.
          */
-        UNSUPPORTED_TARGET
+        UNSUPPORTED_TARGET,
+        /**
+         * The receiving method can be edited, but a declaration that must accept null with it (an implementation
+         * or override found in the editable sources' hierarchy) cannot be changed consistently: it is declared
+         * outside the editable sources, in an anonymous or local class, or carries an explicit non-null annotation
+         * that cannot be replaced. The whole package is skipped.
+         */
+        INCOMPLETE_HIERARCHY
     }
 
     /**
-     * A matched warning and its proposed edits.
+     * A matched warning and its proposed edits, applied together as one package.
      *
-     * @param edit the {@code @Nullable} annotation added
+     * @param edit the {@code @Nullable} annotation added to the receiving declaration
      * @param removal the explicit non-null annotation removed at the same position (a contract change), if any
+     * @param hierarchy for an argument passed to an overridable method: the edits that make the same parameter
+     *     of every implementation and override found in the editable sources nullable too (per declaration, the
+     *     removal of an explicit non-null annotation, if any, then the addition); empty otherwise
      */
     public record Match(String warningId, Rule rule, AnnotationEdit edit, Optional<AnnotationEdit> removal,
-            String evidence) {
+            List<AnnotationEdit> hierarchy, String evidence) {
         public Match {
             java.util.Objects.requireNonNull(removal, "removal");
+            hierarchy = List.copyOf(hierarchy);
         }
 
         public Match(String warningId, Rule rule, AnnotationEdit edit, String evidence) {
-            this(warningId, rule, edit, Optional.empty(), evidence);
+            this(warningId, rule, edit, Optional.empty(), List.of(), evidence);
         }
 
-        /** Every edit of the match, applied together as one package: the removal (if any), then the addition. */
+        /**
+         * Every edit of the match, applied together as one package: the removal (if any), the addition, then the
+         * hierarchy's edits.
+         */
         public List<AnnotationEdit> edits() {
-            return removal.map(r -> List.of(r, edit)).orElse(List.of(edit));
+            List<AnnotationEdit> all = new ArrayList<>();
+            removal.ifPresent(all::add);
+            all.add(edit);
+            all.addAll(hierarchy);
+            return List.copyOf(all);
+        }
+
+        /** Every explicit non-null annotation the package removes (contract changes), in order. */
+        public List<AnnotationEdit> removals() {
+            return edits().stream().filter(e -> e.action() == EditAction.REMOVE).toList();
         }
     }
+
+    /** A declaration of the receiving method's hierarchy that cannot be changed consistently. */
+    private static final class Incomplete extends Exception {
+        private static final long serialVersionUID = 1L;
+
+        Incomplete(String message) {
+            super(message);
+        }
+    }
+
+    /** Where a method declaration is edited. */
+    private record Location(String root, String file, String declaringClass, MemberRef member) {}
 
     /**
      * Where a value comes from, as far as this pass follows it.
@@ -174,7 +215,7 @@ public final class NullabilityPropagation {
 
     private final SourceModel model;
     private final List<String> sourceRoots;
-    private List<ExecutableElement> declaredMethods;
+    private List<TypeElement> sourceTypes;
     private Optional<String> projectNullable;
 
     private NullabilityPropagation(SourceModel model, List<String> sourceRoots) {
@@ -485,25 +526,108 @@ public final class NullabilityPropagation {
             return new Skip(id, SkipCategory.UNRESOLVED, "the explicit @" + nonNull.get() + " of " + formalText
                     + " does not resolve to a qualified type, so it cannot be replaced");
         }
-        Optional<TreePath> declaration = model.declaration(m);
-        if (declaration.isEmpty() || !(declaration.get().getLeaf() instanceof MethodTree mt)
-                || mt.getParameters().size() != params.size()) {
+        if (model.declaration(m).isEmpty()) {
             return new Skip(id, SkipCategory.NOT_EDITABLE, target + " is declared outside the editable project "
                     + "sources (library, JDK or generated code)");
         }
         if (!(m.getEnclosingElement() instanceof TypeElement owner) || owner.getQualifiedName().isEmpty()) {
             return new Skip(id, SkipCategory.NOT_EDITABLE, target + " is declared in an anonymous or local class");
         }
-        if (m.getModifiers().contains(Modifier.ABSTRACT)) {
-            return new Skip(id, SkipCategory.UNSUPPORTED_TARGET, target + " is abstract; its implementations, possibly "
-                    + "outside the editable sources, would all have to accept null too, which this pass does not "
-                    + "change");
+        Location at;
+        try {
+            at = locate(m);
+        } catch (Incomplete e) {
+            return new Skip(id, SkipCategory.NOT_EDITABLE, e.getMessage());
         }
-        List<String> overriders = overriders(m);
-        if (!overriders.isEmpty()) {
-            return new Skip(id, SkipCategory.UNSUPPORTED_TARGET, target + " is overridden by " + String.join(", ",
-                    overriders) + "; a @Nullable parameter would require every overriding method to accept null "
-                    + "too, which this pass does not change");
+        AnnotationEdit edit = new AnnotationEdit(at.root(), at.file(), at.declaringClass(), at.member(),
+                AnnotationPosition.parameter(index), EditAction.ADD, nullable.get());
+        Optional<AnnotationEdit> removal = nonNull.map(n -> new AnnotationEdit(at.root(), at.file(),
+                at.declaringClass(), at.member(), AnnotationPosition.parameter(index), EditAction.REMOVE, n));
+
+        // The hierarchy: every implementation or override of m in the editable sources must accept null too.
+        List<ExecutableElement> implementations;
+        try {
+            implementations = implementations(m);
+        } catch (Incomplete e) {
+            return new Skip(id, SkipCategory.INCOMPLETE_HIERARCHY, "making " + formalText + " @Nullable requires "
+                    + "changing its implementations and overrides too, but " + e.getMessage()
+                    + "; the whole package is skipped");
+        }
+        List<AnnotationEdit> hierarchy = new ArrayList<>();
+        List<String> changed = new ArrayList<>();
+        List<String> kept = new ArrayList<>();
+        List<String> replaced = new ArrayList<>();
+        nonNull.ifPresent(n -> replaced.add(target + " (@" + AnnotationKinds.simpleName(n) + ")"));
+        for (ExecutableElement x : implementations) {
+            String which = describe(x);
+            VariableElement p = x.getParameters().get(index);
+            if (x.isVarArgs() && index == x.getParameters().size() - 1) {
+                return new Skip(id, SkipCategory.UNSUPPORTED_TARGET, "the override " + which + " declares parameter "
+                        + (index + 1) + " as varargs; annotating the varargs array or its elements is not supported");
+            }
+            if (nullness(p, "nullable").isPresent()) {
+                kept.add(which);
+                continue;
+            }
+            Optional<String> xNonNull = nullness(p, "non-null");
+            if (xNonNull.isPresent() && !xNonNull.get().contains(".")) {
+                return new Skip(id, SkipCategory.INCOMPLETE_HIERARCHY, "making " + formalText + " @Nullable requires "
+                        + "changing " + which + " too, but its explicit @" + xNonNull.get() + " does not resolve to a "
+                        + "qualified type, so it cannot be replaced; the whole package is skipped");
+            }
+            Location xa;
+            try {
+                xa = locate(x);
+            } catch (Incomplete e) {
+                return new Skip(id, SkipCategory.INCOMPLETE_HIERARCHY, "making " + formalText + " @Nullable requires "
+                        + "changing " + which + " too, but " + e.getMessage() + "; the whole package is skipped");
+            }
+            xNonNull.ifPresent(n -> {
+                hierarchy.add(new AnnotationEdit(xa.root(), xa.file(), xa.declaringClass(), xa.member(),
+                        AnnotationPosition.parameter(index), EditAction.REMOVE, n));
+                replaced.add(which + " (@" + AnnotationKinds.simpleName(n) + ")");
+            });
+            hierarchy.add(new AnnotationEdit(xa.root(), xa.file(), xa.declaringClass(), xa.member(),
+                    AnnotationPosition.parameter(index), EditAction.ADD, nullable.get()));
+            changed.add(which);
+        }
+        StringBuilder evidence = new StringBuilder("'" + callText + "' passes " + origin.description() + ", which "
+                + "NullAway reports as @Nullable, as argument " + (index + 1) + " to parameter '"
+                + formal.getSimpleName() + "' of " + owner.getQualifiedName() + "#" + at.member().canonical());
+        if (origin.annotation().filter(a -> a.contains(".")).isEmpty()) {
+            evidence.append(" (annotation @").append(nullable.get()).append(": the project's nullable annotation type)");
+        }
+        if (overridable(m)) {
+            evidence.append("; hierarchy (the configured source roots only; implementations elsewhere, such as other "
+                    + "modules, generated or library code, are not discovered): ");
+            evidence.append(changed.isEmpty() && kept.isEmpty() ? "no implementation or override found"
+                    : (changed.isEmpty() ? "" : "also annotated " + String.join(", ", changed))
+                    + (!changed.isEmpty() && !kept.isEmpty() ? "; " : "")
+                    + (kept.isEmpty() ? "" : "already @Nullable, kept: " + String.join(", ", kept)));
+        }
+        if (!replaced.isEmpty()) {
+            evidence.append("; contract change: the explicit non-null annotation of ").append(String.join(", ",
+                    replaced)).append(" is replaced by @").append(nullable.get());
+        }
+        return new Match(id, Rule.ARGUMENT, edit, removal, hierarchy, evidence.toString());
+    }
+
+    /**
+     * Where {@code m} is edited: its configured source root, file, declaring class and member text.
+     *
+     * @throws Incomplete if it has no source declaration in a configured source root, or is declared in an
+     *     anonymous or local class
+     */
+    private Location locate(ExecutableElement m) throws Incomplete {
+        String which = describe(m);
+        Optional<TreePath> declaration = model.declaration(m);
+        if (declaration.isEmpty() || !(declaration.get().getLeaf() instanceof MethodTree mt)
+                || mt.getParameters().size() != m.getParameters().size()) {
+            throw new Incomplete(which + " is declared outside the editable project sources (library, JDK or "
+                    + "generated code)");
+        }
+        if (!(m.getEnclosingElement() instanceof TypeElement owner) || owner.getQualifiedName().isEmpty()) {
+            throw new Incomplete(which + " is declared in an anonymous or local class, which no edit can address");
         }
         CompilationUnitTree declUnit = declaration.get().getCompilationUnit();
         SourceModel.Unit du = model.unit(declUnit);
@@ -511,30 +635,15 @@ public final class NullabilityPropagation {
                 .filter(r -> r.equals(".") || du.relativePath().startsWith(r + "/"))
                 .max((x, y) -> Integer.compare(x.length(), y.length()));
         if (root.isEmpty()) {
-            return new Skip(id, SkipCategory.NOT_EDITABLE, target + " is not in a configured source root");
+            throw new Incomplete(which + " is not in a configured source root");
         }
         String file = root.get().equals(".") ? du.relativePath() : du.relativePath().substring(root.get().length() + 1);
-        String member = member(mt, declUnit, m);
-        AnnotationEdit edit;
-        Optional<AnnotationEdit> removal;
         try {
-            MemberRef ref = MemberRef.parse(member);
-            String cls = owner.getQualifiedName().toString();
-            edit = new AnnotationEdit(root.get(), file, cls, ref, AnnotationPosition.parameter(index), EditAction.ADD,
-                    nullable.get());
-            removal = nonNull.map(n -> new AnnotationEdit(root.get(), file, cls, ref,
-                    AnnotationPosition.parameter(index), EditAction.REMOVE, n));
+            return new Location(root.get(), file, owner.getQualifiedName().toString(),
+                    MemberRef.parse(member(mt, declUnit, m)));
         } catch (IllegalArgumentException e) {
-            return new Skip(id, SkipCategory.UNRESOLVED, "no edit can describe " + formalText + ": " + e.getMessage());
+            throw new Incomplete("no edit can describe " + which + ": " + e.getMessage());
         }
-        String evidence = "'" + callText + "' passes " + origin.description() + ", which NullAway reports as "
-                + "@Nullable, as argument " + (index + 1) + " to parameter '" + formal.getSimpleName() + "' of "
-                + owner.getQualifiedName() + "#" + member
-                + (origin.annotation().filter(a -> a.contains(".")).isEmpty() ? " (annotation @" + nullable.get()
-                        + ": the project's nullable annotation type)" : "")
-                + nonNull.map(n -> "; contract change: its explicit @" + n + " is replaced by @" + nullable.get())
-                        .orElse("");
-        return new Match(id, Rule.ARGUMENT, edit, removal, evidence);
     }
 
     /** A call argument: the call's path, the argument's index, and how deeply the call is nested. */
@@ -658,36 +767,82 @@ public final class NullabilityPropagation {
         return projectNullable;
     }
 
-    /** The methods of the editable sources (anonymous classes included) that override {@code m}. */
-    private List<String> overriders(ExecutableElement m) {
-        if (m.getKind() != ElementKind.METHOD || m.getModifiers().contains(Modifier.STATIC)
-                || m.getModifiers().contains(Modifier.PRIVATE)) {
+    /** Whether {@code m} can be overridden or implemented at all. */
+    private static boolean overridable(ExecutableElement m) {
+        Set<Modifier> mods = m.getModifiers();
+        return m.getKind() == ElementKind.METHOD && !mods.contains(Modifier.STATIC) && !mods.contains(Modifier.PRIVATE)
+                && !mods.contains(Modifier.FINAL) && !(m.getEnclosingElement() instanceof TypeElement t
+                        && t.getModifiers().contains(Modifier.FINAL));
+    }
+
+    /**
+     * Every method of the editable sources' types that overrides or implements {@code m}, directly, through an
+     * implementation inherited from another class, or through intermediate overrides (overrides of overrides),
+     * sorted. The relation is javac's ({@link javax.lang.model.util.Elements#overrides}, with type arguments
+     * substituted), never a name match, so overloads and unrelated methods are excluded; ancestors of {@code m}
+     * are never included (a parameter may be widened in an override without changing what it overrides).
+     *
+     * @throws Incomplete if one of them is declared outside the editable sources or in an anonymous or local class
+     */
+    private List<ExecutableElement> implementations(ExecutableElement m) throws Incomplete {
+        if (!overridable(m)) {
             return List.of();
         }
-        if (declaredMethods == null) {
-            List<ExecutableElement> all = new ArrayList<>();
+        List<ExecutableElement> found = new ArrayList<>();
+        Set<ExecutableElement> seen = new java.util.HashSet<>(List.of(m));
+        java.util.ArrayDeque<ExecutableElement> pending = new java.util.ArrayDeque<>(List.of(m));
+        while (!pending.isEmpty()) {
+            ExecutableElement y = pending.poll();
+            TypeElement yOwner = (TypeElement) y.getEnclosingElement();
+            TypeMirror yType = model.types().erasure(yOwner.asType());
+            for (TypeElement t : sourceTypes()) {
+                if (t.equals(yOwner) || !model.types().isSubtype(model.types().erasure(t.asType()), yType)) {
+                    continue;
+                }
+                for (Element member : model.elements().getAllMembers(t)) {
+                    if (!(member instanceof ExecutableElement x) || x.getKind() != ElementKind.METHOD
+                            || seen.contains(x) || !model.elements().overrides(x, y, t)) {
+                        continue;
+                    }
+                    seen.add(x);
+                    String in = t.getQualifiedName().isEmpty() ? "an anonymous or local class" : t.getQualifiedName()
+                            .toString();
+                    if (model.declaration(x).isEmpty()) {
+                        throw new Incomplete(describe(x) + ", which implements " + describe(y) + " in " + in
+                                + ", is declared outside the editable project sources (library, JDK or generated "
+                                + "code)");
+                    }
+                    if (!(x.getEnclosingElement() instanceof TypeElement xo) || xo.getQualifiedName().isEmpty()) {
+                        throw new Incomplete("an override of " + describe(y) + " is declared in " + in + ", which no "
+                                + "edit can address");
+                    }
+                    found.add(x);
+                    pending.add(x);
+                }
+            }
+        }
+        found.sort(java.util.Comparator.comparing(NullabilityPropagation::describe));
+        return found;
+    }
+
+    /** Every class, interface, enum and record declared in the editable sources (anonymous and local included). */
+    private List<TypeElement> sourceTypes() {
+        if (sourceTypes == null) {
+            List<TypeElement> all = new ArrayList<>();
             for (SourceModel.Unit unit : model.units()) {
                 new TreePathScanner<Void, Void>() {
                     @Override
-                    public Void visitMethod(MethodTree node, Void unused) {
-                        if (model.trees().getElement(getCurrentPath()) instanceof ExecutableElement e
-                                && e.getKind() == ElementKind.METHOD) {
-                            all.add(e);
+                    public Void visitClass(ClassTree node, Void unused) {
+                        if (model.trees().getElement(getCurrentPath()) instanceof TypeElement t) {
+                            all.add(t);
                         }
-                        return super.visitMethod(node, unused);
+                        return super.visitClass(node, unused);
                     }
                 }.scan(unit.tree(), null);
             }
-            declaredMethods = all;
+            sourceTypes = all;
         }
-        List<String> found = new ArrayList<>();
-        for (ExecutableElement other : declaredMethods) {
-            if (other != m && other.getEnclosingElement() instanceof TypeElement t
-                    && model.elements().overrides(other, m, t)) {
-                found.add(describe(other));
-            }
-        }
-        return found;
+        return sourceTypes;
     }
 
     /** The member text of a method or constructor declaration, as the applier matches it. */

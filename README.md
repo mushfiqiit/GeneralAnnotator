@@ -1833,7 +1833,7 @@ the resolved symbols all agree:
 | `FIELD_ASSIGNMENT` | assigning @Nullable expression to @NonNull field | `f = x` where `x` reads a field, or calls a method, explicitly annotated `@Nullable`, and `f` is a field | `@Nullable` on `f`'s type |
 | `FIELD_INITIALIZER` | the same | a field declaration `T f = x` with such an `x` | `@Nullable` on `f`'s type |
 | `RETURN` | returning @Nullable expression from method with @NonNull return type | `return x` with such an `x`, in a method (not a lambda) | `@Nullable` on the method's return type |
-| `ARGUMENT` | passing @Nullable parameter 'x' where @NonNull is required | an argument `x` (a field read, a method call, or a local or parameter) of a call whose method or constructor javac resolved; the argument index gives the formal parameter | `@Nullable` on that parameter; an explicit non-null annotation on it is removed in the same package |
+| `ARGUMENT` | passing @Nullable parameter 'x' where @NonNull is required | an argument `x` (a field read, a method call, or a local or parameter) of a call whose method or constructor javac resolved; the argument index gives the formal parameter | `@Nullable` on that parameter, and on the same parameter of every implementation and override in the editable sources; explicit non-null annotations are removed in the same package |
 
 For the assignment and return rules, `x` may also be a local variable
 initialized (directly or through other locals, up to four) from such a field
@@ -1853,15 +1853,47 @@ null; the argument needs no annotation of its own:
 - **Explicit `@NonNull`.** The package removes it and adds `@Nullable` at the
   same position (two edits, applied atomically). `analysis.json` records the
   `contractChange`.
-- **Skipped:** varargs positions, parameters of abstract methods and of
-  methods overridden in the editable sources (`UNSUPPORTED_TARGET`), anonymous
-  class creations, executables outside the editable sources (`NOT_EDITABLE`),
-  and `null` literals, conditionals or casts as arguments.
+- **Interface, abstract and overridden methods.** When the resolved method
+  can be overridden, the package also covers every method of the editable
+  sources that overrides or implements it:
+  - The relation is javac's (`Elements.overrides`, with type arguments
+    substituted), so `put(String)` implementing `Sink<String>.put(T)` is
+    found, while overloads and same-named methods are not.
+  - It includes implementations inherited from another class (`class Impl
+    extends Helper implements Handler` adds `Helper#handle`) and overrides of
+    overrides, repeated until nothing new is found.
+  - The method's ancestors are never widened. A call resolved to `L2#go`
+    changes `L2` and its overrides, not `L1#go`: an override may accept more
+    than what it overrides.
+  - Implementations that are already `@Nullable` are kept. Explicit non-null
+    ones are replaced, and each replacement is listed in `contractChange`.
+  - All the edits form one package, which is one annotation node, applied
+    and evaluated atomically. Two warnings that need the same complete
+    package share it.
+  - If a required declaration can't be edited consistently, the whole
+    package is skipped (`INCOMPLETE_HIERARCHY`). That covers an
+    implementation declared outside the editable sources, for example one
+    inherited from `java.io.PrintStream`, and an override in an anonymous or
+    local class.
+  - Coverage: only the configured source roots are searched.
+    Implementations in other modules, or in generated or library code, are
+    not discovered, and the evidence says so. Lambdas and method references
+    implementing the method are not edited. NullAway reports any resulting
+    problems as new warnings in the evaluation.
+- **Skipped:** varargs positions (`UNSUPPORTED_TARGET`), anonymous class
+  creations, executables outside the editable sources (`NOT_EDITABLE`), and
+  `null` literals, conditionals or casts as arguments.
 
-Regression example (EventBus, round 1): `Object event = pendingPost.event;
-invokeSubscriber(subscription, event);`, with `PendingPost.event` `@Nullable`,
-proposes `void invokeSubscriber(Subscription subscription,
-@org.jspecify.annotations.Nullable Object event)`.
+Regression examples (EventBus, round 1):
+- `Object event = pendingPost.event; invokeSubscriber(subscription, event);`,
+  with `PendingPost.event` `@Nullable`, proposes `void
+  invokeSubscriber(Subscription subscription, @org.jspecify.annotations.Nullable
+  Object event)`.
+- `logger.log(Level.SEVERE, msg, cause)` proposes one package that annotates
+  `th` in `Logger#log(Level, String, Throwable)`, `JavaLogger#log` and
+  `SystemOutLogger#log`. `log(Level, String)` is not touched.
+  `AndroidLogger` lives in the `eventbus-android` module, outside the
+  configured source root, so it isn't part of the package.
 
 **What is skipped.** Everything else, with the reason recorded in
 `analysis.json`:
@@ -1876,13 +1908,17 @@ proposes `void invokeSubscriber(Subscription subscription,
   non-null annotation, or is a method that overrides another method.
 - **`NOT_EDITABLE`:** a destination outside the configured source roots, in an
   anonymous or local class, or a field declared together with others.
-- **`UNSUPPORTED_TARGET`:** a resolved parameter that this pass does not
-  change (see `ARGUMENT`).
+- **`UNSUPPORTED_TARGET`:** a varargs position or an anonymous class
+  creation (see `ARGUMENT`).
+- **`INCOMPLETE_HIERARCHY`:** an implementation or override that the package
+  would also have to change cannot be edited (see `ARGUMENT`); nothing of the
+  package is proposed.
 
-The rule set is versioned (`nullable-flow-2`, generator
-`nullability-propagation-2`). Its version is part of `analysis.json` and so
-of every cache key, so results computed by `nullable-flow-1`, which skipped
-argument warnings, are never reused.
+The rule set is versioned (`nullable-flow-3`, generator
+`nullability-propagation-3`). Its version is part of `analysis.json` and so
+of every cache key. Results from earlier versions are never reused:
+`nullable-flow-1` skipped argument warnings, and `nullable-flow-2` skipped
+interface, abstract and overridden targets.
 
 **What happens next.**
 - **Candidates.** All candidates come from the fixed input, before any edit.
@@ -1896,7 +1932,7 @@ argument warnings, are never reused.
   - New warnings get the next round's IDs: `W2001, ...` after round 1.
   - There is one annotation node per package; its proposals are named
     `<warning>@propagation-1`, and the generator is recorded as
-    `nullability-propagation-2`.
+    `nullability-propagation-3`.
   - The graph gets `W -> A` for every resolved warning and `A -> N` for every
     introduced one.
   - Failed or incomplete evaluations claim nothing.

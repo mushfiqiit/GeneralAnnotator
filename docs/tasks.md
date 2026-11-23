@@ -1340,3 +1340,75 @@ Verified by:
     `handleSubscriberException` (line 519), left for a later pass;
   - the combined check went from 23 to 20 findings (7 resolved, 4
     introduced).
+
+## T19 — Propagate nullable arguments into interface, abstract and overridden methods · `done`
+
+T18 skipped arguments whose receiving method was abstract or overridden
+(`UNSUPPORTED_TARGET`), such as EventBus's `logger.log(Level.SEVERE, msg,
+cause)`.
+
+- **Hierarchy** (`NullabilityPropagation.implementations`, rules
+  `nullable-flow-3`): when the resolved method can be overridden (not static,
+  private, final, a constructor, or in a final class), the package also
+  annotates the same parameter of every method in the editable sources that
+  overrides or implements it:
+  - by javac's `Elements.overrides` relation, checked in each source subtype,
+    so generic substitutions are found and overloads are not;
+  - including implementations inherited from another class, and overrides of
+    those overrides, until nothing new is found;
+  - never the method's ancestors, siblings or overloads.
+- **Edits:** `@Nullable` on unannotated parameters. Explicit non-null ones are
+  replaced (REMOVE + ADD) and listed in `contractChange`. Parameters already
+  `@Nullable` are kept. All edits form one `Match` (`hierarchy`), hence one
+  package and one annotation node; equal complete packages are merged with
+  every originating warning.
+- **Skipped as a whole** (`INCOMPLETE_HIERARCHY`, new): a required
+  implementation declared outside the editable sources (for example inherited
+  from `java.io.PrintStream`) or in an anonymous or local class, or an
+  explicit non-null annotation that does not resolve to a qualified type.
+  Varargs at an override's position: `UNSUPPORTED_TARGET`.
+- **Coverage:** only the configured source roots are searched; the evidence
+  says that implementations elsewhere are not discovered (project-spec §6,
+  research decision 6).
+- **Stage:** `analysis.json` lists `hierarchy` edits; generator
+  `nullability-propagation-3`. The rule version is in every cache key, so
+  `nullable-flow-2` results are not reused. Everything else is unchanged.
+
+Verified by:
+- `PropagationHierarchyTest` (fake NullAway that also reports overrides left
+  non-null under a `@Nullable` parameter):
+  - an interface with three implementations, one two levels down in another
+    file, with its overload untouched, reached directly and through a local,
+    merged into one four-edit package and node;
+  - an abstract method, with its overload untouched;
+  - an implementation inherited from a class outside the interface's
+    hierarchy, plus that class's own override;
+  - multi-level overrides, and a call resolved at the middle level that
+    leaves the ancestor alone;
+  - `Sink<String>.put(T)` with `put(String)`, and the unrelated `put(Integer)`
+    left alone;
+  - an existing `@Nullable` implementation kept, and an explicit `@NonNull`
+    implementation replaced;
+  - an external implementation (`PrintStream#println`) and an anonymous-class
+    override, each skipping the whole package;
+  - atomic application: every package evaluates without override
+    inconsistencies, and the combined source has every hierarchy edit;
+  - one pass: the introduced dereference is recorded, not propagated, and
+    reruns reuse everything.
+- `PropagationArgumentTest` updated: `I#take` (no implementations) and
+  `Base#m` + `Sub#m` are now matched.
+- A run on a copy of the EventBus pipeline after round 1 (real NullAway):
+  - W1006 and W1008 (`logger.log(..., cause)`) share package P0003. It
+    annotates `th` in `Logger#log(Level, String, Throwable)`,
+    `JavaLogger#log` and `SystemOutLogger#log`, and leaves `log(Level,
+    String)` alone. `AndroidLogger` (module `eventbus-android`) is outside
+    the source root and is not changed.
+  - P0003's own evaluation resolved both, 23 -> 22 findings. It introduced
+    W2002, the dereference `th.printStackTrace(System.out)` in
+    `SystemOutLogger` (Logger.java:58), left for a later pass.
+  - W1014 annotated `SubscriberInfoIndex#getSubscriberInfo` alone (no
+    implementation in the sources; the generated ones aren't discovered) and
+    resolved it, introducing nothing.
+  - 10 of 23 warnings matched, giving 9 packages, all COMPLETED. The
+    combined check went from 23 to 18 findings: 10 resolved, 5 introduced
+    (W2006-W2010).
