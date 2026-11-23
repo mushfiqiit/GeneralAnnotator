@@ -609,9 +609,20 @@ public final class PropagationStage {
     static Map<String, Object> writeGraph(Input input, Path dir, WarningGraph layer, Path evaluationDir,
             WarningMatcher matcher, PrintStream out) throws IOException {
         HistoryGraph.Built built = HistoryGraph.build(input.historyGraph(),
-                input.historyEvaluation().or(() -> input.historyGraph().map(Path::getParent)), input.historyIds(),
+                input.historyEvaluation().or(() -> input.historyGraph().map(Path::getParent)),
                 input.inherit() ? Optional.of(input.dir()) : Optional.empty(), input.output(), layer, evaluationDir,
                 input.state(), input.sourceRound(), matcher);
+        // verified correspondences between distinct occurrences are registry metadata, never shared IDs or edges
+        List<?> correspondences = built.record().get("correspondences") instanceof List<?> l ? l : List.of();
+        if (!correspondences.isEmpty()) {
+            generalannotator.evaluation.WarningRegistry.update(input.output(), r -> {
+                for (Object o : correspondences) {
+                    Map<?, ?> c = (Map<?, ?>) o;
+                    r.correspond(String.valueOf(c.get("reportWarning")), String.valueOf(c.get("correspondsTo")),
+                            String.valueOf(c.get("evidence")));
+                }
+            });
+        }
         Path file = dir.resolve(GRAPH);
         String json = WarningGraphJson.write(built.graph());
         boolean changed = !Files.isRegularFile(file) || !Files.readString(file, StandardCharsets.UTF_8).equals(json);

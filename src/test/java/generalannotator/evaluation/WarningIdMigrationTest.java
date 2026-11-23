@@ -238,9 +238,11 @@ class WarningIdMigrationTest {
         WarningGraph g = WarningGraphJson.load(dirs.get(0).resolve(Evaluator.GRAPH));
         AnnotationNode a = (AnnotationNode) g.node("A0001").orElseThrow();
         assertEquals(2, a.edits().size());
-        assertEquals(List.of("W0001 -resolved-by-> A0001", "W0002 -resolved-by-> A0001", "A0001 -introduces-> W1001"),
+        // the historical evaluation of the same run already used W1001 to W1003 (registered in the run's warning
+        // registry), so the fresh evaluation's new warning gets the round's next ID, never one of those
+        assertEquals(List.of("W0001 -resolved-by-> A0001", "W0002 -resolved-by-> A0001", "A0001 -introduces-> W1004"),
                 g.edges().stream().map(e -> e.source() + " -" + e.kind() + "-> " + e.target()).toList(),
-                "only edges from the package's own fresh comparison");
+                "only edges from the package's own fresh comparison, with a run-unique ID");
     }
 
     @Test

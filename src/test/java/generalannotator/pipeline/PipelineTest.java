@@ -879,13 +879,15 @@ class PipelineTest {
         assertEquals(1, g.warningNodes().stream().filter(w -> w.id().startsWith("W3")).count(),
                 "only the genuinely new warning gets a round-3 ID");
         Map<?, ?> history = (Map<?, ?>) record.get("history");
-        assertEquals(Map.of("linked-to-package-warning", 2L, "persisting-from-base", 1L), history.get("counts"));
+        assertEquals(Map.of("corresponds-to-package-warning", 2L, "persisting-from-base", 1L), history.get("counts"));
 
         // nothing earlier was modified
         assertEquals(roundTwoGraphText, Files.readString(roundTwoGraph));
         assertEquals(roundTwoTree, EvaluationFiles.treeHash(roundTwoCombined));
         assertEquals(targetBefore, EvaluationFiles.treeHash(target));
         assertTrue(Files.readString(dir.resolve(Pipeline.SUMMARY)).contains("propagation-r3"));
+        assertTrue(generalannotator.evaluation.WarningIntegrity.check(dir).ok(),
+                generalannotator.evaluation.WarningIntegrity.check(dir).problems().toString());
 
         // repeating the command reuses everything and duplicates nothing
         int calls = checker.calls();
@@ -913,8 +915,17 @@ class PipelineTest {
         assertEquals(artifact(three, "combined"), ((String) ((Map<?, ?>) four.get("input")).get("directory"))
                 .substring(dir.toString().length() + 1));
         WarningGraph g4 = WarningGraphJson.load(dir.resolve(artifact(four, "graph")));
-        assertTrue(edges(g4).contains("W3001 resolved-by P4-0001"), edges(g4).toString());
+        // the combined round-3 occurrence of k = h keeps its report ID (distinct from the evaluation's W3001)
+        String kh = ((List<?>) json(dir.resolve(artifact(three, "combined")).resolve("findings.json")).get("findings"))
+                .stream().map(o -> (Map<?, ?>) o).filter(f -> "INTRODUCED".equals(f.get("status"))).findFirst()
+                .orElseThrow().get("warningId").toString();
+        assertFalse(kh.equals("W3001"), "two occurrences in different states, two IDs");
+        assertTrue(edges(g4).contains(kh + " resolved-by P4-0001"), edges(g4).toString());
         assertTrue(g4.warningNodes().stream().noneMatch(w -> w.id().startsWith("W4")), "no W4 nodes: none introduced");
+        // across rounds 1 to 4 every report, comparison and graph agrees with the run's warning registry
+        generalannotator.evaluation.WarningIntegrity.Report integrity =
+                generalannotator.evaluation.WarningIntegrity.check(dir);
+        assertTrue(integrity.ok(), integrity.problems().toString());
     }
 
     @Test

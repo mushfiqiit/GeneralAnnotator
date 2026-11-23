@@ -2,6 +2,7 @@ package generalannotator.propagation;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import generalannotator.checker.CheckerOutcome;
@@ -24,6 +25,9 @@ import generalannotator.evaluation.Evaluator;
 import generalannotator.evaluation.FakeChecker;
 import generalannotator.evaluation.HistoryGraph;
 import generalannotator.evaluation.RoundApplication;
+import generalannotator.evaluation.WarningRegistry;
+import generalannotator.evaluation.WarningIntegrity;
+import generalannotator.evaluation.RegistryMigration;
 import generalannotator.evaluation.matching.AnchoredWarningMatcher;
 import generalannotator.graph.AnnotationNode;
 import generalannotator.graph.GraphEdge;
@@ -62,10 +66,11 @@ import org.junit.jupiter.api.io.TempDir;
  * annotates {@code x}. Alone, A0001 introduces
  * {@code shared()} and {@code b = a}; A0002 introduces {@code x.hashCode()} and {@code shared()}. Together they also
  * introduce {@code e = a} (only in combination). The evaluation numbers A0001's warnings first ({@code W1001}
- * shared, {@code W1002} b = a, {@code W1003} x.hashCode, {@code W1004} shared), but the combined result numbers its
- * own by position ({@code W1001} x.hashCode, {@code W1002} shared, {@code W1003} b = a, {@code W1004} e = a): the same
- * IDs name different warnings. {@code m = n} is an original warning that persists. Propagation then annotates
- * {@code b} (introducing {@code c = b}) and {@code m} (introducing nothing).
+ * shared, {@code W1002} b = a, {@code W1003} x.hashCode, {@code W1004} shared); the combined result draws from the
+ * same round-1 sequence through the run's warning registry, so its own warnings continue after them ({@code W1005}
+ * x.hashCode, ...) instead of reusing W1001 to W1004 for different warnings (the EventBus W1004 collision).
+ * {@code m = n} is an original warning that persists. Propagation then annotates {@code b} (introducing
+ * {@code c = b}) and {@code m} (introducing nothing).
  */
 class PropagationHistoryGraphTest {
 
@@ -257,11 +262,22 @@ class PropagationHistoryGraphTest {
     }
 
     @Test
-    void theFixtureReallyHasCollidingIdsBetweenTheIndependentEvaluationAndTheCombinedResult() throws Exception {
+    void independentAndCombinedOccurrencesNeverShareAnId() throws Exception {
         assertEquals("W1001", earlierId("shared();", "S0+A0001"));
-        assertEquals("W1001", combinedId("x.hashCode()"), "the same ID names a different warning in the combined result");
         assertEquals("W1002", earlierId("b = a;", "S0+A0001"));
-        assertEquals("W1003", combinedId("b = a;"));
+        assertEquals("W1003", earlierId("x.hashCode()", "S0+A0002"));
+        assertEquals("W1004", earlierId("shared();", "S0+A0002"));
+        // the combined state's warnings are distinct occurrences: their own IDs, after the evaluation's
+        assertEquals("W1005", combinedId("x.hashCode()"), "never the evaluation's W1001 (a different warning)");
+        Set<String> evaluationIds = new HashSet<>();
+        earlier.warningNodes().forEach(w -> evaluationIds.add(w.id()));
+        WarningGraphJson.load(roundOne.resolve(WarningGraphJson.FILE_NAME)).warningNodes().stream()
+                .filter(w -> w.id().startsWith("W1"))
+                .forEach(w -> assertFalse(evaluationIds.contains(w.id()), w.id() + " is used by both"));
+        WarningRegistry registry = WarningRegistry.load(run);
+        assertEquals(java.util.OptionalInt.of(8), registry.counter(1), "one shared round-1 sequence");
+        assertEquals("evaluation", registry.warning("W1004").orElseThrow().kind());
+        assertEquals("combined", registry.warning("W1005").orElseThrow().kind());
     }
 
     @Test
@@ -284,23 +300,34 @@ class PropagationHistoryGraphTest {
         String bEarlier = earlierId("b = a;", "S0+A0001");
         assertTrue(edges.contains("A0001 introduces " + bEarlier), "the earlier annotation -> W1 edge: " + edges);
 
-        // the combined result's b = a (its own W1003) is the earlier W1002, extended with W1002 -> P -> W2001
+        // the combined result's b = a keeps its report ID in the graph; its correspondence to A0001's W1002 (a
+        // distinct occurrence in another state) is metadata, never a substituted ID or an invented edge
         String bPackage = packageFor(r, "b");
-        assertTrue(edges.contains(bEarlier + " resolved-by " + bPackage), edges.toString());
+        String bCombined = combinedId("b = a;");
+        assertFalse(bCombined.equals(bEarlier));
+        assertTrue(edges.contains(bCombined + " resolved-by " + bPackage), edges.toString());
         assertTrue(edges.contains(bPackage + " introduces W2001"), edges.toString());
-        assertFalse(edges.contains(combinedId("b = a;") + " resolved-by " + bPackage), "never matched by ID");
+        assertFalse(edges.contains(bEarlier + " resolved-by " + bPackage), "the report ID, never the earlier node's");
+        assertFalse(edges.contains("A0001 introduces " + bCombined), "no fabricated causal edge");
+        Map<?, ?> b = inputWarning((Map<?, ?>) r.get("history"), bCombined);
+        assertEquals("corresponds-to-package-warning", b.get("relation"));
+        assertEquals(bEarlier, ((Map<?, ?>) b.get("provenance")).get("correspondsTo"));
+        assertEquals(bCombined, b.get("graphNode"));
+        assertTrue(WarningRegistry.load(run).correspondences().contains(new WarningRegistry.Correspondence(bCombined,
+                bEarlier, String.valueOf(((Map<?, ?>) b.get("provenance")).get("evidence")))));
         WarningNode w2001 = (WarningNode) g.node("W2001").orElseThrow();
         assertTrue(w2001.diagnostic().sourceSnippet().orElseThrow().contains("c = b;"));
         assertEquals(java.util.OptionalInt.of(2), w2001.round());
-        GraphEdge resolved = g.edges().stream().filter(e -> e.source().equals(bEarlier) && e.target().equals(bPackage))
+        GraphEdge resolved = g.edges().stream().filter(e -> e.source().equals(bCombined) && e.target().equals(bPackage))
                 .findFirst().orElseThrow();
-        assertEquals(combinedId("b = a;"), resolved.provenance().get("reportWarning"));
+        assertEquals(bCombined, resolved.provenance().get("reportWarning"));
+        assertTrue(resolved.provenance().get("claim").contains("own independent evaluation"));
         assertEquals(roundOne.getFileName().toString(), resolved.provenance().get("sourceState"));
         assertEquals(roundOne.getFileName() + "+" + bPackage, resolved.provenance().get("resultState"));
         assertTrue(resolved.provenance().get("evaluation").startsWith("evaluations/"), resolved.provenance().toString());
         AnnotationNode p = (AnnotationNode) g.node(bPackage).orElseThrow();
         assertEquals(java.util.OptionalInt.of(2), p.round());
-        assertEquals(Optional.of(bEarlier), p.proposals().get(0).baselineWarningId(), "translated to the graph's node");
+        assertEquals(Optional.of(bCombined), p.proposals().get(0).baselineWarningId(), "the report ID");
 
         assertEquals(earlierBefore, Files.readString(earlierGraph), "the earlier graph is not modified");
         assertEquals(roundBefore, EvaluationFiles.treeHash(roundOne), "the round-1 result is not modified");
@@ -344,29 +371,34 @@ class PropagationHistoryGraphTest {
         Map<?, ?> history = (Map<?, ?>) json(stage.resolve(PropagationStage.RESULT)).get("history");
         Map<?, ?> reportToGraph = (Map<?, ?>) history.get("reportToGraph");
 
-        // x.hashCode (the combined W1001) is the earlier W1003 of A0002, not the earlier W1001 (shared, A0001)
+        // every report ID is its own graph ID
+        reportToGraph.forEach((k, v) -> assertEquals(k, v));
+        // x.hashCode (the combined W1005) corresponds to A0002's W1003; it keeps W1005
         String hash = earlierId("x.hashCode()", "S0+A0002");
-        assertEquals(hash, reportToGraph.get("W1001"));
-        assertTrue(edges(g).contains("A0002 introduces " + hash), "the earlier causal edge is the only origin");
-        Map<?, ?> link = inputWarning(history, "W1001");
-        assertEquals("linked-to-package-warning", link.get("relation"));
+        String hashCombined = combinedId("x.hashCode()");
+        assertTrue(g.node(hashCombined).isPresent());
+        assertTrue(edges(g).contains("A0002 introduces " + hash), "the earlier causal edge is kept");
+        Map<?, ?> link = inputWarning(history, hashCombined);
+        assertEquals("corresponds-to-package-warning", link.get("relation"));
         assertEquals("A0002", ((Map<?, ?>) link.get("provenance")).get("package"));
+        assertEquals(hash, ((Map<?, ?>) link.get("provenance")).get("correspondsTo"));
 
-        // shared() was introduced alone by both packages: an ambiguous link, so a separate node with a fresh ID
+        // shared() was introduced alone by both packages: ambiguous, so no correspondence; its own report ID
         String shared = id(g, "shared();", Optional.of(state));
+        assertEquals(combinedId("shared();"), shared);
         assertTrue(earlier.node(shared).isEmpty(), "a new, unique ID: " + shared);
-        assertTrue(shared.startsWith("W1"), "a round-1 ID: " + shared);
-        Map<?, ?> amb = inputWarning(history, combinedId("shared();"));
-        assertEquals("ambiguous", amb.get("relation"));
+        Map<?, ?> amb = inputWarning(history, shared);
+        assertEquals("ambiguous-correspondence", amb.get("relation"));
         assertEquals(shared, amb.get("graphNode"));
         String candidates = String.valueOf(((Map<?, ?>) amb.get("provenance")).get("candidates"));
         assertTrue(candidates.contains("A0001") && candidates.contains("A0002"), candidates);
         // e = a appears only in combination: no individual evaluation establishes its origin
         String combo = id(g, "e = a;", Optional.of(state));
         assertTrue(earlier.node(combo).isEmpty());
-        Map<?, ?> unattributed = inputWarning(history, combinedId("e = a;"));
-        assertEquals("unattributed", unattributed.get("relation"));
-        assertTrue(String.valueOf(((Map<?, ?>) unattributed.get("provenance")).get("limitation"))
+        assertEquals(combinedId("e = a;"), combo);
+        Map<?, ?> unattributed = inputWarning(history, combo);
+        assertEquals("introduced-in-combined-state", unattributed.get("relation"));
+        assertTrue(String.valueOf(((Map<?, ?>) unattributed.get("provenance")).get("note"))
                 .contains("not established"), unattributed.toString());
         // neither gets an invented incoming edge
         assertTrue(g.edges().stream().noneMatch(e -> e.target().equals(shared) || e.target().equals(combo)),
@@ -453,4 +485,131 @@ class PropagationHistoryGraphTest {
         assertEquals(ExitCode.EXECUTION_FAILURE, rebuild(stage), output());
         assertTrue(output().contains("rerun propagate"), output());
     }
+
+    /** Replaces every string equal to a key of {@code map} in a JSON file (to fabricate a legacy artifact). */
+    private static void renameIn(Path file, Map<String, String> map) throws IOException {
+        Object json = rename(JsonParser.parse(Files.readString(file)), map);
+        Files.writeString(file, Json.write(json));
+    }
+
+    private static Object rename(Object json, Map<String, String> map) {
+        if (json instanceof Map<?, ?> m) {
+            Map<String, Object> copy = new LinkedHashMap<>();
+            m.forEach((k, v) -> copy.put(String.valueOf(k), rename(v, map)));
+            return copy;
+        }
+        if (json instanceof List<?> l) {
+            return l.stream().map(v -> rename(v, map)).toList();
+        }
+        return json instanceof String str && map.containsKey(str) ? map.get(str) : json;
+    }
+
+    @Test
+    void aLegacyRunWithCollidingIdsIsDetectedMigratedAndValidated() throws Exception {
+        assertEquals(ExitCode.COMPLETED, propagate(), output());
+        Path stage = stage();
+        Path evaluation = earlierGraph.getParent();
+        // Legacy: the evaluation numbered its warnings from W1005 (as the earlier, unshared allocator could), so
+        // its W1005 (shared(), A0001) is not the combined result's W1005 (x.hashCode()), as in EventBus's W1004.
+        Map<String, String> legacy = Map.of("W1001", "W1005", "W1002", "W1006", "W1003", "W1007", "W1004", "W1008");
+        List<Path> files = new ArrayList<>(List.of(evaluation.resolve(Evaluator.GRAPH),
+                evaluation.resolve("summary.json")));
+        try (Stream<Path> s = Files.list(evaluation.resolve("attempts"))) {
+            s.filter(d -> Files.isRegularFile(d.resolve("attempt.json"))).forEach(d -> {
+                files.add(d.resolve("attempt.json"));
+                files.add(d.resolve("comparison.json"));
+            });
+        }
+        for (Path f : files) {
+            renameIn(f, legacy);
+        }
+        Path record = stage.resolve(PropagationStage.RESULT);
+        Files.writeString(record, Files.readString(record).replace(HistoryGraph.MODEL, "warning-annotation-history-2"));
+        Files.delete(run.resolve(WarningRegistry.FILE));
+        String legacyGraph = Files.readString(evaluation.resolve(Evaluator.GRAPH));
+        String roundsBefore = EvaluationFiles.treeHash(run.resolve("rounds"));
+        String baselineBefore = EvaluationFiles.treeHash(evaluation.resolve("baseline"));
+        String snapshotBefore = EvaluationFiles.treeHash(run.resolve("workspace/target"));
+        int edgesBefore = WarningGraphJson.load(stage.resolve(PropagationStage.GRAPH)).edges().size();
+        int checks = checker.calls();
+        assertEquals("W1005", combinedId("x.hashCode()"));
+        earlier = WarningGraphJson.load(earlierGraph);
+        assertEquals("W1005", earlierId("shared();", "S0+A0001"), "the fabricated collision");
+
+        // detected, and every writer refuses the inconsistent run
+        WarningIntegrity.Report before = WarningIntegrity.check(run);
+        assertFalse(before.ok());
+        assertTrue(before.problems().stream().anyMatch(p -> p.contains("give one public ID to different warnings")
+                && p.contains("warning-ids migrate")), before.problems().toString());
+        assertThrows(WarningRegistry.Conflict.class, () -> WarningRegistry.rebuild(run));
+
+        // a failed migration restores every file
+        PrintStream sink = new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8);
+        RegistryMigration.Result failed = RegistryMigration.migrate(run, new AnchoredWarningMatcher(),
+                PrepareInferenceCommandTest.CLOCK, sink, s -> {
+                    throw new IOException("simulated interruption");
+                });
+        assertFalse(failed.ok());
+        assertEquals(legacyGraph, Files.readString(evaluation.resolve(Evaluator.GRAPH)), "restored");
+        assertFalse(Files.exists(run.resolve(WarningRegistry.FILE)), "no half-written registry");
+
+        // migrated: combined-report IDs kept, the colliding evaluation occurrences renamed to fresh round-1 IDs
+        RegistryMigration.Result m = RegistryMigration.migrate(run, new AnchoredWarningMatcher(),
+                PrepareInferenceCommandTest.CLOCK, sink, s -> {
+                    try {
+                        PropagationStage.rebuildGraph(s, new AnchoredWarningMatcher(), PrepareInferenceCommandTest.CLOCK,
+                                sink);
+                    } catch (NullabilityPropagation.InvalidException e) {
+                        throw new RegistryMigration.Superseded(e.getMessage());
+                    }
+                });
+        assertTrue(m.ok(), m.problems().toString());
+        assertEquals(Map.of(run.relativize(evaluation).toString(), Map.of("W1005", "W1009", "W1006", "W1010", "W1007",
+                "W1011", "W1008", "W1012")), m.renames());
+        WarningIntegrity.Report after = WarningIntegrity.check(run);
+        assertTrue(after.ok(), after.problems().toString());
+
+        earlier = WarningGraphJson.load(earlierGraph);
+        String hash = earlierId("x.hashCode()", "S0+A0002");
+        assertEquals("W1011", hash);
+        assertEquals("W1005", combinedId("x.hashCode()"), "the report keeps its ID");
+        WarningGraph g = WarningGraphJson.load(stage.resolve(PropagationStage.GRAPH));
+        assertEquals("x.hashCode();", ((WarningNode) g.node("W1005").orElseThrow()).diagnostic().sourceSnippet()
+                .orElseThrow().strip(), "graph and report agree about W1005");
+        List<String> edges = edges(g);
+        assertTrue(edges.contains("A0002 introduces W1011"), edges.toString());
+        assertFalse(edges.contains("A0002 introduces W1005"), "no fabricated edge");
+        assertEquals(edgesBefore, g.edges().size(), "no edge added or lost");
+        String bPackage = packageFor(json(stage.resolve(PropagationStage.RESULT)), "b");
+        assertEquals(List.of(combinedId("b = a;")), g.edges().stream().filter(e -> e.target().equals(bPackage))
+                .map(GraphEdge::source).toList(), "the package resolves only the combined occurrence it was given");
+        WarningRegistry reg = WarningRegistry.load(run);
+        assertTrue(reg.correspondences().stream().anyMatch(c -> c.warningId().equals("W1005")
+                && c.correspondsTo().equals("W1011")), reg.correspondences().toString());
+
+        // raw results and snapshots are untouched; derived artifacts are backed up
+        assertEquals(roundsBefore, EvaluationFiles.treeHash(run.resolve("rounds")));
+        assertEquals(baselineBefore, EvaluationFiles.treeHash(evaluation.resolve("baseline")));
+        assertEquals(snapshotBefore, EvaluationFiles.treeHash(run.resolve("workspace/target")));
+        Path backup = m.report().getParent().resolve("backup");
+        assertEquals(legacyGraph, Files.readString(backup.resolve(run.relativize(evaluation.resolve(Evaluator.GRAPH))
+                .toString())));
+        assertEquals(checks, checker.calls(), "nothing was rechecked");
+
+        // idempotent, and the registry rebuilds deterministically from the migrated artifacts
+        assertFalse(RegistryMigration.migrate(run, new AnchoredWarningMatcher(), PrepareInferenceCommandTest.CLOCK,
+                sink, s -> {
+                    throw new IOException("must not rebuild again");
+                }).migrated());
+        String saved = Files.readString(run.resolve(WarningRegistry.FILE));
+        WarningRegistry.rebuild(run).save();
+        assertEquals(saved, Files.readString(run.resolve(WarningRegistry.FILE)), "rebuild == saved registry");
+        // and the migrated run keeps working: rerunning propagation reuses everything and changes nothing
+        String graphText = Files.readString(stage.resolve(PropagationStage.GRAPH));
+        assertEquals(ExitCode.COMPLETED, propagate(), output());
+        assertEquals(checks, checker.calls());
+        assertEquals(graphText, Files.readString(stage.resolve(PropagationStage.GRAPH)));
+        assertTrue(WarningIntegrity.check(run).ok());
+    }
 }
+

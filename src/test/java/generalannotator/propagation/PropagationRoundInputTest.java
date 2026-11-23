@@ -280,12 +280,13 @@ class PropagationRoundInputTest {
         // attempt-introduced warnings and their edges are kept too, unchanged
         earlier.nodes().forEach(n -> assertEquals(n, g.node(n.id()).orElseThrow(), "kept: " + n.id()));
         earlier.edges().forEach(e -> assertTrue(g.edges().contains(e), "kept: " + e));
-        // the round's b = a is placed on the earlier node of the same warning (matcher and provenance, not ID)
+        // the round's b = a keeps its report ID as its own node; its correspondence to A0001's warning is metadata
         WarningNode bAssign = (WarningNode) g.node(roundId("b = a;")).orElseThrow();
         assertEquals(java.util.OptionalInt.of(1), bAssign.round());
-        assertEquals(Optional.of("S0+A0001"), bAssign.state(), "the earlier node, introduced by A0001 alone");
+        assertEquals(Optional.of(roundOne.getFileName().toString()), bAssign.state(), "the combined occurrence");
         Map<?, ?> history = (Map<?, ?>) r.get("history");
-        assertTrue(history.get("inputWarnings").toString().contains("linked-to-package-warning"), history.toString());
+        assertTrue(history.get("inputWarnings").toString().contains("corresponds-to-package-warning"),
+                history.toString());
         String bPackage = packageFor(r, "#b");
         assertTrue(bPackage.startsWith("P"));
         AnnotationNode p = (AnnotationNode) g.node(bPackage).orElseThrow();

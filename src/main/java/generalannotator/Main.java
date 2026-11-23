@@ -15,6 +15,7 @@ import generalannotator.cli.PropagateCommand;
 import generalannotator.cli.SliceCommand;
 import generalannotator.cli.TargetsCommand;
 import generalannotator.cli.VisualizeCommand;
+import generalannotator.cli.WarningIdsCommand;
 import generalannotator.edits.javaparser.JavaParserAnnotationApplier;
 import generalannotator.evaluation.matching.AnchoredWarningMatcher;
 import generalannotator.exec.ProcessCommandRunner;
@@ -113,6 +114,12 @@ public final class Main {
                       compatible successful ones together and recheck once (rounds/). Writes
                       propagation/<id>/ (analysis.json, propagation.json, summary.txt,
                       evaluation-graph.json: the earlier evaluation graph kept whole plus this stage).
+              warning-ids check|rebuild|migrate <run directory>
+                      The run's warning registry (warning-registry.json), the authority for public
+                      warning IDs. check: verify that registry, reports and graphs agree (exit 3 if
+                      not); rebuild: regenerate the registry from saved artifacts; migrate: give a
+                      run written before the registry consistent IDs (backs up derived files,
+                      validates, restores on failure; no checker, LLM or inference).
               propagate --rebuild-graph <propagation directory>
                       Regenerate propagation/<id>/evaluation-graph.json from saved artifacts only
                       (no checker, LLM or inference; no configuration needed). Refuses if the input
@@ -327,6 +334,10 @@ public final class Main {
                 e.printStackTrace(err);
                 return ExitCode.INTERNAL_ERROR;
             }
+        }
+        if (args.length == 3 && args[0].equals("warning-ids")) {
+            return WarningIdsCommand.run(args[1], args[2], Path.of("").toAbsolutePath(), new AnchoredWarningMatcher(),
+                    Clock.systemUTC(), out, err);
         }
         if (args.length == 2 && args[0].equals("propagate")) {
             try {

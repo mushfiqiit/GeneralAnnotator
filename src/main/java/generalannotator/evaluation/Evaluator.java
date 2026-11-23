@@ -256,7 +256,14 @@ public final class Evaluator {
         key.put("configuration", config.fingerprint());
         key.put("candidatesSha256", EvaluationFiles.sha256(candidatesJson));
         key.put("matcher", matcher.id());
-        inherited.ifPresent(b -> key.put("inheritedBaseline", Map.of("state", b.state(), "identity", b.identity())));
+        inherited.ifPresent(b -> {
+            // a fixed order: Map.of iterates in a per-JVM random order, which made the key (and the evaluation ID)
+            // differ between processes, so repeated commands could not find their own evaluation
+            Map<String, Object> ib = new LinkedHashMap<>();
+            ib.put("state", b.state());
+            ib.put("identity", b.identity());
+            key.put("inheritedBaseline", ib);
+        });
         String keyJson = Json.write(key);
         String evaluationId = candidates.submissionId() + "-" + EvaluationFiles.sha256(keyJson).substring(0, 12);
         Path dir = candidates.runDir().resolve(DIR).resolve(evaluationId);
@@ -372,6 +379,11 @@ public final class Evaluator {
             if (invalid.isPresent()) {
                 return refused(dir, invalid.get());
             }
+            // one allocator per round for the whole run: never an ID the registry holds for another artifact
+            for (String id : WarningRegistry.current(candidates.runDir()).idsOutside(dir)) {
+                last = Math.max(last, WarningIds.sequence(id, round).orElse(0));
+                taken.add(id);
+            }
             ids = new WarningIds.Allocator(round, taken, last);
         }
 
@@ -451,6 +463,7 @@ public final class Evaluator {
         EvaluationFiles.writeAtomically(dir.resolve(GRAPH), WarningGraphJson.write(graph));
         EvaluationFiles.writeAtomically(dir.resolve(SUMMARY), Json.write(summary(evaluationId, baseline, original,
                 records, interrupted, graph, ids)));
+        WarningRegistry.update(candidates.runDir(), r -> r.registerEvaluation(dir, Map.of()));
         return new Result(Status.COMPLETED, dir, "", summaries);
     }
 

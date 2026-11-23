@@ -546,7 +546,7 @@ interface or in one named class), labeled provisional, and noted here.
     stale). Each command runs exactly one pass. Packages are `P<n>-0001`;
     new warnings get `W<n>001`. The extended graph of round n - 1 is
     extended in turn (`HistoryGraph` with the earlier round's evaluation as
-    evidence and its `reportToGraph` for base identities).
+    evidence).
   - **Evaluation.** Candidates come only from that fixed input and are merged
     by edit set (`P0001, ...`, origins `<warning>@propagation-r<source
     round>`, generator `nullability-propagation-4`). `Evaluator` evaluates
@@ -555,24 +555,24 @@ interface or in one named class), labeled provisional, and noted here.
       (`Evaluator.inheriting`); the fresh baseline must reproduce its
       findings.
     - Introduced warnings get the next round's IDs.
-  - **Graph (T17b).** `evaluation.HistoryGraph`
-    (`warning-annotation-history-2`) keeps the earlier evaluation graph
+  - **Graph (T17b, T22).** `evaluation.HistoryGraph`
+    (`warning-annotation-history-3`) keeps the earlier evaluation graph
     whole and holds only warning and annotation nodes with `resolved-by`
     (W -> A) and `introduces` (A -> W) edges from independent package
-    evaluations; the combined result adds none. Combined-result and
-    evaluation warning IDs are separate namespaces, so input warnings are
-    never linked by ID. A persisting warning is linked to its base root
-    (combined comparison plus matcher re-check). An introduced one is linked
-    to the earlier node of the only applied package whose own evaluation (on
-    the same base state) introduced an `anchored-1`-equivalent warning;
-    otherwise it is a separate node with a fresh ID and no incoming edge,
-    with the limitation recorded in `propagation.json`. Provisional:
-    - reusing an earlier node's ID treats an `anchored-1` equivalence across
-      different states (S0+A versus the combined state) as the same warning,
-      which depends on §6.1;
-    - a single-package match records equivalence, not proof that the package
-      alone causes the warning in combination (another package could too);
-    - a new node's distance is the input round, as for inherited warnings;
+    evaluations; the combined result adds none.
+    - **Report IDs:** every input warning appears under its report ID (the
+      registry's). A persisting one is the node of its ID; an introduced
+      one is its own node with no incoming edge.
+    - **Correspondences:** if exactly one applied package's own evaluation
+      introduced an `anchored-1`-equivalent warning, the correspondence is
+      recorded as metadata, never as an edge or shared ID. An ID clash is
+      refused, with a pointer to migration.
+    - **Edge claims:** an edge records only its evaluation's outcome
+      (`claim`).
+    - **Provisional:**
+      - a correspondence is equivalence, not proof that the package alone
+        causes the warning in combination (another package could too);
+      - a new node's distance is the input round, as for inherited warnings;
     - a warning that only the combination introduces has no causal branch:
       whether such effects should ever be attributed (for example by
       evaluating package subsets) is open.
@@ -583,6 +583,34 @@ interface or in one named class), labeled provisional, and noted here.
     excluded and reported, never chosen by order.
   - **One pass:** introduced warnings are never analyzed. Whether and how to
     iterate (a fixed point) is open and tied to §6.3 and §6.4.
+- **Warning identities (T22).** `evaluation.WarningRegistry`
+  (`<run>/warning-registry.json`, model `warning-registry-1`) is the run's
+  authority for public warning IDs: one ID names one warning in every report,
+  comparison and graph.
+  - **Contents:** `ID -> canonical record` and `occurrence -> ID`.
+    Occurrences are keyed by artifact and local finding, with state, site
+    and evidence. `FIRST` allocated the ID; `PERSISTING` was paired with it
+    by the matcher in that artifact's own comparison, and an ambiguous match
+    gets its own ID.
+  - **Correspondences** link distinct occurrences without merging them.
+  - **Allocation:** `Evaluator` and `RoundApplication` draw from one
+    sequence per round through the registry (`idsOutside`). They register
+    their artifacts afterwards, idempotently, under the registry's lock.
+    `HistoryGraph` allocates nothing.
+  - **Legacy runs:** a registry is rebuilt deterministically from the
+    artifacts. A legacy run whose artifacts reuse IDs is refused until
+    `warning-ids migrate` (`evaluation.RegistryMigration`). Migration keeps
+    combined-report IDs and renames colliding independent-evaluation
+    occurrences; it backs up, validates (`evaluation.WarningIntegrity`) and
+    restores on failure.
+  - **Provisional:**
+    - **Persisting identity:** an occurrence persists only through the
+      artifact's own matcher comparison. Two independent evaluations that
+      introduce equivalent warnings in different states get different IDs
+      (§6.1 remains open).
+    - **Superseded stages:** propagation stages whose input no longer
+      resolves keep their old graph as `evaluation-graph.legacy.json`,
+      outside the identity check.
 - **Pipeline orchestration (T16).** Provisional, in `pipeline.Pipeline`:
   - **Composition.** The existing commands are called in-process; the run
     directory is the pipeline directory and `pipeline.json` its state.

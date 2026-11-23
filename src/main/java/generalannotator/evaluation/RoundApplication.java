@@ -231,10 +231,13 @@ public final class RoundApplication {
         Path dir = rounds.resolve(id);
         try (EvaluationFiles.Lock lock = EvaluationFiles.lock(rounds.resolve(".locks").resolve(id),
                 "pid " + ProcessHandle.current().pid() + " since " + clock.instant())) {
-            if (Files.exists(dir, LinkOption.NOFOLLOW_LINKS)) {
-                return existing(dir, keyJson);
+            Result result = Files.exists(dir, LinkOption.NOFOLLOW_LINKS) ? existing(dir, keyJson)
+                    : build(rounds, id, key, candidatesJson, union, snapshotHash);
+            if (result.status() == Status.COMPLETED) {
+                // the run's warning registry records every public ID of the combined state
+                WarningRegistry.update(candidates.runDir(), r -> r.registerRound(result.directory()));
             }
-            return build(rounds, id, key, candidatesJson, union, snapshotHash);
+            return result;
         } catch (EvaluationFiles.BusyException e) {
             out.println("  " + e.getMessage());
             return new Result(Status.BUSY, dir, false, Map.of());
@@ -429,6 +432,11 @@ public final class RoundApplication {
             last = Math.max(last, WarningIds.sequence(r, round).orElse(0));
         }
         taken.addAll(reserved);
+        // one allocator per round, shared with the round's independent evaluations through the run's registry
+        for (String r : WarningRegistry.current(candidates.runDir()).idsOutside(rounds.resolve(id))) {
+            last = Math.max(last, WarningIds.sequence(r, round).orElse(0));
+            taken.add(r);
+        }
         WarningIds.Allocator ids = new WarningIds.Allocator(round, taken, last);
         List<Object> findings = new ArrayList<>();
         List<WarningNode> nodes = new ArrayList<>();

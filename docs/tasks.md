@@ -1550,3 +1550,93 @@ Verified by:
     persisting-from-base and 5 linked-to-package-warning.
   - **Untouched:** round 2's record and artifacts.
   - **Repeat:** about 1 s with no checker run, and an identical graph.
+
+## T22 — One run-scoped authority for public warning IDs · `done`
+
+Independent evaluations and combined results numbered warnings separately,
+and `HistoryGraph` remapped report IDs to earlier graph IDs. In EventBus,
+graph W1004 was the `cause` argument to `EventBusException` (A0008), while
+the reports' W1004 is a `subscription` dereference, and the edge into P0004
+was drawn from graph W1004 for report W1007.
+
+- **Registry** (`evaluation.WarningRegistry`, `<run>/warning-registry.json`):
+  - `ID -> canonical record` and `occurrence -> ID`; occurrences carry the
+    artifact, state, local finding, site and evidence;
+  - `FIRST` / `PERSISTING` (matcher-paired) relations, and correspondences
+    as metadata;
+  - one allocator per round, shared through `idsOutside`;
+  - idempotent registration that refuses a second warning for an ID or a
+    second ID for an occurrence;
+  - atomic save under `.warning-registry/lock`, and a deterministic rebuild
+    from the artifacts.
+- **Writers:**
+  - `Evaluator` and `RoundApplication` seed their allocators from the
+    registry and register their artifacts. The round-1 combined result now
+    continues after the round-1 evaluation's IDs.
+  - `HistoryGraph` (`warning-annotation-history-3`) uses report IDs only.
+    Correspondences are metadata, which `PropagationStage` registers; edges
+    carry a `claim` limited to their own evaluation, and there is no
+    allocation.
+- **Integrity** (`evaluation.WarningIntegrity`, `warning-ids check`):
+  - the registry, and a rebuild equal to the saved registry;
+  - reports versus registry;
+  - every graph node versus the registry's warning of that ID, state and
+    site;
+  - edges, proposal references, identity `reportToGraph`, and pipeline
+    paths.
+- **Migration** (`evaluation.RegistryMigration`, `warning-ids migrate`):
+  - combined-report IDs are kept, and colliding independent-evaluation
+    occurrences are renamed;
+  - affected derived files are backed up, the extended graphs rebuilt in
+    round order, the result validated, and everything restored on failure;
+  - a report is written. Raw output, snapshots and round results are
+    untouched.
+- **Determinism fix:** the evaluation key's `inheritedBaseline` used
+  `Map.of`, whose per-JVM random order changed evaluation IDs between
+  processes. It is now ordered (`state`, `identity`), as in the saved
+  records.
+
+Verified by:
+- `WarningRegistryTest`:
+  - persisting IDs across states and shifted lines;
+  - identical messages at different sites;
+  - independent versus combined occurrences (the W1004 collision refused;
+    correspondences only);
+  - ambiguous combined findings kept separate;
+  - the shared per-round allocator, resume and idempotence, and exhaustion;
+  - atomic persistence and failed changes.
+- `PropagationHistoryGraphTest`:
+  - independent and combined occurrences never share IDs;
+  - report IDs in the graph, with correspondences as metadata and no
+    fabricated edge;
+  - a legacy run with colliding IDs is detected, a failed migration
+    restores everything, and migration keeps report IDs and renames the
+    evaluation's;
+  - the result validates, with the same edge count, untouched raw artifacts
+    and a backup;
+  - migration is idempotent, the registry rebuild is byte-identical, and
+    propagation still reuses everything.
+- `PipelineTest`: the integrity check holds across rounds 1 to 4.
+- Updated expectations in `PropagationRoundInputTest` and
+  `WarningIdMigrationTest`: a second evaluation in the same run now
+  continues the round's sequence.
+- A migration of a copy of the EventBus run (rounds 1 to 5):
+  - **Detection:** `check` found 69 problems first.
+  - **Registry:** 115 warnings and 2186 occurrences.
+  - **Renames:** 31 independent-evaluation occurrences in 3 evaluations.
+    The round-1 evaluation's W1001–W1022 became W1025–W1046; the superseded
+    round-2 evaluations' W2001…W2005 became W2011–W2019.
+  - **Kept:** every combined-report ID. 0 ambiguities remain, and `check`
+    reports OK.
+  - **W1004 and W1007:** W1004 (`subscription` dereference, EventBus.java:510)
+    and W1007 (`cause` passed to `EventBusException`, :537) are distinct.
+    A0008's own occurrence of the `cause` argument is W1028, with
+    W1007 -> W1028 recorded as a correspondence.
+  - **Graphs:** every round's graph shows W1004 as the dereference. P0004 is
+    resolved only by W1007, and `A0008 introduces W1028` is kept.
+  - **Unchanged:** 471 edges before and after; rounds, inference,
+    workspace, prompts, slices and the evaluations' raw files are
+    byte-identical.
+  - **Reruns:** a repeated `pipeline propagate --round 5` reuses the original
+    evaluation with no NullAway run, and the graph and registry stay
+    byte-identical.

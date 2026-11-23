@@ -7,7 +7,6 @@ import generalannotator.graph.GraphEdge;
 import generalannotator.graph.GraphNode;
 import generalannotator.graph.WarningGraph;
 import generalannotator.graph.WarningGraphJson;
-import generalannotator.graph.WarningIds;
 import generalannotator.graph.WarningNode;
 import generalannotator.report.JsonParser;
 import java.io.IOException;
@@ -20,7 +19,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.OptionalInt;
 import java.util.Set;
 import java.util.TreeMap;
 
@@ -37,33 +35,29 @@ import java.util.TreeMap;
  * input state's warnings, saved separately, and is used here only to identify those warnings.
  *
  * <h2>Identity</h2>
- * Warning IDs are local to the graph or result that assigned them. The earlier evaluation's introduced warnings
- * ({@code W1001, ...}, each in its own state {@code S0+A}) and the combined round result's introduced warnings
- * ({@code W1001, ...}, in state {@code round1-...}) are separate namespaces, and the same ID often names different
- * warnings in the two. Input warnings (the combined result's findings) are therefore never matched by ID, and
- * never by diagnostic similarity alone. Each is linked to an earlier occurrence only with saved evidence:
+ * Public warning IDs come from the run's {@link WarningRegistry}: one ID names one warning in every report and
+ * graph. Every input warning (a combined-result finding) therefore appears under its report ID:
  * <ul>
- *   <li><b>Persisting from the base state:</b> the combined result's own comparison paired it with base warning
- *       B, B is a root of the earlier graph, and the {@link WarningMatcher} pairs B's saved baseline finding with
- *       it again. It keeps B's identity.
- *   <li><b>Introduced in the combined state:</b> linked to earlier node N only if N was introduced by a package
- *       that was applied in the combined state (verified by its package key), in that package's own completed
- *       evaluation against the same base state, the matcher pairs N with it, and no other package's warning is
- *       equivalent and nothing is ambiguous.
- *   <li>Otherwise (no equivalent, several, an ambiguous group, or an unverifiable persisting record) it gets a
- *       separate warning node with a new unique ID of the input's round, in the input state, with no incoming
- *       edge: the individual evaluations do not establish its origin, and no connection is invented.
+ *   <li><b>Persisting:</b> the combined result's comparison paired it with the base warning of the same ID; it is
+ *       that node (the matcher re-verifies the pairing against the earlier evaluation's baseline, and the
+ *       relation records whether it did).
+ *   <li><b>Introduced in the combined state:</b> a distinct occurrence in another state than any package's own
+ *       evaluation, so it is its own node with its own ID and no incoming edge. If exactly one applied package
+ *       introduced an equivalent warning in its own completed evaluation on the same base state (verified by
+ *       package key and the matcher, with nothing ambiguous), the correspondence is recorded as metadata (and in
+ *       the registry); it never becomes an edge or a shared ID. Otherwise nothing is recorded.
+ *   <li>An earlier node with the same ID but another warning is refused: the run predates the registry and must be
+ *       migrated ({@code warning-ids migrate}).
  * </ul>
- * The layer's nodes and edges are then added with input IDs translated to graph IDs; its introduced warnings keep
- * their next-round IDs ({@code W2001, ...}). Every new edge carries its provenance as metadata (the evaluation,
- * source and result states, the matcher and the combined result's warning ID). The mapping from combined-result
- * IDs to graph nodes, with each link's evidence or each limitation, is in the record. An ID clash between earlier
- * and new nodes is refused, never renamed.
+ * The layer's nodes and edges are then added unchanged; its introduced warnings keep their registry IDs. Every
+ * new edge carries its provenance (the evaluation, source and result states, the matcher, the report warning) and
+ * its claim: the outcome of that package's own independent evaluation only, not a statement about any later
+ * combined state. {@code reportToGraph} is the identity map, kept for readers of earlier records.
  */
 public final class HistoryGraph {
 
     /** The graph model, recorded with the graph; a different model means the saved graph is stale. */
-    public static final String MODEL = "warning-annotation-history-2";
+    public static final String MODEL = "warning-annotation-history-3";
 
     public record Built(WarningGraph graph, Map<String, Object> record) {}
 
@@ -82,8 +76,8 @@ public final class HistoryGraph {
      */
     public static Built build(Optional<Path> earlierGraph, Optional<Path> roundResult, Path runDir, WarningGraph layer,
             Path layerEvaluation, String inputState, int inputRound, WarningMatcher matcher) throws IOException {
-        return build(earlierGraph, earlierGraph.map(Path::getParent), Optional.empty(), roundResult, runDir, layer,
-                layerEvaluation, inputState, inputRound, matcher);
+        return build(earlierGraph, earlierGraph.map(Path::getParent), roundResult, runDir, layer, layerEvaluation,
+                inputState, inputRound, matcher);
     }
 
     /**
@@ -91,12 +85,10 @@ public final class HistoryGraph {
      *
      * @param earlierEvaluation the evaluation whose packages the combined round result applied (its {@code
      *     baseline/} and {@code attempts/} are the evidence); by default the earlier graph's own directory
-     * @param baseToGraph how that evaluation's baseline warning IDs map to nodes of the earlier graph (the earlier
-     *     stage's {@code reportToGraph}); when empty, a base warning is its own ID and must be a root (round 2)
      */
     public static Built build(Optional<Path> earlierGraph, Optional<Path> earlierEvaluation,
-            Optional<Map<String, String>> baseToGraph, Optional<Path> roundResult, Path runDir, WarningGraph layer,
-            Path layerEvaluation, String inputState, int inputRound, WarningMatcher matcher) throws IOException {
+            Optional<Path> roundResult, Path runDir, WarningGraph layer, Path layerEvaluation, String inputState,
+            int inputRound, WarningMatcher matcher) throws IOException {
         Map<String, GraphNode> nodes = new LinkedHashMap<>();
         Map<String, GraphEdge> edges = new LinkedHashMap<>();
         Map<String, Object> record = new LinkedHashMap<>();
@@ -108,8 +100,8 @@ public final class HistoryGraph {
         Map<String, String> toGraph = new LinkedHashMap<>();
         Map<String, Map<String, Object>> identities = new LinkedHashMap<>();
         Map<String, Integer> counts = new TreeMap<>();
-        List<WarningNode> unplaced = new ArrayList<>();
         List<String> notes = new ArrayList<>();
+        List<Object> correspondences = new ArrayList<>();
         String roundRef = null;
 
         if (earlierGraph.isEmpty()) {
@@ -232,36 +224,52 @@ public final class HistoryGraph {
                 prov.put("matcher", matcher.id());
                 if ("PERSISTING".equals(f.get("status"))) {
                     String b = String.valueOf(f.get("baselineWarningId"));
-                    String node = baseToGraph.isPresent() ? baseToGraph.get().get(b) : b;
-                    boolean verified = node != null && nodes.get(node) instanceof WarningNode n
-                            && (baseToGraph.isPresent() || n.root()) && base.containsKey(b)
+                    if (!b.equals(w.id())) {
+                        throw new IOException("the combined result " + roundRef + " records " + w.id() + " as persisting "
+                                + "from " + b + "; a persisting warning keeps its public ID, so these artifacts predate "
+                                + "the warning registry (migrate the run with `warning-ids migrate`)");
+                    }
+                    boolean verified = nodes.get(b) instanceof WarningNode && base.containsKey(b)
                             && matcher.compare(List.of(base.get(b)), List.of(observed(w.id(), f))).persisting()
                                     .size() == 1;
                     prov.put("baseState", baseState);
-                    if (verified) {
-                        prov.put("evidence", "the combined result's comparison and the matcher pair it with base "
-                                + "warning " + b + " (" + rel(runDir, evaluationDir.resolve("baseline")) + ")"
-                                + (node.equals(b) ? "" : ", which the earlier graph records as node " + node));
-                        place(w, node, "persisting-from-base", prov, toGraph, identities, counts);
+                    if (nodes.get(b) instanceof WarningNode) {
+                        prov.put("evidence", verified ? "the combined result's comparison and the matcher pair it with "
+                                + "base warning " + b + " (" + rel(runDir, evaluationDir.resolve("baseline")) + ")"
+                                : "the combined result's comparison pairs it with base warning " + b);
+                        place(w, b, verified ? "persisting-from-base" : "persisting-per-combined-comparison", prov,
+                                toGraph, identities, counts);
                     } else {
-                        prov.put("limitation", "recorded as persisting from " + b + ", but " + b + " is not a matching "
-                                + (baseToGraph.isPresent() ? "warning mapped to a node of the earlier graph"
-                                        : "root of the earlier graph") + "; kept as a separate node without history");
-                        separate(w, "unverified-persisting", prov, unplaced, identities, counts);
+                        prov.put("note", "persisting from " + b + ", which the earlier graph does not show");
+                        own(w, "persisting-not-in-earlier-graph", prov, nodes, toGraph, identities, counts);
                     }
                     continue;
+                }
+                if (nodes.containsKey(w.id())) {
+                    throw new IOException("the earlier graph already uses " + w.id() + " for another warning ("
+                            + describe(nodes.get(w.id())) + ") than " + roundRef + "'s " + w.id() + " ("
+                            + w.diagnostic().message().lines().findFirst().orElse("") + " at line "
+                            + w.diagnostic().line() + "); one public ID must name one warning, so migrate the run with "
+                            + "`warning-ids migrate`");
                 }
                 List<Candidate> cs = candidates.getOrDefault(w.id(), List.of());
                 if (cs.size() == 1 && !ambiguous.containsKey(w.id())) {
                     Candidate c = cs.get(0);
+                    prov.put("correspondsTo", c.warningId());
                     prov.put("package", c.packageId());
-                    prov.put("packageWarning", c.warningId());
                     prov.put("packageState", c.state());
                     prov.put("packageEvaluation", rel(runDir, evaluationDir));
                     prov.put("evidence", "the matcher pairs it with " + c.warningId() + ", which only package "
                             + c.packageId() + " (applied in " + inputState + ") introduced in its own completed "
-                            + "evaluation on " + baseState + " (state " + c.state() + ")");
-                    place(w, c.warningId(), "linked-to-package-warning", prov, toGraph, identities, counts);
+                            + "evaluation on " + baseState + " (state " + c.state() + "); a distinct occurrence in "
+                            + "another state, so it keeps its own ID and no edge is drawn");
+                    Map<String, Object> corr = new LinkedHashMap<>();
+                    corr.put("reportWarning", w.id());
+                    corr.put("correspondsTo", c.warningId());
+                    corr.put("package", c.packageId());
+                    corr.put("evidence", prov.get("evidence"));
+                    correspondences.add(corr);
+                    own(w, "corresponds-to-package-warning", prov, nodes, toGraph, identities, counts);
                 } else {
                     boolean none = cs.isEmpty() && !ambiguous.containsKey(w.id());
                     if (!cs.isEmpty()) {
@@ -271,30 +279,13 @@ public final class HistoryGraph {
                     if (ambiguous.containsKey(w.id())) {
                         prov.put("ambiguity", String.join("; ", ambiguous.get(w.id())));
                     }
-                    prov.put("limitation", none ? "no applied package introduced an equivalent warning in its own "
-                            + "evaluation; its origin in the combination is not established by any individual "
-                            + "evaluation, so it is a separate node without incoming edges"
-                            : "equivalent warnings of several packages, or an undecided group; the link is ambiguous, "
-                                    + "so it is a separate node without incoming edges");
-                    separate(w, none ? "unattributed" : "ambiguous", prov, unplaced, identities, counts);
+                    prov.put("note", none ? "no applied package introduced an equivalent warning in its own evaluation; "
+                            + "its origin in the combination is not established by any individual evaluation"
+                            : "equivalent warnings of several packages, or an undecided group; no correspondence is "
+                                    + "recorded");
+                    own(w, none ? "introduced-in-combined-state" : "ambiguous-correspondence", prov, nodes, toGraph,
+                            identities, counts);
                 }
-            }
-        }
-
-        // Separate nodes for input warnings with no supported link, with fresh IDs of the input's round.
-        if (!unplaced.isEmpty()) {
-            Set<String> taken = new LinkedHashSet<>(nodes.keySet());
-            layer.nodes().stream().filter(n -> !inputIds.contains(n.id())).forEach(n -> taken.add(n.id()));
-            int last = taken.stream().map(id -> WarningIds.sequence(id, inputRound))
-                    .filter(OptionalInt::isPresent).mapToInt(OptionalInt::getAsInt).max().orElse(0);
-            WarningIds.Allocator ids = new WarningIds.Allocator(inputRound, taken, last);
-            for (WarningNode w : unplaced) {
-                String id = ids.next();
-                nodes.put(id, new WarningNode(id, w.diagnostic(), w.targetPath(), false, Math.max(1, w.distance()),
-                        Optional.of(inputState), OptionalInt.of(inputRound)));
-                toGraph.put(w.id(), id);
-                identities.get(w.id()).put("graphNode", id);
-                counts.merge("newNodes", 1, Integer::sum);
             }
         }
 
@@ -325,6 +316,8 @@ public final class HistoryGraph {
             String annotation = e.kind().equals(GraphEdge.RESOLVED_BY) ? e.target() : e.source();
             Map<String, String> prov = new LinkedHashMap<>();
             prov.put("evaluation", evaluationRef);
+            prov.put("claim", "the outcome of this package's own independent evaluation on " + inputState + " only; "
+                    + "later rounds may still report the warning");
             prov.put("sourceState", inputState);
             prov.put("resultState", resultStates.getOrDefault(annotation, ""));
             prov.put("matcher", matcher.id());
@@ -342,15 +335,16 @@ public final class HistoryGraph {
         Map<String, String> reportToGraph = new LinkedHashMap<>();
         identities.forEach((k, v) -> reportToGraph.put(k, String.valueOf(v.get("graphNode"))));
         record.put("reportToGraph", reportToGraph);
+        record.put("correspondences", correspondences);
         record.put("inputWarnings", List.copyOf(identities.values()));
         record.put("notes", notes);
         record.put("nodes", graph.nodes().size());
         record.put("edges", graph.edges().size());
         record.put("note", "Earlier nodes and edges are kept unchanged. Every edge comes from an independent package "
-                + "evaluation; the combined result adds none. Input warnings are linked to earlier nodes only through "
-                + "verified provenance and the matcher, never by ID; reportToGraph maps the combined result's IDs to "
-                + "graph nodes. Warnings whose origin no individual evaluation establishes are separate nodes without "
-                + "incoming edges.");
+                + "evaluation and records only that evaluation's outcome; the combined result adds none. Every input "
+                + "warning appears under its report ID (reportToGraph is the identity): a persisting one on the node of "
+                + "that ID, an introduced one as its own node, with any verified correspondence to a package's "
+                + "introduced warning recorded as metadata, never as an edge or a shared ID.");
         return new Built(graph, record);
     }
 
@@ -365,11 +359,18 @@ public final class HistoryGraph {
         counts.merge(relation, 1, Integer::sum);
     }
 
-    private static void separate(WarningNode w, String relation, Map<String, String> prov, List<WarningNode> unplaced,
-            Map<String, Map<String, Object>> identities, Map<String, Integer> counts) {
-        unplaced.add(w);
-        identities.put(w.id(), identity(w.id(), null, relation, prov));
+    /** An input warning that is its own node, under its report ID. */
+    private static void own(WarningNode w, String relation, Map<String, String> prov, Map<String, GraphNode> nodes,
+            Map<String, String> toGraph, Map<String, Map<String, Object>> identities, Map<String, Integer> counts) {
+        nodes.put(w.id(), w);
+        toGraph.put(w.id(), w.id());
+        identities.put(w.id(), identity(w.id(), w.id(), relation, prov));
         counts.merge(relation, 1, Integer::sum);
+    }
+
+    private static String describe(GraphNode n) {
+        return n instanceof WarningNode w ? w.diagnostic().message().lines().findFirst().orElse("") + " at line "
+                + w.diagnostic().line() + w.state().map(s -> " in state " + s).orElse("") : "annotation package";
     }
 
     private static Map<String, Object> identity(String input, String graph, String relation, Map<String, ?> prov) {

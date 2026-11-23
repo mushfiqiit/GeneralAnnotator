@@ -1840,11 +1840,9 @@ $GA propagate runs/<run id>             # round 2's input selection, without rec
   the rule version are in the stage key; the checker configuration is in
   the evaluation key. Repeating a command reuses its results, and an
   identical rerun is not added to the stage's `previous` history.
-- **Graph:** round `n` extends round `n - 1`'s extended graph. The
-  persisting input warnings are placed on round `n - 1`'s nodes through
-  its saved `reportToGraph` and the matcher, whatever their round (`W0`,
-  `W1`, `W2`, ...). Introduced input warnings are linked through round
-  `n - 1`'s own package evaluations, as in round 2.
+- **Graph:** round `n` extends round `n - 1`'s extended graph. Every input
+  warning appears under its report ID, whatever its round (`W0`, `W1`,
+  `W2`, ...). See "Warning identities" below.
 
 **Input.** The input is chosen from the directory, never by sorting
 directory names:
@@ -2011,29 +2009,27 @@ of every cache key. Results from earlier versions are never reused:
     two solid edge kinds: `W -> A` (`resolved-by`: applying A resolved W)
     and `A -> W` (`introduces`: applying A introduced W). Every edge comes
     from one complete, independent package evaluation against its source
-    state; the combined result adds no node and no edge. It numbers its
-    warnings independently, so its `W1001` is often a different warning
-    from the evaluation's `W1001`, and input warnings are never matched by
-    ID or by diagnostic similarity alone:
-    - **Persisting** from the original baseline: linked to the earlier root
-      (`W0...`), checked by the combined comparison and the matcher.
-    - **Introduced** in the combined state: linked to the earlier node N
-      only if N was introduced by a package applied in the combined state
-      (package key checked), in its own completed evaluation on the same
-      base state, the matcher pairs them, and no other package's warning is
-      equivalent. The link reuses N's ID.
-    - **Otherwise** (ambiguous, several candidates, or no individual
-      evaluation introduced it): a separate warning node with a fresh
-      round-1 ID and no incoming edge. Its origin is not established, and
-      none is invented; `propagation.json` states the limitation.
+    state; the combined result adds no node and no edge. Every input warning
+    appears under its report ID (see "Warning identities"):
+    - **Persisting:** the node of its ID, re-checked with the matcher.
+    - **Introduced in the combined state:** its own node, with no incoming
+      edge. If exactly one applied package introduced an equivalent warning
+      in its own completed evaluation on the same base state (package key
+      checked, matcher pairing, nothing ambiguous), `propagation.json` and
+      the registry record the correspondence (`corresponds-to-package-
+      warning`, `correspondsTo`). It never becomes an edge or a shared ID.
+    - **Otherwise** (`ambiguous-correspondence`,
+      `introduced-in-combined-state`): its own node, and nothing is
+      recorded; no origin is invented.
     - **This stage:** `W -> P` for every input warning a package resolves,
       `P -> W2001, ...` for genuinely new warnings, nothing more. A package
       that introduces nothing ends at its node.
     - **Metadata:** every new edge records its evaluation, source and result
-      states, the matcher and the warning's ID in the combined report
-      (`reportWarning`). `propagation.json` maps every combined-report ID to
-      its graph node (`history.reportToGraph`), with each link's evidence or
-      limitation (`history.inputWarnings`).
+      states, the matcher, the report warning (`reportWarning`), and its
+      `claim`: the outcome of that package's own evaluation only, not the
+      warning's status in any later combined state.
+      `history.reportToGraph` is the identity, and `history.inputWarnings`
+      gives each warning's relation and evidence.
     - Loading and saving reject any other node or edge kind, a wrong edge
       direction, and dangling or duplicate edges. ID clashes are refused,
       never renamed.
@@ -2112,6 +2108,94 @@ combined set was rejected; 4 internal error.
     chain reads `W0012 -> A0009 -> W1007 -> P0001` (the edge records
     `reportWarning: W1001`). There are no W2 nodes: 95 nodes (66 warnings, 29
     annotations) and 66 edges (42 `resolved-by`, 24 `introduces`).
+
+## Warning identities (`warning-ids`)
+
+Within one run, a public warning ID (`W0001`, `W1004`, ...) names exactly
+one warning in every report (`warnings.txt`, `findings.json`), comparison
+and graph. The authority is the run's warning registry,
+`<run>/warning-registry.json`:
+- **Warnings:** `ID -> canonical record`, meaning the round, the first
+  occurrence and the diagnostic identity (path, line, column, message,
+  declaration anchor).
+- **Occurrences:** `occurrence -> ID`, keyed by the artifact and its local
+  finding (`rounds/round2-.../#R004`, `evaluations/<id>/attempts/P0002#R017`),
+  with the state and the evidence.
+  - `FIRST` allocated the ID.
+  - `PERSISTING` was paired with it by the semantic matcher in that
+    artifact's own comparison (`anchored-1`: declaration anchor and site,
+    never line or message alone).
+  - An ambiguous match is not persisting; it gets its own ID.
+- **Correspondences:** verified links between distinct occurrences, for
+  example a combined-state warning and the equivalent warning a package
+  introduced in its own evaluation. They are metadata only and never merge
+  IDs.
+- **Allocation:** one sequence per round (`W1001...` for round 1,
+  `W2001...` for round 2), shared by the independent evaluations and the
+  combined application of that round. A new ID follows every ID of the
+  round registered anywhere in the run; running out of a round's 999 IDs
+  fails instead of colliding.
+- **Writes:** the registry is written atomically under its own lock
+  (`.warning-registry/lock`) after every evaluation, combined round and
+  propagation graph. Registration is idempotent: resume, repeated commands
+  and rebuilds never allocate twice or reassign. A missing registry is
+  rebuilt from the artifacts, deterministically.
+
+Earlier runs numbered each evaluation and each combined result separately,
+so one ID could name different warnings. In EventBus, graph W1004 was the
+`cause` argument to `EventBusException` (introduced by A0008 alone), while
+the reports' W1004 is a `subscription` dereference. Such runs are refused
+until migrated:
+
+```sh
+$GA warning-ids check   runs/<run id>   # registry, reports, graphs, references; exit 3 on any problem
+$GA warning-ids migrate runs/<run id>   # one-time migration of a run written before the registry
+$GA warning-ids rebuild runs/<run id>   # regenerate warning-registry.json from the artifacts
+```
+
+**`migrate`** runs under the pipeline lock and needs no checker, LLM or
+inference:
+1. **Combined-report IDs are kept.** An independent-evaluation occurrence
+   whose recorded ID already names another warning gets a fresh ID of its
+   round, after every ID of that round in the run.
+2. **Legacy warnings are identified by namespace,** that is evaluation
+   directory, state and local finding, never by bare ID.
+3. **Order:** evaluations named by `pipeline.json` are processed before
+   superseded ones.
+4. **Applying:** the renames go into the evaluations' attempt records,
+   comparisons, graphs and summaries, and stale renderings are removed.
+   Then every propagation round's extended graph is rebuilt in round order,
+   and the stages record the new graph model (`warning-annotation-history-3`).
+5. **Backup and validation:** every changed derived file is first copied to
+   `migrations/<id>/backup/`, and the result is validated with `check`. On
+   any problem everything is restored.
+6. **What is never changed:** raw checker output, logs, snapshots,
+   workspaces and combined round results.
+7. **Report:** `migrations/<id>/migration.json` lists every rename with its
+   evidence, the ambiguities left as separate warnings, and superseded
+   stages whose input no longer resolves. Their old graph is kept as
+   `evaluation-graph.legacy.json`.
+8. Running it again on a consistent run does nothing.
+
+Then render again:
+`$GA visualize runs/<run id>/propagation/<id>` and
+`$GA visualize runs/<run id>/evaluations/<id>`.
+
+**`check`** verifies:
+- **The registry:** one `FIRST` per ID, valid ID forms, counters,
+  correspondences.
+- **The artifacts:** a rebuild from them equals the saved registry.
+- **The reports:** `findings.json`, `warnings.txt` and the round's warning
+  graph agree, and each warning is registered with that ID.
+- **The graphs:** every node of every `evaluation-graph.json` is the
+  registry's warning of that ID, state and site. There are no dangling,
+  duplicate or non-causal edges, every package proposal names a registered
+  warning, and `reportToGraph` is the identity.
+- **The pipeline:** every artifact path in `pipeline.json` exists.
+
+Evaluation keys are now written in a fixed order. They used a `Map.of`, whose
+per-process random order could change an evaluation's ID between commands,
+so a repeated command might not find its own evaluation.
 
 ## How the local NullAway checkout is used
 
