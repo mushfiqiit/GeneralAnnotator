@@ -31,6 +31,14 @@ import java.util.OptionalInt;
  * #ANSWER_PACKAGE_SCHEMA_VERSION} (one package per answer, the indices on each edit), version {@value
  * #EDIT_LEVEL_SCHEMA_VERSION} (one edit per node, with rounds) and version {@value
  * #LEGACY_EXPANDED_SCHEMA_VERSION} (one edit per node, introduced warnings named {@code A0001-N1}).
+ * An extended (multi-round) graph uses the same version, the same two node kinds and the same two edge kinds;
+ * its later edges also carry provenance metadata (optional, so graphs without it are unchanged):
+ * <pre>
+ *   { "source": "W1007", "target": "P0001", "kind": "resolved-by",
+ *     "provenance": { "evaluation": "evaluations/...", "sourceState": "round1-...", ... } }
+ * </pre>
+ * Loading rejects any other node kind, any other edge kind or direction, and duplicate or dangling edges
+ * ({@link WarningGraph}).
  * <pre>
  *   { "id": "W0001", "kind": "warning", "state": "S0", "round": 0, ... as in version 1 }
  *   { "id": "W1001", "kind": "warning", "state": "S0+A0001", "round": 1, "root": false, "distance": 1, ... }
@@ -96,6 +104,9 @@ public final class WarningGraphJson {
             m.put("source", e.source());
             m.put("target", e.target());
             m.put("kind", e.kind());
+            if (!e.provenance().isEmpty()) {
+                m.put("provenance", e.provenance());
+            }
             edges.add(m);
         }
         root.put("edges", edges);
@@ -234,8 +245,15 @@ public final class WarningGraphJson {
         List<GraphEdge> edges = new ArrayList<>();
         for (Object item : list(root, "edges", "graph")) {
             Map<String, Object> e = object(item, "edge");
+            Map<String, String> provenance = new LinkedHashMap<>();
+            if (e.get("provenance") != null) {
+                Map<String, Object> p = object(e.get("provenance"), "edge provenance");
+                for (String key : p.keySet()) {
+                    provenance.put(key, string(p, key, "edge provenance"));
+                }
+            }
             edges.add(new GraphEdge(string(e, "source", "edge"), string(e, "target", "edge"),
-                    string(e, "kind", "edge")));
+                    string(e, "kind", "edge"), provenance));
         }
         return new WarningGraph(runId, checker, nodes, edges);
     }

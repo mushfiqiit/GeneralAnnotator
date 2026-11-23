@@ -44,6 +44,17 @@ final class EvaluationGraph {
 
     static WarningGraph build(Candidates candidates, List<WarningNode> baseline, Map<String, Map<?, ?>> records,
             Set<String> interrupted, Map<String, String> originalToBaseline, String checkerId, int round) {
+        return build(candidates, baseline, records, interrupted, originalToBaseline, checkerId, round,
+                Evaluator.BASELINE_STATE, 1);
+    }
+
+    /**
+     * @param baselineState the name of the state every package was applied to
+     * @param introducedDistance the graph distance of introduced warnings (1 above an initial baseline)
+     */
+    static WarningGraph build(Candidates candidates, List<WarningNode> baseline, Map<String, Map<?, ?>> records,
+            Set<String> interrupted, Map<String, String> originalToBaseline, String checkerId, int round,
+            String baselineState, int introducedDistance) {
         List<GraphNode> nodes = new ArrayList<>(baseline);
         Set<GraphEdge> edges = new LinkedHashSet<>();
         for (Candidates.Candidate c : candidates.candidates()) {
@@ -72,7 +83,7 @@ final class EvaluationGraph {
                     for (Map<?, ?> im : Evaluator.introduced(r)) {
                         String id = (String) im.get("warningId");
                         introduced.add(new WarningNode(id, FindingJson.diagnostic((Map<?, ?>) im.get("diagnostic")),
-                                Optional.ofNullable((String) im.get("targetPath")), false, 1, resultState,
+                                Optional.ofNullable((String) im.get("targetPath")), false, introducedDistance, resultState,
                                 OptionalInt.of(Math.toIntExact((Long) im.get("round")))));
                         edges.add(new GraphEdge(c.id(), id, GraphEdge.INTRODUCES));
                     }
@@ -93,7 +104,7 @@ final class EvaluationGraph {
                         o.edits().stream().map(Candidates.EditAssociation::answerEditIndices).toList(),
                         Optional.ofNullable(originalToBaseline.get(o.warningId()))));
             }
-            nodes.add(new AnnotationNode(c.id(), c.canonical(), edits, Evaluator.BASELINE_STATE, resultState, outcome,
+            nodes.add(new AnnotationNode(c.id(), c.canonical(), edits, baselineState, resultState, outcome,
                     detail, proposals, counts, OptionalInt.of(round)));
             nodes.addAll(introduced);
         }

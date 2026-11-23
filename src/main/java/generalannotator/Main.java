@@ -11,6 +11,7 @@ import generalannotator.cli.InferenceCommand;
 import generalannotator.cli.MigrateWarningIdsCommand;
 import generalannotator.cli.PrepareInferenceCommand;
 import generalannotator.cli.PromptsCommand;
+import generalannotator.cli.PropagateCommand;
 import generalannotator.cli.SliceCommand;
 import generalannotator.cli.TargetsCommand;
 import generalannotator.cli.VisualizeCommand;
@@ -101,6 +102,21 @@ public final class Main {
                       every finding (findings.json, warnings.txt) and its comparison with the
                       baseline. A conflict rejects the whole round. Checker settings as for
                       evaluate-annotations. The result directory can be used as the next round's run.
+              propagate <run directory>
+                      Single-pass, warning-guided nullability propagation (no LLM). For a pipeline
+                      directory the input is its completed combined round-1 result (verified; no
+                      fallback); otherwise the run's own baseline. For every input
+                      warning that assigns or returns an explicitly @Nullable field or
+                      method result into an unannotated field or method result, propose @Nullable on
+                      that destination; skip everything else with its reason. Evaluate each unique
+                      package alone (evaluations/<id>-<key>/, expanded graph), then apply the
+                      compatible successful ones together and recheck once (rounds/). Writes
+                      propagation/<id>/ (analysis.json, propagation.json, summary.txt,
+                      evaluation-graph.json: the earlier evaluation graph kept whole plus this stage).
+              propagate --rebuild-graph <propagation directory>
+                      Regenerate propagation/<id>/evaluation-graph.json from saved artifacts only
+                      (no checker, LLM or inference; no configuration needed). Refuses if the input
+                      changed since. Then: visualize <propagation directory>.
               pipeline start [--resume <pipeline dir>]
                       Run the whole round-1 front half in one command: check (snapshot, findings,
                       graph, targets), slice, context, prompts, prepare-inference (by default one
@@ -111,6 +127,9 @@ public final class Main {
               pipeline status <pipeline dir> [--connect]
                       Recorded stages, then the job's scheduler states (fresh, or cached and
                       labeled); --connect reconnects first (may prompt once).
+              pipeline propagate <pipeline dir>
+                      The propagation stage on the pipeline's combined round-1 result (after
+                      pipeline finish), recorded in pipeline.json; no LLM, nothing submitted.
               pipeline finish <pipeline dir>
                       Connect, check the job; once every task has ended: collect, evaluate each
                       unique package (evaluate-annotations), apply all packages together and
@@ -129,7 +148,8 @@ public final class Main {
                         equivalent or IDs exhausted;
                         apply-round: nothing to apply, rejected, check failed or not comparable;
                         pipeline: failed, blocked, waiting for jobs, unknown submission or
-                        nothing to submit/evaluate;
+                        nothing to submit/evaluate; propagate: baseline or combined check
+                        failed, or the combined edit set was rejected;
                         migrate-warning-ids: refused), 4 internal error,
                         5 inference: the shared SSH connection is not available (reconnect).""";
 
@@ -276,7 +296,8 @@ public final class Main {
             boolean status = args[1].equals("status") && (args.length == 3 || (args.length == 4
                     && args[3].equals("--connect")));
             boolean finish = args[1].equals("finish") && args.length == 3;
-            if (start || status || finish) {
+            boolean propagate = args[1].equals("propagate") && args.length == 3;
+            if (start || status || finish || propagate) {
                 try {
                     Pipeline pipeline = new Pipeline(env, Path.of("").toAbsolutePath(),
                             Path.of(System.getProperty("java.home")), new Pipeline.Tools(new ProcessCommandRunner(),
@@ -285,12 +306,36 @@ public final class Main {
                                     InferenceCommand.sshClusters(), new JavaParserAnnotationApplier(),
                                     new AnchoredWarningMatcher(), Clock.systemUTC()), out, err);
                     return start ? pipeline.start(args.length == 4 ? Optional.of(args[3]) : Optional.empty())
-                            : status ? pipeline.status(args[2], args.length == 4) : pipeline.finish(args[2]);
+                            : status ? pipeline.status(args[2], args.length == 4)
+                            : propagate ? pipeline.propagate(args[2]) : pipeline.finish(args[2]);
                 } catch (RuntimeException e) {
                     err.println("GeneralAnnotator: internal error:");
                     e.printStackTrace(err);
                     return ExitCode.INTERNAL_ERROR;
                 }
+            }
+        }
+        if (args.length == 3 && args[0].equals("propagate") && args[1].equals("--rebuild-graph")) {
+            try {
+                return PropagateCommand.rebuildGraph(args[2], Path.of("").toAbsolutePath(), new AnchoredWarningMatcher(),
+                        Clock.systemUTC(), out, err);
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if (args.length == 2 && args[0].equals("propagate")) {
+            try {
+                return new PropagateCommand(args[1], env, Path.of("").toAbsolutePath(),
+                        Path.of(System.getProperty("java.home")),
+                        (config, e) -> Checkers.create(config, e, new ProcessCommandRunner()),
+                        new JavaParserAnnotationApplier(), new AnchoredWarningMatcher(), Clock.systemUTC(), out, err)
+                        .run();
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
             }
         }
         if (args.length == 2 && args[0].equals("migrate-warning-ids")) {

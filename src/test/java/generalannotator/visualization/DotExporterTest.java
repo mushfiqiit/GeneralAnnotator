@@ -4,7 +4,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import generalannotator.graph.AnnotationNode;
 import generalannotator.graph.GraphEdge;
+import generalannotator.graph.GraphNode;
 import generalannotator.graph.WarningGraph;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -35,13 +37,22 @@ class DotExporterTest {
     }
 
     @Test
-    void existingEdgesAreDrawn() {
+    void existingEdgesAreDrawnSolid() {
         WarningGraph g = VisualizationFixtures.threeIsolated();
-        WarningGraph withEdge = new WarningGraph(g.runId(), g.checkerId(), g.nodes(),
-                List.of(new GraphEdge("W0001", "W0003", "example")));
+        List<GraphNode> nodes = new java.util.ArrayList<>(g.nodes());
+        nodes.add(new AnnotationNode("A0001", "package", List.of(new AnnotationNode.PackageEdit("ADD @x",
+                java.util.Map.of(), java.util.Optional.empty(), java.util.Optional.empty())), "S0",
+                java.util.Optional.empty(), "COMPLETED", "d", List.of(), java.util.Optional.empty(),
+                java.util.OptionalInt.of(1)));
+        WarningGraph withEdge = new WarningGraph(g.runId(), g.checkerId(), nodes,
+                List.of(new GraphEdge("W0001", "A0001", GraphEdge.RESOLVED_BY, java.util.Map.of("evaluation", "e")),
+                        new GraphEdge("A0001", "W0003", GraphEdge.INTRODUCES)));
         String dot = DotExporter.toDot(withEdge);
-        assertEquals(1, Pattern.compile("(?m)^  \"[^\"]+\" -> ").matcher(dot).results().count());
-        assertTrue(dot.contains("  \"W0001\" -> \"W0003\" [label=\"example\""));
+        assertEquals(2, Pattern.compile("(?m)^  \"[^\"]+\" -> ").matcher(dot).results().count());
+        assertTrue(dot.contains("  \"W0001\" -> \"A0001\" [label=\"resolved-by\""), dot);
+        assertTrue(dot.contains("  \"A0001\" -> \"W0003\" [label=\"introduces\""), dot);
+        assertTrue(dot.contains("evaluation: e"), "provenance is in the edge tooltip: " + dot);
+        assertFalse(dot.contains("style=dashed") || dot.contains("style=dotted") || dot.contains("dashed"), dot);
         assertFalse(dot.contains("layout=osage"), "graphs with edges use the hierarchical dot layout");
     }
 

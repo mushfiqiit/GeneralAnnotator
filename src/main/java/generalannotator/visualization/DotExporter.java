@@ -25,15 +25,18 @@ import java.util.List;
  *       {@code dot} layout, with packing.
  *   <li>An empty graph is rendered as a clear "No warnings" message.
  *   <li>Evaluation graphs: warning nodes are rounded boxes; warnings of a result state (introduced
- *       by a package) have a dashed border. Annotation nodes (one per annotation package) are ellipses filled by outcome (green
+ *       by a package) have a thicker solid border. Annotation nodes (one per annotation package) are ellipses filled by outcome (green
  *       completed, grey unevaluated or no-op, red failed or rejected, yellow ambiguous), labeled
  *       with their ID, outcome, number of edits and (when several answers share the package) number
  *       of answers, with every edit of the package (and its applier outcome), the counts and every
  *       originating answer in the tooltip.
- *       {@value GraphEdge#RESOLVED_BY} edges are green, {@value GraphEdge#INTRODUCES} edges red. Nodes
+ *       {@value GraphEdge#RESOLVED_BY} edges (warning → annotation) are green, {@value GraphEdge#INTRODUCES}
+ *       edges (annotation → warning) red; both are solid, and there is no other edge kind or style. Nodes
  *       are labeled with their IDs (introduced warnings carry their round's IDs, {@code W1001, ...}); the
  *       tooltips name the round.
  *       Proposal associations are not drawn as edges.
+ *   <li>Extended (multi-round) graphs are drawn the same way; an edge's provenance (evaluation, states,
+ *       matcher, combined-result warning ID) is in its tooltip.
  * </ul>
  *
  * <p>Escaping (verified against Graphviz 12.1): inside double-quoted DOT strings, {@code "} becomes
@@ -67,7 +70,7 @@ public final class DotExporter {
                         .append(", label=").append(label(w.id()))
                         .append(", tooltip=").append(tooltip(tooltipText(w)))
                         .append(", fillcolor=\"").append(fill(w)).append('"')
-                        .append(w.root() ? "" : ", style=\"rounded,filled,dashed\"")
+                        .append(w.root() ? "" : ", penwidth=2")
                         .append(", sortv=").append(i + 1)
                         .append("];\n");
                 case AnnotationNode a -> out.append("  ").append(id(a.id()))
@@ -90,11 +93,17 @@ public final class DotExporter {
             };
             out.append("  ").append(id(e.source())).append(" -> ").append(id(e.target()))
                     .append(" [label=").append(label(e.kind())).append(color)
-                    .append(", tooltip=").append(tooltip(e.source() + " -> " + e.target() + " (" + e.kind() + ")"))
+                    .append(", tooltip=").append(tooltip(edgeTooltip(e)))
                     .append("];\n");
         }
         out.append("}\n");
         return out.toString();
+    }
+
+    static String edgeTooltip(GraphEdge e) {
+        StringBuilder text = new StringBuilder(e.source() + " -> " + e.target() + " (" + e.kind() + ")");
+        e.provenance().forEach((k, v) -> text.append('\n').append(k).append(": ").append(v));
+        return text.toString();
     }
 
     static String title(WarningGraph graph) {
@@ -104,6 +113,14 @@ public final class DotExporter {
         }
         int warnings = graph.warningNodes().size();
         long annotations = graph.nodes().stream().filter(AnnotationNode.class::isInstance).count();
+        long rounds = graph.nodes().stream().filter(AnnotationNode.class::isInstance)
+                .map(n -> ((AnnotationNode) n).round()).filter(java.util.OptionalInt::isPresent).distinct().count();
+        if (rounds > 1) {
+            return "Extended evaluation graph: run " + graph.runId() + " (" + graph.checkerId() + ")\n"
+                    + warnings + " warning node(s), " + annotations + " annotation node(s) in " + rounds
+                    + " rounds, " + graph.edges().size() + " edge(s) - each package was evaluated alone against its "
+                    + "source state; hover for details and provenance";
+        }
         if (annotations > 0) {
             return "Evaluation graph: run " + graph.runId() + " (" + graph.checkerId() + ")\n"
                     + warnings + " warning node(s), " + annotations + " annotation node(s), " + graph.edges().size()

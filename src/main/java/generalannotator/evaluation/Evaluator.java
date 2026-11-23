@@ -136,6 +136,51 @@ public final class Evaluator {
     private final Clock clock;
     private final PrintStream out;
     private final ToolIdentity tools = new ToolIdentity();
+    private Optional<InheritedBaseline> inherited = Optional.empty();
+
+    /**
+     * Baseline warning IDs taken over from the graph of the state being evaluated (for example a combined round
+     * result), instead of a fresh numbering, so that IDs stay those of that state. The fresh baseline must
+     * reproduce the graph's findings exactly (same path, line, column, severity, checker and message);
+     * otherwise the evaluation is refused.
+     *
+     * @param state the name of the baseline state (for example {@code round1-09d3783e43a5})
+     * @param nodes the state's warning nodes, with the IDs to keep
+     * @param originRounds the round each ID was introduced in (0 for initial warnings)
+     * @param identity a digest of the state's snapshot and report, part of the evaluation key
+     */
+    public record InheritedBaseline(String state, List<WarningNode> nodes, Map<String, Integer> originRounds,
+            String identity) {
+        public InheritedBaseline {
+            nodes = List.copyOf(nodes);
+            originRounds = Map.copyOf(originRounds);
+        }
+    }
+
+    /** Evaluates against a baseline whose warning IDs are taken over from {@code baseline}. */
+    public Evaluator inheriting(InheritedBaseline baseline) {
+        this.inherited = Optional.of(baseline);
+        return this;
+    }
+
+    /** The baseline state's name: {@value #BASELINE_STATE}, or the inherited state's. */
+    private String state() {
+        return inherited.map(InheritedBaseline::state).orElse(BASELINE_STATE);
+    }
+
+    /** The fresh baseline did not reproduce the inherited state's findings. */
+    private static final class InheritanceException extends Exception {
+        private static final long serialVersionUID = 1L;
+
+        InheritanceException(String message) {
+            super(message);
+        }
+    }
+
+    private WarningNode baselineNode(String id, generalannotator.diagnostics.Diagnostic d, Optional<String> target) {
+        int r = inherited.map(b -> b.originRounds().getOrDefault(id, 0)).orElse(0);
+        return new WarningNode(id, d, target, r == 0, r, Optional.of(state()), java.util.OptionalInt.of(r));
+    }
 
     /**
      * @param round the inference round these candidates were proposed in (1 for answers about the
@@ -211,6 +256,7 @@ public final class Evaluator {
         key.put("configuration", config.fingerprint());
         key.put("candidatesSha256", EvaluationFiles.sha256(candidatesJson));
         key.put("matcher", matcher.id());
+        inherited.ifPresent(b -> key.put("inheritedBaseline", Map.of("state", b.state(), "identity", b.identity())));
         String keyJson = Json.write(key);
         String evaluationId = candidates.submissionId() + "-" + EvaluationFiles.sha256(keyJson).substring(0, 12);
         Path dir = candidates.runDir().resolve(DIR).resolve(evaluationId);
@@ -251,10 +297,14 @@ public final class Evaluator {
             m.put("round", round);
             m.put("warningIdScheme", WarningIds.SCHEME);
             m.put("candidateModel", Candidates.MODEL);
+            m.put("generator", candidates.generator());
             m.put("key", key);
             m.put("runDirectory", candidates.runDir().toString());
             m.put("snapshot", candidates.snapshot().toString());
-            m.put("baselineState", BASELINE_STATE);
+            m.put("baselineState", state());
+            inherited.ifPresent(b -> m.put("inheritedBaseline", Map.of("state", b.state(), "identity", b.identity(),
+                    "note", "Baseline warning IDs are those of state " + b.state() + "; the fresh baseline reproduced "
+                            + "its findings exactly.")));
             m.put("timeoutSeconds", config.analysis().timeout().toSeconds());
             m.put("matcher", matcher.id());
             m.put("matcherAssumptions", matcher.assumptions());
@@ -287,14 +337,19 @@ public final class Evaluator {
                     : other.getValue() == null ? " (an earlier single-edit evaluation; its per-edit results are never "
                             + "combined into package results)" : " (candidate model " + other.getValue() + ")"));
         }
-        Optional<Baseline> found = baseline(dir, evaluationId, snapshotHash);
+        Optional<Baseline> found;
+        try {
+            found = baseline(dir, evaluationId, snapshotHash);
+        } catch (InheritanceException e) {
+            return refused(dir, e.getMessage());
+        }
         if (found.isEmpty()) {
             return new Result(Status.BASELINE_FAILED, dir, "the baseline analysis did not complete; see "
                     + dir.resolve("baseline-failed"), List.of());
         }
         Baseline baseline = found.get();
         out.println("  baseline:   " + (baseline.reused() ? "reused, " : "") + baseline.findings().size()
-                + " finding(s) in state " + BASELINE_STATE + " (" + baseline.dir() + ")");
+                + " finding(s) in state " + state() + " (" + baseline.dir() + ")");
         Map<String, String> original = originalMapping(baseline);
         Optional<String> invalid = Optional.empty();
         WarningIds.Allocator ids;
@@ -392,7 +447,7 @@ public final class Evaluator {
         Map<String, Map<?, ?>> records = records(dir);
         Set<String> interrupted = interrupted(dir, records.keySet());
         WarningGraph graph = EvaluationGraph.build(candidates, baseline.nodes(), records, interrupted, original,
-                config.analysis().checkerId(), round);
+                config.analysis().checkerId(), round, state(), inherited.isPresent() ? round : 1);
         EvaluationFiles.writeAtomically(dir.resolve(GRAPH), WarningGraphJson.write(graph));
         EvaluationFiles.writeAtomically(dir.resolve(SUMMARY), Json.write(summary(evaluationId, baseline, original,
                 records, interrupted, graph, ids)));
@@ -402,7 +457,8 @@ public final class Evaluator {
     // ---------------------------------------------------------------------------------------------
     // Baseline
 
-    private Optional<Baseline> baseline(Path dir, String evaluationId, String snapshotHash) throws IOException {
+    private Optional<Baseline> baseline(Path dir, String evaluationId, String snapshotHash) throws IOException,
+            InheritanceException {
         Path bdir = dir.resolve("baseline");
         Path result = bdir.resolve("result.json");
         if (Files.exists(result)) {
@@ -419,8 +475,7 @@ public final class Evaluator {
                 Map<?, ?> f = (Map<?, ?>) o;
                 ObservedFinding of = FindingJson.finding(f);
                 findings.add(of);
-                nodes.add(new WarningNode(of.id(), of.diagnostic(), Optional.ofNullable((String) f.get("targetPath")),
-                        true, 0, Optional.of(BASELINE_STATE), java.util.OptionalInt.of(0)));
+                nodes.add(baselineNode(of.id(), of.diagnostic(), Optional.ofNullable((String) f.get("targetPath"))));
             }
             return Optional.of(new Baseline(bdir, findings, nodes, (Map<?, ?>) r.get("toolIdentity"), recorded, true));
         }
@@ -455,15 +510,16 @@ public final class Evaluator {
             return Optional.empty();
         }
         WarningGraph graph = InitialWarningGraph.build(candidates.runId(), checker.id(), completed, source);
+        Map<String, String> ids = inheritedIds(graph);
         DeclarationAnchors anchors = new DeclarationAnchors(source);
         List<ObservedFinding> findings = new ArrayList<>();
         List<WarningNode> nodes = new ArrayList<>();
         List<Object> findingJson = new ArrayList<>();
         for (WarningNode n : graph.warningNodes()) {
-            ObservedFinding f = observe(n.id(), n.diagnostic(), n.targetPath(), anchors);
+            String id = ids.getOrDefault(n.id(), n.id());
+            ObservedFinding f = observe(id, n.diagnostic(), n.targetPath(), anchors);
             findings.add(f);
-            nodes.add(new WarningNode(n.id(), n.diagnostic(), n.targetPath(), true, 0, Optional.of(BASELINE_STATE),
-                    java.util.OptionalInt.of(0)));
+            nodes.add(baselineNode(id, n.diagnostic(), n.targetPath()));
             Map<String, Object> m = FindingJson.finding(f);
             m.put("targetPath", n.targetPath().orElse(null));
             findingJson.add(m);
@@ -472,7 +528,7 @@ public final class Evaluator {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("schemaVersion", SCHEMA_VERSION);
         m.put("evaluationId", evaluationId);
-        m.put("state", BASELINE_STATE);
+        m.put("state", state());
         m.put("status", "COMPLETED");
         m.put("startedAt", started.toString());
         m.put("finishedAt", clock.instant().toString());
@@ -497,6 +553,44 @@ public final class Evaluator {
     }
 
     /**
+     * Fresh baseline ID to inherited ID (empty without inheritance); a one-to-one match of every finding by
+     * path, line, column, severity, checker and message is required.
+     */
+    private Map<String, String> inheritedIds(WarningGraph fresh) throws InheritanceException {
+        Map<String, String> ids = new LinkedHashMap<>();
+        if (inherited.isEmpty()) {
+            return ids;
+        }
+        List<WarningNode> wanted = new ArrayList<>(inherited.get().nodes());
+        for (WarningNode n : fresh.warningNodes()) {
+            WarningNode match = wanted.stream().filter(w -> same(w, n)).findFirst().orElse(null);
+            if (match == null) {
+                throw new InheritanceException("the fresh baseline of " + candidates.snapshot() + " reported a finding "
+                        + "that state " + inherited.get().state() + " does not list (" + n.targetPath().orElse("?") + ":"
+                        + n.diagnostic().line() + " " + n.diagnostic().message().lines().findFirst().orElse("")
+                        + "); its warning IDs cannot be kept. Check that the checker configuration is the one that "
+                        + "produced that state.");
+            }
+            wanted.remove(match);
+            ids.put(n.id(), match.id());
+        }
+        if (!wanted.isEmpty()) {
+            throw new InheritanceException("the fresh baseline of " + candidates.snapshot() + " did not reproduce "
+                    + wanted.size() + " finding(s) of state " + inherited.get().state() + " (for example "
+                    + wanted.get(0).id() + "); its warning IDs cannot be kept.");
+        }
+        return ids;
+    }
+
+    private static boolean same(WarningNode a, WarningNode b) {
+        return a.targetPath().equals(b.targetPath()) && a.diagnostic().line() == b.diagnostic().line()
+                && a.diagnostic().column().equals(b.diagnostic().column())
+                && a.diagnostic().severity() == b.diagnostic().severity()
+                && a.diagnostic().checkerName().equals(b.diagnostic().checkerName())
+                && a.diagnostic().message().equals(b.diagnostic().message());
+    }
+
+    /**
      * Maps warning IDs of the analyzed run's {@code warning-graph.json} to baseline nodes with an
      * identical diagnostic (path, line, column, severity, checker, message). The sources are the same
      * snapshot, so a complete identity mapping is expected; anything else is reported.
@@ -504,6 +598,11 @@ public final class Evaluator {
     private Map<String, String> originalMapping(Baseline baseline) throws IOException {
         Path file = candidates.runDir().resolve(WarningGraphJson.FILE_NAME);
         Map<String, String> mapping = new LinkedHashMap<>();
+        if (inherited.isPresent()) {
+            // proposals name warnings of the inherited state, whose IDs the baseline kept
+            baseline.nodes().forEach(n -> mapping.put(n.id(), n.id()));
+            return mapping;
+        }
         if (!Files.isRegularFile(file)) {
             return mapping;
         }
@@ -612,7 +711,7 @@ public final class Evaluator {
                 CheckerRun run = checker.analyze(request(source, adir.resolve("check")));
                 m.put("commands", commands(run, adir));
                 m.put("coverage", coverage(run));
-                m.put("resultState", BASELINE_STATE + "+" + c.id());
+                m.put("resultState", state() + "+" + c.id());
                 if (run.outcome() instanceof ExecutionFailure f) {
                     outcome = switch (f.kind()) {
                         case COMPILATION_FAILED -> AttemptOutcome.COMPILATION_FAILED;
@@ -674,7 +773,7 @@ public final class Evaluator {
         m.put("canonical", c.canonical());
         m.put("warningIds", c.warningIds());
         m.put("origins", candidates.originsJson(c));
-        m.put("baselineState", BASELINE_STATE);
+        m.put("baselineState", state());
         m.put("edits", Candidates.editsJson(c));
         return m;
     }
@@ -724,7 +823,7 @@ public final class Evaluator {
                 m.put(field, old.get(field));
             }
         }
-        m.put("resultState", BASELINE_STATE + "+" + c.id());
+        m.put("resultState", state() + "+" + c.id());
         for (String field : List.of("failure", "toolIdentity", "findingCount", "resolved")) {
             if (old.containsKey(field)) {
                 m.put(field, PackageReuse.normalize(old.get(field), from, adir.toString()));
@@ -757,7 +856,7 @@ public final class Evaluator {
             Map<String, Object> cmp = new LinkedHashMap<>();
             PackageReuse.normalize(parse(from.resolve(COMPARISON)), from, adir.toString())
                     .forEach((k, v) -> cmp.put(String.valueOf(k), v));
-            cmp.put("resultState", BASELINE_STATE + "+" + c.id());
+            cmp.put("resultState", state() + "+" + c.id());
             List<Object> mapping = new ArrayList<>();
             for (Object o : (List<?>) cmp.get("introducedWarnings")) {
                 String resultId = String.valueOf(((Map<?, ?>) o).get("resultId"));
@@ -853,8 +952,8 @@ public final class Evaluator {
         Map<String, Object> json = new LinkedHashMap<>();
         json.put("matcher", matcher.id());
         json.put("assumptions", matcher.assumptions());
-        json.put("baselineState", BASELINE_STATE);
-        json.put("resultState", BASELINE_STATE + "+" + candidateId);
+        json.put("baselineState", state());
+        json.put("resultState", state() + "+" + candidateId);
         json.put("counts", countsJson(counts));
         json.put("resolved", cmp.resolved());
         json.put("introduced", cmp.introduced());
@@ -1078,8 +1177,9 @@ public final class Evaluator {
         m.put("warningIdSequence", seq);
         m.put("runId", candidates.runId());
         m.put("submissionId", candidates.submissionId());
-        m.put("baselineState", BASELINE_STATE);
+        m.put("baselineState", state());
         m.put("baselineFindings", baseline.findings().size());
+        m.put("generator", candidates.generator());
         m.put("importedProposals", candidates.importedProposals());
         m.put("uniquePackages", candidates.candidates().size());
         boolean identical = original.size() == baseline.nodes().size()

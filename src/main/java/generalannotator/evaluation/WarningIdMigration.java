@@ -426,7 +426,7 @@ public final class WarningIdMigration {
         List<GraphEdge> edges = new ArrayList<>();
         for (GraphEdge e : legacy.edges()) {
             edges.add(new GraphEdge(renames.getOrDefault(e.source(), e.source()),
-                    renames.getOrDefault(e.target(), e.target()), e.kind()));
+                    renames.getOrDefault(e.target(), e.target()), e.kind(), e.provenance()));
         }
         return new WarningGraph(legacy.runId(), legacy.checkerId(), nodes, edges);
     }

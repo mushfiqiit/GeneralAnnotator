@@ -50,9 +50,11 @@ import java.util.Set;
  * @param sourceRoots the run's configured source roots ({@code report.json})
  * @param candidates the unique packages
  * @param excluded the answers that yielded no package, with reasons
+ * @param generator what proposed the packages: {@value #LLM_GENERATOR} for collected LLM answers, or a
+ *     deterministic pass such as {@code nullability-propagation-2}
  */
 public record Candidates(String submissionId, String runId, Path runDir, Path snapshot, List<String> sourceRoots,
-        List<Candidate> candidates, List<Excluded> excluded) {
+        List<Candidate> candidates, List<Excluded> excluded, String generator) {
 
     public static final String FILE = "candidates.json";
     /** The candidate model recorded in candidates.json and the evaluation key. */
@@ -67,7 +69,16 @@ public record Candidates(String submissionId, String runId, Path runDir, Path sn
             + "candidate and are all listed as its origins. Candidates are evaluated independently of each other; "
             + "independently successful candidates are not shown to combine safely.";
 
+    /** The generator of packages imported from collected LLM answers. */
+    public static final String LLM_GENERATOR = "llm-answers";
+
+    public Candidates(String submissionId, String runId, Path runDir, Path snapshot, List<String> sourceRoots,
+            List<Candidate> candidates, List<Excluded> excluded) {
+        this(submissionId, runId, runDir, snapshot, sourceRoots, candidates, excluded, LLM_GENERATOR);
+    }
+
     public Candidates {
+        java.util.Objects.requireNonNull(generator, "generator");
         sourceRoots = List.copyOf(sourceRoots);
         candidates = List.copyOf(candidates);
         excluded = List.copyOf(excluded);
@@ -241,6 +252,38 @@ public record Candidates(String submissionId, String runId, Path runDir, Path sn
      * @param proposals the validated answers, in numeric warning order
      */
     static List<Candidate> merge(Path runDir, List<Proposal> proposals) {
+        return merge(runDir, proposals, p -> p.source().warningId() + "@" + p.source().attempt(), "A");
+    }
+
+    /**
+     * Packages proposed by something other than collected LLM answers (for example a deterministic pass),
+     * merged exactly like answers: one package per complete edit set, every proposal kept as an origin.
+     *
+     * @param groupSuffix names each origin {@code <warning>@<groupSuffix>}, so nodes show what proposed them
+     */
+    public static Candidates fromProposals(String submissionId, String runId, Path runDir, Path snapshot,
+            List<String> sourceRoots, List<Proposal> proposals, String generator, String groupSuffix) {
+        return fromProposals(submissionId, runId, runDir, snapshot, sourceRoots, proposals, generator, groupSuffix,
+                "A");
+    }
+
+    /** Like the other overload, with package IDs {@code <idPrefix>0001, ...} (for example {@code P0001}). */
+    public static Candidates fromProposals(String submissionId, String runId, Path runDir, Path snapshot,
+            List<String> sourceRoots, List<Proposal> proposals, String generator, String groupSuffix,
+            String idPrefix) {
+        return new Candidates(submissionId, runId, runDir, snapshot, sourceRoots,
+                merge(runDir, proposals, p -> p.source().warningId() + "@" + groupSuffix, idPrefix), List.of(),
+                generator);
+    }
+
+    /** These candidates restricted to {@code ids} (same IDs, provenance and generator). */
+    public Candidates only(Set<String> ids) {
+        return new Candidates(submissionId, runId, runDir, snapshot, sourceRoots,
+                candidates.stream().filter(c -> ids.contains(c.id())).toList(), excluded, generator);
+    }
+
+    private static List<Candidate> merge(Path runDir, List<Proposal> proposals,
+            java.util.function.Function<Proposal, String> group, String idPrefix) {
         Map<Set<AnnotationEdit>, List<Proposal>> groups = new LinkedHashMap<>();
         for (Proposal p : proposals) {
             Set<AnnotationEdit> set = new LinkedHashSet<>();
@@ -270,11 +313,11 @@ public record Candidates(String submissionId, String runId, Path runDir, Path sn
                             pe.origins().stream().map(EditOrigin::uncertainty).toList()));
                 }
                 Proposal.ProposalSource s = p.source();
-                origins.add(new Origin(s.warningId(), s.warningId() + "@" + s.attempt(), s.attempt(), s.promptSha256(),
+                origins.add(new Origin(s.warningId(), group.apply(p), s.attempt(), s.promptSha256(),
                         runDir.relativize(s.answerFile().toAbsolutePath().normalize()).toString(), s.answerSha256(),
                         p.rationale(), p.uncertainty(), answerEdits, associations));
             }
-            candidates.add(new Candidate(String.format("A%04d", candidates.size() + 1), edits, origins));
+            candidates.add(new Candidate(String.format("%s%04d", idPrefix, candidates.size() + 1), edits, origins));
         }
         return candidates;
     }
@@ -328,6 +371,10 @@ public record Candidates(String submissionId, String runId, Path runDir, Path sn
         Map<String, Object> root = new LinkedHashMap<>();
         root.put("schemaVersion", 3);
         root.put("candidateModel", MODEL);
+        if (!generator.equals(LLM_GENERATOR)) {
+            // written only for other generators, so answer evaluations keep their keys
+            root.put("generator", generator);
+        }
         root.put("submissionId", submissionId);
         root.put("runId", runId);
         root.put("note", NOTE);

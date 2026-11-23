@@ -583,7 +583,8 @@ class EvaluateAnnotationsTest {
         assertTrue(dot.contains("\"A0001\" [id=\"A0001\", shape=ellipse"), dot);
         assertTrue(dot.contains("\"W1001\" [id=\"W1001\", label=\"W1001\""), dot);
         assertTrue(dot.contains("state S0+A0001, introduced in round 1"), dot);
-        assertTrue(dot.contains("style=\"rounded,filled,dashed\""), dot);
+        assertTrue(dot.contains("\"W1001\" [id=\"W1001\"") && dot.contains(", penwidth=2, sortv="), dot);
+        assertFalse(dot.contains("dashed") || dot.contains("dotted"), "only solid nodes and edges: " + dot);
         assertTrue(dot.contains("\"W0001\" -> \"A0001\" [label=\"resolved-by\", color=\"#2e7d32\""), dot);
         assertTrue(dot.contains("\"A0001\" -> \"W1001\" [label=\"introduces\", color=\"#c62828\""), dot);
         assertTrue(dot.contains("Evaluation graph: run run 1"), dot);

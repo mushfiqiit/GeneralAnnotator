@@ -1,8 +1,8 @@
 package generalannotator.graph;
 
 /**
- * A node of a {@link WarningGraph}: a checker finding ({@link WarningNode}) or a concrete annotation
- * edit evaluated against a baseline state ({@link AnnotationNode}).
+ * A node of a {@link WarningGraph}: a checker finding ({@link WarningNode}) or an annotation package
+ * evaluated against a source state ({@link AnnotationNode}). There are no other node kinds.
  */
 public sealed interface GraphNode permits WarningNode, AnnotationNode {
 

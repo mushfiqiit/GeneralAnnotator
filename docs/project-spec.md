@@ -470,6 +470,79 @@ interface or in one named class), labeled provisional, and noted here.
     open (§6.3, §6.4).
   - **Publication.** Results are published by an atomic rename and never
     overwritten. Failed attempts are kept as `-failed-<time>`.
+- **Single-pass nullability propagation (T17).** Provisional, in
+  `propagation.NullabilityPropagation` (rules `nullable-flow-2`) and
+  `propagation.PropagationStage`:
+  - **Matching.** A warning matches only if the NullAway message ("assigning
+    @Nullable expression to @NonNull field" or "returning @Nullable
+    expression from method with @NonNull return type"), the javac tree at its
+    caret (an assignment, a field initializer or a return in a method) and the
+    resolved symbols agree. The value must read a field, or call a method,
+    explicitly annotated `@Nullable`; the destination is a field, or the
+    enclosing method's return. The value may also be a local initialized
+    (through up to four locals) from such a read or call. The origin's own
+    annotation is proposed.
+  - **Arguments (T18).** "passing @Nullable parameter 'x' where @NonNull is
+    required" matches the argument at the caret whose text equals the quoted
+    expression. Its formal parameter comes from the executable javac
+    attributed. The argument may be a field read, a method call, or a local
+    or parameter, and the diagnostic is the evidence that it may be null.
+    The receiving parameter gets `@Nullable`, and an explicit non-null
+    annotation on it is removed in the same package. Provisional:
+    - When the value has no annotated origin, the project's single nullable
+      annotation type is used, and the warning is skipped if there is not
+      exactly one.
+    - Varargs positions, parameters of abstract methods and of methods
+      overridden in the sources are skipped. Whether a parameter contract
+      should change for implementations outside the sources is open.
+    - Replacing `@NonNull` changes an explicit contract; the change is
+      recorded, and the evaluation decides its effect.
+  - **Not followed:** values NullAway considers nullable for other reasons
+    in assignments and returns (library models, conditionals, `null`
+    literals, locals without an explicitly `@Nullable` origin).
+  - **Overriding methods are skipped.** The pass doesn't decide whether a
+    supertype's return contract should change. This is conservative and
+    open.
+  - **Input (T17a).** For a pipeline, the input is the completed combined
+    round-1 result named in pipeline.json. Its snapshot hash, report and graph
+    run IDs, finding counts and IDs are verified; there is no fallback. A
+    plain run uses its own baseline (round 0).
+  - **Evaluation.** Candidates come only from that fixed input and are merged
+    by edit set (`P0001, ...`, origins `<warning>@propagation-r<source
+    round>`, generator `nullability-propagation-2`). `Evaluator` evaluates
+    them with round = source round + 1 on copies of the input snapshot.
+    - Baseline warning IDs are inherited from the input
+      (`Evaluator.inheriting`); the fresh baseline must reproduce its
+      findings.
+    - Introduced warnings get the next round's IDs.
+  - **Graph (T17b).** `evaluation.HistoryGraph`
+    (`warning-annotation-history-2`) keeps the earlier evaluation graph
+    whole and holds only warning and annotation nodes with `resolved-by`
+    (W -> A) and `introduces` (A -> W) edges from independent package
+    evaluations; the combined result adds none. Combined-result and
+    evaluation warning IDs are separate namespaces, so input warnings are
+    never linked by ID. A persisting warning is linked to its base root
+    (combined comparison plus matcher re-check). An introduced one is linked
+    to the earlier node of the only applied package whose own evaluation (on
+    the same base state) introduced an `anchored-1`-equivalent warning;
+    otherwise it is a separate node with a fresh ID and no incoming edge,
+    with the limitation recorded in `propagation.json`. Provisional:
+    - reusing an earlier node's ID treats an `anchored-1` equivalence across
+      different states (S0+A versus the combined state) as the same warning,
+      which depends on §6.1;
+    - a single-package match records equivalence, not proof that the package
+      alone causes the warning in combination (another package could too);
+    - a new node's distance is the input round, as for inherited warnings;
+    - a warning that only the combination introduces has no causal branch:
+      whether such effects should ever be attributed (for example by
+      evaluating package subsets) is open.
+  - **Combined result.** Successful (COMPLETED or AMBIGUOUS), mutually
+    non-conflicting packages go to `RoundApplication`. It is pinned to the
+    evaluation's baseline (`withBaseline`), so IDs are kept, and its
+    introduced IDs come after the evaluation's. Conflicting packages are
+    excluded and reported, never chosen by order.
+  - **One pass:** introduced warnings are never analyzed. Whether and how to
+    iterate (a fixed point) is open and tied to §6.3 and §6.4.
 - **Pipeline orchestration (T16).** Provisional, in `pipeline.Pipeline`:
   - **Composition.** The existing commands are called in-process; the run
     directory is the pipeline directory and `pipeline.json` its state.
@@ -598,6 +671,7 @@ interface or in one named class), labeled provisional, and noted here.
 | 5. Apply and recheck | `apply-proposal` applies a proposal's edits, all or nothing, to a snapshot copy (`applications/`). `evaluate-annotations` applies each distinct complete edit set (equivalent answers merged) as one package to a copy of one baseline, reruns NullAway once on all source roots and compares findings with the provisional `anchored-1` rule (T8, T8b, T8c). Verified with fakes and manually on EventBus (39 answers, 27 unique packages, all completed). |
 | 5b. Apply a whole round | `apply-round --round 1` applies all validated packages together to one snapshot copy, checks it once and saves every finding with its comparison; the result can serve as the next round's run (T8d). Verified with fakes and manually on EventBus (27 packages, 42 → 19 findings). |
 | 5c. Whole pipeline | `pipeline start` (analysis to submission) and `pipeline finish` (collection, independent evaluation, combined application), resumable, with `pipeline status` (T16). Verified with fakes; stages 1–5 also with real tools offline. A real submission through `pipeline` is not verified. |
+| 5d. Deterministic propagation | `propagate` / `pipeline propagate`: one pass of nullable assignment/return propagation from the baseline, independent evaluation, combined application (T17). Verified with fakes and with real NullAway on a small project. |
 | 6. Record | Partly: per-attempt records, summary and the expanded graph (T8). No append-only state-transition log (T9). |
 | 7. Explore and select | Not implemented; blocked on §6 decisions |
 | 8. Batch | Not implemented; blocked on §6 decisions |

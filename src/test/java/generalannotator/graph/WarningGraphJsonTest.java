@@ -60,11 +60,41 @@ class WarningGraphJsonTest {
     }
 
     @Test
-    void edgesRoundTrip() {
-        WarningGraph g = graph();
-        WarningGraph withEdge = new WarningGraph(g.runId(), g.checkerId(), g.nodes(),
-                List.of(new GraphEdge("W0001", "W0002", "test-kind")));
-        assertEquals(withEdge, WarningGraphJson.read(WarningGraphJson.write(withEdge)));
+    void edgesRoundTripWithTheirProvenance() {
+        WarningGraph g = expanded();
+        List<GraphEdge> edges = new java.util.ArrayList<>(g.edges());
+        edges.add(new GraphEdge("W1001", "A0002", GraphEdge.RESOLVED_BY,
+                java.util.Map.of("evaluation", "evaluations/e", "reportWarning", "W1003")));
+        WarningGraph withProvenance = new WarningGraph(g.runId(), g.checkerId(), g.nodes(), edges);
+        String json = WarningGraphJson.write(withProvenance);
+        assertTrue(json.contains("\"reportWarning\": \"W1003\""), json);
+        assertEquals(withProvenance, WarningGraphJson.read(json));
+    }
+
+    @Test
+    void onlyWarningAndAnnotationNodesAndTheTwoCausalEdgeKindsAreAccepted() {
+        WarningGraph g = expanded();
+        java.util.function.Function<GraphEdge, WarningGraph> with = e -> {
+            List<GraphEdge> edges = new java.util.ArrayList<>(g.edges());
+            edges.add(e);
+            return new WarningGraph(g.runId(), g.checkerId(), g.nodes(), edges);
+        };
+        // another kind, the wrong direction, warning to warning, and a duplicate are rejected
+        assertThrows(IllegalArgumentException.class, () -> with.apply(new GraphEdge("A0001", "W0004", "applied-in")));
+        assertThrows(IllegalArgumentException.class,
+                () -> with.apply(new GraphEdge("A0002", "W0004", GraphEdge.RESOLVED_BY)));
+        assertThrows(IllegalArgumentException.class,
+                () -> with.apply(new GraphEdge("W0004", "A0002", GraphEdge.INTRODUCES)));
+        assertThrows(IllegalArgumentException.class,
+                () -> with.apply(new GraphEdge("W0001", "W1001", GraphEdge.INTRODUCES)));
+        assertThrows(IllegalArgumentException.class, () -> with.apply(new GraphEdge("W0002", "A0001",
+                GraphEdge.RESOLVED_BY, java.util.Map.of("note", "same edge, other provenance"))));
+        // the same on load, and a combined-state node is not a node kind
+        String json = WarningGraphJson.write(g);
+        assertThrows(IllegalArgumentException.class, () -> WarningGraphJson.read(json.replace(
+                "\"kind\": \"introduces\"", "\"kind\": \"combined-introduces\"")));
+        assertThrows(IllegalArgumentException.class, () -> WarningGraphJson.read(json.replace(
+                "\"nodes\": [", "\"nodes\": [{\"id\": \"round1-x\", \"kind\": \"state\", \"round\": 1},")));
     }
 
     @Test

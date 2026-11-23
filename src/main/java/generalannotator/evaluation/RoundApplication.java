@@ -115,8 +115,37 @@ public final class RoundApplication {
     private final PrintStream out;
     private final ToolIdentity tools = new ToolIdentity();
 
+    private final String selection;
+    private Optional<Path> requiredBaseline = Optional.empty();
+    private String baseState = BASE_STATE;
+    private Set<String> reserved = Set.of();
+
+    /**
+     * Applies the packages to a state other than the run snapshot (for example a combined round result): the
+     * baseline must be the one of {@code evaluationDir} (whose warning IDs are that state's), never a fresh
+     * renumbering, and introduced warnings get IDs after every ID in {@code reservedIds} (for example those of the
+     * independent evaluations of the same packages), so the two never collide.
+     */
+    public RoundApplication withBaseline(Path evaluationDir, String state, Set<String> reservedIds) {
+        this.requiredBaseline = Optional.of(evaluationDir);
+        this.baseState = state;
+        this.reserved = Set.copyOf(reservedIds);
+        return this;
+    }
+
     public RoundApplication(Candidates candidates, EvaluationConfig config, Checker checker, AnnotationApplier applier,
             WarningMatcher matcher, int round, Clock clock, PrintStream out) {
+        this(candidates, config, checker, applier, matcher, round, clock, out, "every validated round-" + round
+                + " package");
+    }
+
+    /**
+     * @param selection which packages {@code candidates} holds, for the recorded state description (for
+     *     example "every compatible, successfully evaluated propagation package")
+     */
+    public RoundApplication(Candidates candidates, EvaluationConfig config, Checker checker, AnnotationApplier applier,
+            WarningMatcher matcher, int round, Clock clock, PrintStream out, String selection) {
+        this.selection = selection;
         if (round < 1) {
             throw new IllegalArgumentException("round must be >= 1: " + round);
         }
@@ -192,6 +221,10 @@ public final class RoundApplication {
         key.put("candidatesSha256", EvaluationFiles.sha256(candidatesJson));
         key.put("editSetSha256", EvaluationFiles.sha256(editSet.toString()));
         key.put("matcher", matcher.id());
+        if (requiredBaseline.isPresent()) {
+            key.put("baseState", baseState);
+            key.put("reservedIdsSha256", EvaluationFiles.sha256(String.join("\n", new java.util.TreeSet<>(reserved))));
+        }
         String keyJson = Json.write(key);
         String id = "round" + round + "-" + EvaluationFiles.sha256(keyJson).substring(0, 12);
         Path rounds = candidates.runDir().resolve(DIR);
@@ -232,9 +265,10 @@ public final class RoundApplication {
         m.put("schemaVersion", SCHEMA_VERSION);
         m.put("roundResultId", id);
         m.put("stateId", id);
-        m.put("baseState", BASE_STATE);
-        m.put("stateDescription", "the run snapshot (" + BASE_STATE + ") with every validated round-" + round
-                + " package applied together; not the state of any single annotation attempt");
+        m.put("baseState", baseState);
+        m.put("stateDescription", "the state " + baseState + " with " + selection
+                + " applied together; not the state of any single annotation attempt");
+        m.put("generator", candidates.generator());
         m.put("round", round);
         m.put("status", null);
         m.put("detail", null);
@@ -390,7 +424,12 @@ public final class RoundApplication {
         cmp.ambiguous().forEach(a -> ambiguousResults.addAll(a.resultIds()));
         Set<String> taken = new LinkedHashSet<>();
         baseline.get().findings().forEach(f -> taken.add(f.id()));
-        WarningIds.Allocator ids = new WarningIds.Allocator(round, taken, 0);
+        int last = 0;
+        for (String r : reserved) {
+            last = Math.max(last, WarningIds.sequence(r, round).orElse(0));
+        }
+        taken.addAll(reserved);
+        WarningIds.Allocator ids = new WarningIds.Allocator(round, taken, last);
         List<Object> findings = new ArrayList<>();
         List<WarningNode> nodes = new ArrayList<>();
         List<String> lines = new ArrayList<>();
@@ -449,7 +488,7 @@ public final class RoundApplication {
         Map<String, Object> c = new LinkedHashMap<>();
         c.put("matcher", matcher.id());
         c.put("assumptions", matcher.assumptions());
-        c.put("baselineState", BASE_STATE);
+        c.put("baselineState", baseState);
         c.put("resultState", id);
         c.put("counts", summary);
         c.put("resolved", resolved);
@@ -485,10 +524,14 @@ public final class RoundApplication {
         Path evaluations = candidates.runDir().resolve(Evaluator.DIR);
         Map<String, Object> bm = new LinkedHashMap<>();
         m.put("baseline", bm);
-        if (Files.isDirectory(evaluations)) {
+        if (requiredBaseline.isPresent() || Files.isDirectory(evaluations)) {
             List<Path> dirs;
-            try (var s = Files.list(evaluations)) {
-                dirs = s.sorted().toList();
+            if (requiredBaseline.isPresent()) {
+                dirs = List.of(requiredBaseline.get());
+            } else {
+                try (var s = Files.list(evaluations)) {
+                    dirs = s.sorted().toList();
+                }
             }
             for (Path d : dirs) {
                 Path record = d.resolve(Evaluator.RECORD);
@@ -520,6 +563,11 @@ public final class RoundApplication {
                 out.println("  baseline:   reused " + findings.size() + " finding(s) from " + d.resolve("baseline")
                         + " (verified equivalent)");
                 return Optional.of(new Baseline(findings, (Map<?, ?>) r.get("toolIdentity")));
+            }
+            if (requiredBaseline.isPresent()) {
+                throw new IOException("the evaluation baseline of " + requiredBaseline.get() + " cannot be reused for "
+                        + "state " + baseState + " (different snapshot, configuration or matcher, or a changed source "
+                        + "copy); a fresh baseline would renumber its warnings, so nothing was applied");
             }
         }
         Path bdir = tmp.resolve("baseline");
@@ -553,7 +601,7 @@ public final class RoundApplication {
         }
         Map<String, Object> identity = tools.of(run);
         Map<String, Object> r = new LinkedHashMap<>();
-        r.put("state", BASE_STATE);
+        r.put("state", baseState);
         r.put("snapshotTreeSha256", snapshotHash);
         r.put("sourceTreeSha256", EvaluationFiles.treeHash(source));
         r.put("toolIdentity", identity);
@@ -563,7 +611,7 @@ public final class RoundApplication {
         bm.put("status", "COMPLETED");
         bm.put("findingCount", findings.size());
         bm.put("toolIdentity", identity);
-        out.println("  baseline:   " + findings.size() + " finding(s) in state " + BASE_STATE);
+        out.println("  baseline:   " + findings.size() + " finding(s) in state " + baseState);
         return Optional.of(new Baseline(findings, Evaluator.parse(tmp.resolve("baseline/result.json"))
                 .get("toolIdentity") instanceof Map<?, ?> t ? t : identity));
     }
@@ -650,7 +698,7 @@ public final class RoundApplication {
         StringBuilder b = new StringBuilder();
         b.append("# GeneralAnnotator warnings of a combined round state\n");
         b.append("# state:   ").append(id).append(" (round ").append(round).append(": every validated package applied "
-                + "together to ").append(BASE_STATE).append(")\n");
+                + "together to ").append(baseState).append(")\n");
         b.append("# checker: ").append(config.analysis().checkerId()).append(", source roots ")
                 .append(config.analysis().sourceRoots()).append(" only\n");
         b.append("# status:  COMPLETED (complete list)\n");

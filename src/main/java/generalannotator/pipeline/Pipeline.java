@@ -8,6 +8,7 @@ import generalannotator.cli.ExitCode;
 import generalannotator.cli.InferenceCommand;
 import generalannotator.cli.PrepareInferenceCommand;
 import generalannotator.cli.PromptsCommand;
+import generalannotator.cli.PropagateCommand;
 import generalannotator.cli.SliceCommand;
 import generalannotator.config.ConfigLoader;
 import generalannotator.config.ConfigurationException;
@@ -24,6 +25,7 @@ import generalannotator.inference.remote.Cluster;
 import generalannotator.inference.remote.RemoteSettings;
 import generalannotator.inference.remote.SshConnection;
 import generalannotator.prompts.PromptManifestJson;
+import generalannotator.propagation.PropagationStage;
 import generalannotator.report.Json;
 import generalannotator.report.JsonParser;
 import generalannotator.slicing.SliceResultsJson;
@@ -84,7 +86,7 @@ public final class Pipeline {
     static final List<String> NOT_FINGERPRINTED = List.of("GA_SSH_", "GA_RSYNC_", "GA_REMOTE_POLL_SECONDS",
             "GA_REMOTE_MAX_UNKNOWN_POLLS", "GA_INFERENCE_", "GA_SLURM_");
     static final List<String> STAGES = List.of("analysis", "slices", "context", "prompts", "preparation",
-            "submission", "collection", "evaluation", "combined");
+            "submission", "collection", "evaluation", "combined", "propagation");
 
     /** Pipeline outcomes recorded as {@code status}. */
     public enum Status {
@@ -653,6 +655,77 @@ public final class Pipeline {
         });
     }
 
+    // ============================================================== propagation
+
+    /**
+     * The explicitly selected, deterministic nullability-propagation stage on the pipeline's baseline (see
+     * {@link PropagationStage}). It needs only a completed analysis, calls no LLM, and leaves the LLM stages
+     * and the pipeline status unchanged.
+     */
+    public ExitCode propagate(String argument) {
+        Optional<Path> found = pipelineDirectory(argument);
+        if (found.isEmpty()) {
+            return ExitCode.USAGE_OR_CONFIGURATION_ERROR;
+        }
+        Path dir = found.get();
+        return locked(dir, false, state -> {
+            out.println("GeneralAnnotator pipeline propagate " + dir);
+            Optional<ExitCode> refused = verifyInputs(dir, state);
+            if (refused.isPresent()) {
+                return refused.get();
+            }
+            if (!"COMPLETED".equals(stage(state, "combined").get("status"))) {
+                out.println("Propagation reads the combined round-1 result (its annotated code and warnings), but this "
+                        + "pipeline's combined stage is " + stage(state, "combined").get("status") + ". Run `pipeline "
+                        + "finish " + dir + "` until it completes, then rerun `pipeline propagate " + dir + "`. Nothing "
+                        + "falls back to the original baseline.");
+                return ExitCode.EXECUTION_FAILURE;
+            }
+            out.println();
+            out.println("== [propagation] single-pass nullability propagation (propagate; deterministic, no LLM)");
+            Map<String, Object> propagation = stage(state, "propagation");
+            if (propagation.get("outcome") != null) {
+                // an earlier result (possibly for another input, for example the original baseline) is kept as history
+                List<Object> previous = list(propagation.get("previous"));
+                Map<String, Object> copy = new LinkedHashMap<>(propagation);
+                copy.remove("previous");
+                previous.add(copy);
+                propagation.put("previous", previous);
+                propagation.remove("input");
+            }
+            beginStage(dir, state, propagation);
+            PropagateCommand command = new PropagateCommand(dir.toString(), env, workingDirectory, defaultJavaHome,
+                    tools.checkers(), tools.applier(), tools.matcher(), tools.clock(), out, err);
+            ExitCode code = command.run();
+            Optional<PropagationStage.Result> result = command.result();
+            if (result.isEmpty()) {
+                finishStage(propagation, "FAILED", "propagate did not run (" + code + ")");
+            } else {
+                Map<String, Object> record = result.get().record();
+                propagation.put("outcome", result.get().outcome().name());
+                propagation.put("input", record.get("input"));
+                propagation.put("counts", record.get("counts"));
+                propagation.put("graphModel", record.get("graphModel"));
+                Map<String, String> files = new LinkedHashMap<>();
+                files.put("directory", dir.relativize(result.get().directory()).toString());
+                files.put("summary", dir.relativize(result.get().directory().resolve(PropagationStage.SUMMARY))
+                        .toString());
+                if (record.get("evaluation") instanceof Map<?, ?> e) {
+                    files.put("graph", String.valueOf(e.get("extendedGraph") != null ? e.get("extendedGraph")
+                            : e.get("graph")));
+                    files.put("evaluations", String.valueOf(e.get("directory")));
+                }
+                if (record.get("combined") instanceof Map<?, ?> c) {
+                    files.put("combined", String.valueOf(c.get("directory")));
+                }
+                artifacts(propagation, files);
+                finishStage(propagation, code == ExitCode.COMPLETED ? "COMPLETED" : "FAILED",
+                        result.get().outcome() + ": " + record.get("detail"));
+            }
+            return conclude(dir, state, Status.valueOf(String.valueOf(state.get("status"))), code);
+        });
+    }
+
     // ============================================================== configuration
 
     /** Every setting the stages need, validated before anything starts. */
@@ -791,6 +864,11 @@ public final class Pipeline {
         }
         @SuppressWarnings("unchecked")
         Map<String, Object> state = (Map<String, Object>) mutable(parse(file));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> stages = (Map<String, Object>) state.get("stages");
+        for (String s : STAGES) {
+            stages.putIfAbsent(s, new LinkedHashMap<>(Map.of("status", "PENDING"))); // stages added by later versions
+        }
         return state;
     }
 

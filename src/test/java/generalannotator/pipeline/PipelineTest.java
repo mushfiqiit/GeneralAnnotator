@@ -635,6 +635,48 @@ class PipelineTest {
     }
 
     @Test
+    void propagationRefusesToRunWithoutACompletedCombinedRoundAndNeverFallsBack() throws Exception {
+        setUp(2);
+        assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.empty()), output());
+        Path dir = runDir();
+        int calls = checker.calls();
+
+        assertEquals(ExitCode.EXECUTION_FAILURE, pipeline().propagate(dir.toString()), output());
+
+        assertTrue(output().contains("combined stage is PENDING") && output().contains("pipeline finish"), output());
+        assertFalse(Files.exists(dir.resolve("propagation")), "the original baseline is not analyzed instead");
+        assertEquals(calls, checker.calls());
+        assertEquals("SUBMITTED", state().get("status"));
+    }
+
+    @Test
+    void propagationReadsTheCombinedRoundOneResultRecordedInThePipeline() throws Exception {
+        setUp(2);
+        assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.empty()), output());
+        Path dir = runDir();
+        answer("W0001", List.of(field("f1", "ADD")));
+        answer("W0002", List.of(field("f2", "ADD")));
+        allTasks("COMPLETED");
+        assertEquals(ExitCode.COMPLETED, pipeline().finish(dir.toString()), output());
+        String combined = (String) ((Map<?, ?>) stage("combined").get("artifacts")).get("directory");
+        Map<?, ?> round = json(dir.resolve(combined).resolve("round.json"));
+
+        assertEquals(ExitCode.COMPLETED, pipeline().propagate(dir.toString()), output());
+
+        Map<?, ?> propagation = stage("propagation");
+        assertEquals("COMPLETED", propagation.get("status"));
+        Map<?, ?> input = (Map<?, ?>) propagation.get("input");
+        assertEquals(1L, input.get("sourceRound"));
+        assertEquals(dir.resolve(combined).getFileName().toString(), input.get("state"));
+        assertEquals(round.get("findingCount"), input.get("warnings"), "the combined result's warnings, not the 2 "
+                + "original ones");
+        assertTrue(output().contains("source round 1, state " + round.get("roundResultId")), output());
+        assertTrue(output().contains("snapshot:   " + dir.resolve(combined).resolve("workspace/target")), output());
+        assertEquals("PARTIAL".equals(state().get("status")) || "COMPLETED".equals(state().get("status")), true);
+        assertEquals(1, cluster.sbatchCalls.size(), "nothing was submitted");
+    }
+
+    @Test
     void aConflictingRoundBlocksTheCombinedStageButKeepsTheIndependentEvaluations() throws Exception {
         setUp(2);
         assertEquals(ExitCode.COMPLETED, pipeline().start(Optional.empty()), output());

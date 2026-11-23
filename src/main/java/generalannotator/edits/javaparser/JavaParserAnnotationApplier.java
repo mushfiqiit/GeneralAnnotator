@@ -72,7 +72,8 @@ import java.util.stream.Collectors;
  *   <li>placements whose legality depends on the annotation's {@code @Target} for annotations not in
  *       {@link AnnotationKinds};
  *   <li>existing annotations whose name cannot be resolved from the imports, and contradictory or
- *       different nullness annotations at the same position.
+ *       different nullness annotations at the same position (unless the same edit set removes them: a
+ *       REMOVE of {@code @NonNull} together with an ADD of {@code @Nullable} replaces one by the other).
  * </ul>
  * New annotations are written fully qualified, so no import is added.
  */
@@ -190,10 +191,18 @@ public final class JavaParserAnnotationApplier implements AnnotationApplier {
         LineIndex lines = new LineIndex(text);
         List<Splice> splices = new ArrayList<>();
         List<Integer> applied = new ArrayList<>();
+        // annotations the same edit set removes, by position: an ADD there does not contradict them
+        Map<String, Set<String>> removed = new LinkedHashMap<>();
+        for (int i : indices) {
+            if (edits.get(i).action() == EditAction.REMOVE) {
+                removed.computeIfAbsent(edits.get(i).positionKey(), k -> new HashSet<>())
+                        .add(edits.get(i).annotation());
+            }
+        }
         for (int i : indices) {
             AnnotationEdit edit = edits.get(i);
             try {
-                Plan plan = plan(cu.get(), edit, lines);
+                Plan plan = plan(cu.get(), edit, lines, removed.getOrDefault(edit.positionKey(), Set.of()));
                 results[i] = new EditResult(edit, plan.outcome, plan.detail);
                 splices.addAll(plan.splices.stream().map(s -> new Splice(s.offset, s.length, s.text, i)).toList());
                 if (plan.outcome == Outcome.APPLIED) {
@@ -476,7 +485,8 @@ public final class JavaParserAnnotationApplier implements AnnotationApplier {
 
     private record Plan(Outcome outcome, String detail, List<Splice> splices) {}
 
-    private Plan plan(CompilationUnit cu, AnnotationEdit edit, LineIndex lines) throws Rejection {
+    private Plan plan(CompilationUnit cu, AnnotationEdit edit, LineIndex lines, Set<String> removedHere)
+            throws Rejection {
         Located at = locate(cu, edit);
         AnnotationKinds.Kind kind = AnnotationKinds.kind(edit.annotation());
         boolean topLevel = edit.position().kind() != PositionKind.TYPE_USE;
@@ -519,6 +529,9 @@ public final class JavaParserAnnotationApplier implements AnnotationApplier {
                         + wanted);
             }
             String family = AnnotationKinds.nullness(simple);
+            if (fqn.isPresent() && removedHere.contains(fqn.get())) {
+                continue; // removed by the same edit set (a replacement)
+            }
             if (edit.action() == EditAction.ADD && wantedFamily != null && family != null) {
                 throw new Rejection("the position already has the nullness annotation @" + a.getNameAsString()
                         + (fqn.map(f -> " (" + f + ")").orElse("")) + "; adding @" + wanted + " would "

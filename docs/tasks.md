@@ -1082,3 +1082,261 @@ Verified by:
     prompt, and the other tasks complete.
 
 Not verified: whether 1800 s is enough for the 27B model on Wulver nodes.
+
+## T17 — Single-pass nullability propagation · `done`
+
+`propagate <run dir>` and `pipeline propagate <dir>` form a deterministic stage
+that never calls an LLM.
+- **Analysis.** `NullabilityPropagation` classifies every baseline warning
+  against the javac-attributed snapshot (`context.SourceModel`). It matches
+  only nullable field/method-result assignments, field initializers and
+  returns into unannotated destinations, and only when the message kind, the
+  tree at the caret and the symbols agree. Every other warning is recorded
+  with a category and reason (other category such as dereferences, value not
+  an explicitly `@Nullable` field or method, unresolved, explicit contract or
+  override, not editable).
+- **Packages.** One `@Nullable` edit per match, from the unchanged baseline
+  only, merged by edit set (`Candidates.fromProposals`, origins
+  `<warning>@propagation-1`, generator recorded).
+- **Evaluation.** `Evaluator` (round 1, W1001...) evaluates each package
+  alone, and `RoundApplication` applies the successful, mutually compatible
+  packages together and checks them once. Conflicts are reported and
+  excluded.
+- **One pass:** introduced warnings are never analyzed.
+- **Output:** `propagation/<id>/` (`analysis.json`, `propagation.json`,
+  `summary.txt`), `evaluations/<id>-<key>/` and `rounds/round1-<key>/`.
+
+Code:
+- `propagation.NullabilityPropagation` and `PropagationStage` (new);
+- `cli.PropagateCommand` (new);
+- `Pipeline.propagate` (a new `propagation` stage, independent of the LLM
+  stages);
+- `Main`;
+- `Candidates` (`generator`, `fromProposals`, `only`; answer evaluations keep
+  their keys);
+- the generator recorded by `Evaluator` and `RoundApplication`
+  (`RoundApplication` also takes a selection description).
+
+Verified by:
+- `PropagationTest` (real javac and applier, fake NullAway):
+  - both patterns (assignment, field initializer, method result, return);
+  - ignored dereferences and unrelated warnings;
+  - an explicit `@NonNull`;
+  - a returned local;
+  - messages that the tree contradicts;
+  - duplicate candidates becoming one package with two origins;
+  - graph edges, the W1001 ID and generator marks;
+  - one-pass behaviour (B from nullable A annotated; C stays unchanged
+    although `c = b` then warns);
+  - a failed package evaluation (claims nothing, left out of the combined
+    result) and a failed evaluation baseline;
+  - conflicting packages excluded and reported;
+  - no candidates;
+  - reuse.
+- `PipelineTest` (`pipeline propagate` leaves the LLM stages alone) and
+  `MainTest`.
+
+Manual, with real NullAway:
+- **EventBus baseline:** 42 warnings, all skipped with reasons (no
+  `@Nullable` in the tree yet).
+- **EventBus with four `@Nullable` fields:** 36 warnings, all skipped with
+  reasons. The flows are `null`, conditionals or locals, and one override.
+- **A small JSpecify project:**
+  - 5 of 12 warnings matched, giving 4 packages, all COMPLETED;
+  - the combined state went from 12 to 6 findings;
+  - `c = b` was introduced as W1001, and `c` was left unannotated;
+  - the target and snapshot were unchanged.
+
+## T17a — Propagate from the combined round-1 result · `done`
+
+`pipeline propagate` used to read the original program's baseline (42 EventBus
+warnings, so NO_CANDIDATES). It now reads the combined round-1 result recorded
+in `pipeline.json`: the annotated snapshot and its complete warnings (23).
+- **Input (`PropagationStage.Input`).**
+  - Pipeline directory: its completed combined result.
+  - Round result directory: that result.
+  - Plain run: its own baseline, labelled round 0.
+  - A combined result is verified before use: status, snapshot tree hash,
+    run IDs of the report and graph, and finding counts and IDs. A missing or
+    unverifiable result stops with an actionable message and never falls
+    back.
+- **Evaluation.** Packages are named `P0001, ...` and evaluated with round =
+  source round + 1 on copies of the input snapshot, so earlier annotations
+  are kept. Baseline warnings keep the input's IDs
+  (`Evaluator.InheritedBaseline`, verified one-to-one), and introduced
+  warnings get `W2001, ...`.
+- **Extended graph.** `propagation/<id>/evaluation-graph.json` adds this
+  layer to the earlier evaluation graph. (T17a left attempt-introduced
+  warnings out; T17b replaced that with history-preserving linking.)
+- **Combined result.** It goes to `rounds/round2-<key>/`, pinned to the
+  evaluation's baseline (`RoundApplication.withBaseline`), with new IDs after
+  the evaluation's.
+- **Cache keys** include the input's snapshot, report and graph identity
+  (`propagation2-*`). Earlier results, including NO_CANDIDATES from the
+  original baseline, are kept, never reused, and listed in pipeline.json as
+  `previous`.
+
+Verified by:
+- `PropagationRoundInputTest`, with round 1 produced by the real evaluator
+  and round application:
+  - candidates come from round-1 annotations and warnings only;
+  - round-1 annotations are kept in evaluation copies and the combined state;
+  - round IDs are kept, with W2001 for new warnings;
+  - the earlier graph history is preserved and unmodified, with no ID
+    collisions;
+  - pending, tampered, mismatched and incomplete combined results are
+    refused without fallback;
+  - single pass;
+  - an earlier original-baseline result is kept but not reused.
+- `PipelineTest`: refusal without a combined result, and selection after
+  `pipeline finish`.
+- Manual check with real NullAway on a copy of the EventBus pipeline:
+  - input `round1-09d3783e43a5` with 23 warnings;
+  - one match, W1001: `mainThreadSupport` assigned from
+    `getMainThreadSupport()`, which round 1 made `@Nullable`;
+  - the package resolved W1001 and introduced nothing; the combined check
+    went from 23 to 22 findings;
+  - the real run was unchanged.
+
+## T17b — Preserve graph history in the extended propagation graph · `done`
+
+T17a's extended graph dropped the earlier evaluation's attempt-introduced
+warnings (and their `A -> W1...` edges), because the combined round result
+reuses their IDs for other warnings. That cut the history between round-1
+annotations and the round-1 warnings propagation acts on.
+
+- **Graph model.** Only warning nodes and annotation package nodes, and only
+  two solid edge kinds: `W -> A` (`resolved-by`: applying A resolved W) and
+  `A -> W` (`introduces`: applying A introduced W). `WarningGraph` rejects
+  any other edge kind or direction and duplicate edges, as well as dangling
+  ones. Every edge comes from one complete, independent package evaluation
+  against its recorded source state. The combined round result is saved
+  separately as the authoritative list of current warnings and adds no node
+  or edge.
+- **`evaluation.HistoryGraph`** (model `warning-annotation-history-2`)
+  builds the extended graph from saved artifacts only:
+  - The earlier evaluation graph is kept whole: every node and edge,
+    unchanged.
+  - Input warnings (findings of the combined state) are never linked by ID
+    or by diagnostic similarity alone. A persisting warning is linked to the
+    earlier root B only if the combined comparison recorded B and the
+    matcher pairs B's saved baseline finding with it again. An introduced
+    warning is compared by the matcher with what each applied package
+    introduced in its own completed evaluation on the same base state (saved
+    anchored findings; package verified by its package key; the earlier
+    `A -> W` edge must exist). Exactly one equivalent: linked to that
+    earlier node, whose ID is reused. None, several, or an ambiguous group:
+    a separate node with a fresh unique ID of the input's round and no
+    incoming edge, with the limitation recorded.
+  - The propagation layer is added with input IDs translated to graph IDs:
+    `W -> P` for resolved input warnings (W1... or W0...), `P -> W2...` for
+    genuinely new warnings; no node for persisting warnings, and a package
+    that introduces nothing ends its branch. Every new edge records its
+    evaluation, source and result states, matcher and combined-report
+    warning ID (`reportWarning`) as provenance metadata.
+  - `propagation.json` records `history.reportToGraph` (combined-report ID
+    to graph node) and `history.inputWarnings` (relation, evidence or
+    limitation per warning).
+  - ID clashes are refused, never renamed. The round-2 combined result
+    stays separate (`rounds/round2-*`), not in the graph.
+- **Serialization and visualization.** Edges get an optional `provenance`
+  object within schema version 5; other graphs are unchanged. The DOT
+  export draws only solid edges (`resolved-by` green, `introduces` red) with
+  provenance in edge tooltips; introduced warnings get a thicker solid border
+  instead of a dashed one.
+- **Regeneration.** `propagate --rebuild-graph <propagation dir>` rebuilds
+  the graph and the record's `history` from saved artifacts (no checker, LLM
+  or inference; no configuration). It refuses if the input's identity or the
+  evaluation's inherited identity no longer matches. A changed graph removes
+  stale `.dot`/`.svg` renderings. `propagation.json` and pipeline.json record
+  `graphModel`. Rerunning `pipeline propagate` also regenerates it, with all
+  evaluations and checks reused from cache.
+
+Verified by:
+- `PropagationHistoryGraphTest`, with a two-package round 1 whose evaluation
+  and combined IDs really collide (one package proposed by two equivalent
+  answers):
+  - the earlier `A0001 -> W1002` edge is kept;
+  - the same W1002 is extended with `W1002 -> P -> W2001`;
+  - a persisting W0 warning resolved by a package that introduces nothing
+    keeps its ID, with no W2 node;
+  - linked, ambiguous and unattributed input warnings; the latter two are
+    separate nodes without incoming edges; no linking by ID;
+  - equivalent answers stay one package, and annotation IDs are unique
+    across rounds;
+  - only warning and annotation nodes and the two edge kinds, in the JSON
+    and the DOT (no state nodes, no dashed or dotted lines);
+  - repeated runs and rebuilds are byte-identical, with no duplicate nodes or
+    edges and no new checks;
+  - a stale graph is replaced, and a changed input is refused.
+- `WarningGraphJsonTest`: other edge kinds, wrong directions, duplicate edges
+  and `state` nodes are rejected; provenance round-trips.
+- `PropagationRoundInputTest`, `DotExporterTest`, `EvaluateAnnotationsTest`,
+  updated.
+- A rebuild on a copy of the EventBus run (real saved artifacts):
+  - 22 input warnings linked to earlier equivalent nodes, plus 1 persisting;
+    no separate nodes;
+  - `W0012 -> A0009 -> W1007 -> P0001`: the combined report's W1001 is the
+    earlier W1007, recorded as `reportWarning` on the edge;
+  - no W2 nodes; 95 nodes and 66 edges, no dashed lines in the SVG.
+
+## T18 — Propagate nullable arguments to nonnull parameters · `done`
+
+T17's rules accepted only assignment and return warnings, and rejected locals
+as values.
+
+- **Rule `ARGUMENT`** (`NullabilityPropagation`, rules `nullable-flow-2`):
+  - **Recognized message:** "passing @Nullable parameter 'x' where @NonNull is
+    required".
+  - **Call:** the innermost method or constructor call with an argument
+    containing the caret whose text equals the quoted expression. The
+    executable is the one javac attributed, so overloads are told apart by
+    their types. The formal parameter is the one at the argument's index.
+  - **Value:** a field read, a method call, or a local or parameter. The
+    diagnostic is the evidence that it may be null.
+  - **Annotation:** the origin's own `@Nullable`, traced through locals, or
+    else the project's single nullable annotation type.
+  - **Edit:** `@Nullable` at `PARAMETER[i]` of the declaring method or
+    constructor (inherited methods where they are declared). An explicit
+    non-null annotation is removed in the same package and recorded as
+    `contractChange`.
+  - **Skipped with reasons:** varargs positions, abstract or overridden
+    methods, anonymous class creations, executables outside the sources,
+    unresolved calls, and `null`, conditionals or casts as arguments.
+- **Locals** for assignments and returns: a local initialized (through up to
+  four locals) from an explicitly `@Nullable` field read or call is accepted.
+- **Applier.** An ADD no longer counts as contradicting a nullness annotation
+  that the same edit set removes at that position, which makes `@NonNull` ->
+  `@Nullable` one atomic package.
+- **Stage.** A match may carry two edits. Generator
+  `nullability-propagation-2`; the rule version is in `analysis.json`, hence in
+  every cache key, so `nullable-flow-1` results are not reused. Everything
+  else is unchanged: one pass from the fixed input, packages merged by edit
+  set, independent evaluations, the combined result, and the graph.
+
+Verified by:
+- `PropagationArgumentTest`:
+  - direct field arguments, two-local flow and nullable method results;
+  - `@NonNull` replaced in the applied source;
+  - `over(Object)` / `over(String)` resolved by type;
+  - two arguments of one call mapped to two parameters;
+  - repeated warnings merged into one package;
+  - the inherited method annotated in its declaring class;
+  - the project-annotation fallback;
+  - dereferences ignored;
+  - varargs, JDK, abstract, overridden and `null` targets skipped;
+  - a diagnostic naming another expression is not matched;
+  - one pass: the warning introduced inside the annotated method is recorded,
+    not propagated;
+  - reruns reuse everything.
+- The existing propagation tests are unchanged and pass.
+- A run on a copy of the EventBus pipeline after round 1 (real NullAway):
+  - 7 of 23 warnings matched: W1005, W1007, W1009 and W1021 (arguments),
+    W1012 and W1020 (through locals), and W1001;
+  - W1006/W1008 (`Logger#log`, abstract) and W1014
+    (`SubscriberInfoIndex#getSubscriberInfo`, abstract) were skipped;
+  - W1005 annotated `EventBus#invokeSubscriber(Subscription, Object)`
+    parameter 1 and resolved, introducing W2001: `event` passed on to
+    `handleSubscriberException` (line 519), left for a later pass;
+  - the combined check went from 23 to 20 findings (7 resolved, 4
+    introduced).

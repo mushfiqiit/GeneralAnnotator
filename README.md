@@ -189,6 +189,7 @@ $GA pipeline status runs/<run id>        # recorded stages + scheduler states (c
 $GA pipeline status runs/<run id> --connect   # reconnect first (may prompt once)
 $GA pipeline finish runs/<run id>        # once all tasks ended: collect, evaluate, apply the round
 $GA pipeline start --resume runs/<run id>     # continue an interrupted start; never submits twice
+$GA pipeline propagate runs/<run id>     # optional, deterministic: single-pass nullability propagation
 ```
 
 **`pipeline start`**
@@ -1470,7 +1471,7 @@ rerun, and the graph is rebuilt from the records, so nothing is duplicated. A
 file lock refuses a second concurrent writer. The run snapshot,
 `warning-graph.json` and the inference artifacts are only read.
 
-**Graph** (`evaluation-graph.json`, `warning-graph.json` schemaVersion 5):
+**Graph** (`evaluation-graph.json`, `warning-graph.json` schemaVersion 5; extended propagation graphs may also hold `state` nodes and edge `provenance`, see propagation below):
 
 - **Warning nodes.** Baseline warnings (`W0001`, ..., state `S0`, round 0,
   root, distance 0) are always kept. A warning introduced by package `A`
@@ -1492,7 +1493,7 @@ file lock refuses a second concurrent writer. The run snapshot,
 - **Nodes without edges.** An annotation node without edges states why in its
   outcome: unevaluated, no change, no-op, rejected, failed, or ambiguous.
 
-`visualize` draws warnings as boxes (introduced ones dashed) and annotations
+`visualize` draws warnings as boxes (introduced ones with a thicker border) and annotations
 as ellipses coloured by outcome, with `resolved-by` edges green and
 `introduces` edges red. Annotation nodes show their outcome, number of edits
 and, when shared, number of answers. Their tooltips list every edit with its
@@ -1789,6 +1790,225 @@ On a scratch copy of the EventBus run, all 27 packages (30 distinct edits from
 - **Originals.** The run snapshot, inference results and earlier evaluations
   stayed byte-identical.
 
+## Single-pass nullability propagation (`propagate`)
+
+A deterministic alternative to LLM proposals: one pass over a fixed set of
+warnings that turns direct nullable flows into `@Nullable` edits. No LLM is
+called. The checker settings are the same as for `evaluate-annotations`
+(`GA_CHECKER`, `GA_CHECKER_HOME`, `GA_TARGET_CLASSPATH`,
+`GA_CHECKER_JAVA_HOME`, ...).
+
+```sh
+$GA pipeline propagate runs/<run id>    # after pipeline finish: reads the combined round-1 result
+$GA propagate runs/<run id>             # the same input selection, without recording the pipeline stage
+```
+
+**Input.** The input is chosen from the directory, never by sorting
+directory names:
+- **A pipeline directory:** the completed combined round-1 result named in
+  `pipeline.json` (stage `combined`, `rounds/round1-<key>/`). That means its
+  full annotated snapshot and its complete NullAway warnings.
+- **Verification.** The snapshot's tree hash must equal `round.json`'s. The
+  run IDs of `round.json`, `report.json` and `warning-graph.json` must agree,
+  and so must the finding counts and IDs of the graph and `findings.json`.
+- **Refusal.** If the combined stage hasn't completed, or anything fails to
+  verify, the command stops (exit 3) and says what to do, typically to run
+  `pipeline finish` first. It never falls back to the original program.
+- **A combined round result directory** (`rounds/round1-<key>/`) is read the
+  same way.
+- **Any other run directory** (no pipeline) uses the run's own baseline,
+  which the output labels "round 0".
+
+The command prints the selected input round, its snapshot and its warning
+count. For an EventBus pipeline after round 1, that is `round1-<key>` with its
+23 warnings, not the original 42.
+
+**What matches.** Every baseline warning in the run's `warning-graph.json` is
+classified against the unchanged snapshot, which javac attributes. A warning
+matches only if the NullAway message kind, the syntax tree at its position and
+the resolved symbols all agree:
+
+| Rule | NullAway message | Tree and symbols | Proposed edit |
+|---|---|---|---|
+| `FIELD_ASSIGNMENT` | assigning @Nullable expression to @NonNull field | `f = x` where `x` reads a field, or calls a method, explicitly annotated `@Nullable`, and `f` is a field | `@Nullable` on `f`'s type |
+| `FIELD_INITIALIZER` | the same | a field declaration `T f = x` with such an `x` | `@Nullable` on `f`'s type |
+| `RETURN` | returning @Nullable expression from method with @NonNull return type | `return x` with such an `x`, in a method (not a lambda) | `@Nullable` on the method's return type |
+| `ARGUMENT` | passing @Nullable parameter 'x' where @NonNull is required | an argument `x` (a field read, a method call, or a local or parameter) of a call whose method or constructor javac resolved; the argument index gives the formal parameter | `@Nullable` on that parameter; an explicit non-null annotation on it is removed in the same package |
+
+For the assignment and return rules, `x` may also be a local variable
+initialized (directly or through other locals, up to four) from such a field
+read or call. The proposed annotation is the value origin's own `@Nullable`
+(for example `org.jspecify.annotations.Nullable`).
+
+For `ARGUMENT`, the NullAway diagnostic is the evidence that the value may be
+null; the argument needs no annotation of its own:
+- **Resolution.** The call is the innermost one with an argument at the
+  diagnostic's position whose text equals the expression NullAway quotes. The
+  invoked executable is the one javac attributed, so overloads are told apart
+  by their types, never by name. An inherited method is annotated where it is
+  declared.
+- **Annotation.** The origin's own `@Nullable` (traced through locals as
+  above), or else the project's nullable annotation type if the sources use
+  exactly one.
+- **Explicit `@NonNull`.** The package removes it and adds `@Nullable` at the
+  same position (two edits, applied atomically). `analysis.json` records the
+  `contractChange`.
+- **Skipped:** varargs positions, parameters of abstract methods and of
+  methods overridden in the editable sources (`UNSUPPORTED_TARGET`), anonymous
+  class creations, executables outside the editable sources (`NOT_EDITABLE`),
+  and `null` literals, conditionals or casts as arguments.
+
+Regression example (EventBus, round 1): `Object event = pendingPost.event;
+invokeSubscriber(subscription, event);`, with `PendingPost.event` `@Nullable`,
+proposes `void invokeSubscriber(Subscription subscription,
+@org.jspecify.annotations.Nullable Object event)`.
+
+**What is skipped.** Everything else, with the reason recorded in
+`analysis.json`:
+- **`OTHER_CATEGORY`:** other warning kinds. For example, "dereferenced
+  expression 'findState.clazz' is @Nullable" is a dereference and never
+  produces an annotation.
+- **`NOT_A_NULLABLE_FIELD_OR_METHOD`:** `null`, conditionals, or (for
+  assignments and returns) a source, or a local's origin, that is not
+  explicitly `@Nullable`.
+- **`UNRESOLVED`:** positions or symbols that don't resolve to a matching tree.
+- **`EXPLICIT_CONTRACT`:** a destination that is already `@Nullable`, has a
+  non-null annotation, or is a method that overrides another method.
+- **`NOT_EDITABLE`:** a destination outside the configured source roots, in an
+  anonymous or local class, or a field declared together with others.
+- **`UNSUPPORTED_TARGET`:** a resolved parameter that this pass does not
+  change (see `ARGUMENT`).
+
+The rule set is versioned (`nullable-flow-2`, generator
+`nullability-propagation-2`). Its version is part of `analysis.json` and so
+of every cache key, so results computed by `nullable-flow-1`, which skipped
+argument warnings, are never reused.
+
+**What happens next.**
+- **Candidates.** All candidates come from the fixed input, before any edit.
+  Equal edit sets share one package (`P0001, ...`), which keeps every
+  originating warning (`<warning>@propagation-r<source round>`).
+- **Independent evaluation.** Each unique package is evaluated alone on a
+  fresh copy of the input snapshot, so round 1's annotations are kept
+  (`evaluate-annotations`' evaluator, round = source round + 1).
+  - Baseline warnings keep the input's IDs (the fresh baseline must
+    reproduce its findings exactly).
+  - New warnings get the next round's IDs: `W2001, ...` after round 1.
+  - There is one annotation node per package; its proposals are named
+    `<warning>@propagation-1`, and the generator is recorded as
+    `nullability-propagation-2`.
+  - The graph gets `W -> A` for every resolved warning and `A -> N` for every
+    introduced one.
+  - Failed or incomplete evaluations claim nothing.
+  - **Extended graph.** `propagation/<id>/evaluation-graph.json` keeps the
+    earlier round-1 evaluation graph whole (every node and edge, including
+    `A -> W1...` for warnings single packages introduced) and adds this
+    stage. It has only two node kinds (warnings, annotation packages) and
+    two solid edge kinds: `W -> A` (`resolved-by`: applying A resolved W)
+    and `A -> W` (`introduces`: applying A introduced W). Every edge comes
+    from one complete, independent package evaluation against its source
+    state; the combined result adds no node and no edge. It numbers its
+    warnings independently, so its `W1001` is often a different warning
+    from the evaluation's `W1001`, and input warnings are never matched by
+    ID or by diagnostic similarity alone:
+    - **Persisting** from the original baseline: linked to the earlier root
+      (`W0...`), checked by the combined comparison and the matcher.
+    - **Introduced** in the combined state: linked to the earlier node N
+      only if N was introduced by a package applied in the combined state
+      (package key checked), in its own completed evaluation on the same
+      base state, the matcher pairs them, and no other package's warning is
+      equivalent. The link reuses N's ID.
+    - **Otherwise** (ambiguous, several candidates, or no individual
+      evaluation introduced it): a separate warning node with a fresh
+      round-1 ID and no incoming edge. Its origin is not established, and
+      none is invented; `propagation.json` states the limitation.
+    - **This stage:** `W -> P` for every input warning a package resolves,
+      `P -> W2001, ...` for genuinely new warnings, nothing more. A package
+      that introduces nothing ends at its node.
+    - **Metadata:** every new edge records its evaluation, source and result
+      states, the matcher and the warning's ID in the combined report
+      (`reportWarning`). `propagation.json` maps every combined-report ID to
+      its graph node (`history.reportToGraph`), with each link's evidence or
+      limitation (`history.inputWarnings`).
+    - Loading and saving reject any other node or edge kind, a wrong edge
+      direction, and dangling or duplicate edges. ID clashes are refused,
+      never renamed.
+- **Combined result.** Every successfully evaluated package (COMPLETED or
+  AMBIGUOUS) that clashes with no other package is applied together to
+  another copy of the same input, and NullAway runs once (`apply-round`'s
+  mechanism, `rounds/round2-<key>/`). It reuses the evaluation's baseline,
+  so persisting warnings keep their IDs, and new IDs continue after the
+  evaluation's.
+  Conflicting packages are reported and left out. The combined state's effect
+  is never attributed to packages.
+- **Exactly one pass.** Warnings introduced by the evaluations or by the
+  combined check are recorded, not analyzed. If annotating `b` (assigned
+  from a `@Nullable a`) makes `c = b` a new warning, `c` stays unchanged.
+
+**Output:**
+```
+runs/<run>/propagation/<id>/        analysis.json (every warning: matched or skipped, reasons), propagation.json
+                                    (input, packages, evaluation outcomes, combined inclusion, conflicts, history),
+                                    summary.txt, evaluation-graph.json (the extended graph)
+runs/<run>/evaluations/<id>-<key>/  the independent evaluations (this stage's layer of the graph)
+runs/<run>/rounds/round2-<key>/     the combined workspace, changes.diff, findings.json, warnings.txt, report.json,
+                                    warning-graph.json, comparison.json
+```
+
+**Regenerating the graph.** `propagate --rebuild-graph <propagation dir>`
+rebuilds `evaluation-graph.json` (and the record's `history`) from the saved
+artifacts only. It runs no checker, LLM or inference, and needs no
+configuration. It refuses if the input or the evaluation no longer matches the
+record, and a changed graph removes stale `.dot`/`.svg` renderings. The record
+names the graph model (`graphModel`). A graph written under an earlier model
+(T17a, or `reconciled-history-1` with `state` nodes) is stale and should be
+rebuilt; this build cannot read graphs containing `state` nodes:
+```sh
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)
+GA=build/install/GeneralAnnotator/bin/GeneralAnnotator
+$GA propagate --rebuild-graph runs/<run>/propagation/<id>
+$GA visualize runs/<run>/propagation/<id>     # evaluation-graph.dot and .svg
+```
+
+**Reruns and exit codes.** Every key includes the input's snapshot, report
+and warning-graph identity, so rerunning reuses only results for the same
+input. Earlier results for another input stay where they are and are not
+reused. That includes NO_CANDIDATES results computed from the original
+baseline (`propagation1-*`); pipeline.json keeps them as `previous`.
+Exit codes: 0 completed, no candidates, or nothing to combine; 2 invalid
+arguments or configuration; 3 no completed and verified combined result (for
+a pipeline), the evaluation baseline or the combined check failed, or the
+combined set was rejected; 4 internal error.
+
+**On real code.**
+- **EventBus baseline:** all 42 warnings were skipped. The tree has no
+  `@Nullable` annotations yet; its nullable flows are `null` literals,
+  conditionals and locals.
+- **A small JSpecify project** with real NullAway:
+  - 5 of 12 warnings matched (an initializer, two assignments to one field, a
+    method result and a return), giving 4 packages;
+  - the explicit `@NonNull`, the dereference and the returned local were
+    skipped;
+  - every package was evaluated alone, and the combined state went from 12
+    findings to 6;
+  - the newly introduced `c = b` warning (W1001) was left for a later pass.
+- **Copy of the EventBus pipeline after round 1:** the input was
+  `round1-09d3783e43a5` with 23 warnings.
+  - One warning matched: W1001, `mainThreadSupport =
+    builder.getMainThreadSupport()`. Round 1 had made
+    `getMainThreadSupport()` `@Nullable`, so the pass proposes `@Nullable`
+    on `EventBus#mainThreadSupport`.
+  - The package resolved W1001 and introduced nothing; the combined check
+    went from 23 to 22 findings.
+  - The rebuilt extended graph (`warning-annotation-history-2`) kept all 94
+    earlier nodes and all 65 earlier edges. It linked 22 of the 23 input
+    warnings to the earlier node of the one package that introduced them
+    alone, and the remaining one (W0011) to its baseline root; none needed a
+    separate node. The combined report's W1001 is the earlier W1007, so the
+    chain reads `W0012 -> A0009 -> W1007 -> P0001` (the edge records
+    `reportWarning: W1001`). There are no W2 nodes: 95 nodes (66 warnings, 29
+    annotations) and 66 edges (42 `resolved-by`, 24 `introduces`).
+
 ## How the local NullAway checkout is used
 
 1. **Setup.** GeneralAnnotator writes `generated/nullaway-processor-path.init.gradle`
@@ -1998,6 +2218,7 @@ mismatched javac counts, or an exit code inconsistent with the diagnostics).
 ```
 src/main/java/generalannotator/
   pipeline/     the resumable round-1 pipeline over the existing commands (pipeline.json)
+  propagation/  single-pass, warning-guided nullability propagation (analysis and stage)
   cli/          check, visualize, targets, slice, context, prompts, prepare-inference, inference,
                 apply-proposal, evaluate-annotations, apply-round and migrate-warning-ids commands; exit codes
   config/       environment configuration and validation

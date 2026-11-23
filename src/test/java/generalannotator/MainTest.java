@@ -113,6 +113,18 @@ class MainTest {
     }
 
     @Test
+    void propagateIsDispatchedAndValidatesItsArgument() {
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "propagate", "no-such-dir"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("cannot propagate"));
+        err.reset();
+        assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "pipeline", "propagate", "no-such-dir"));
+        assertTrue(err.toString(StandardCharsets.UTF_8).contains("is not a pipeline directory"));
+        assertEquals(ExitCode.COMPLETED, run(Map.of(), "help"));
+        assertTrue(out.toString(StandardCharsets.UTF_8).contains("propagate <run directory>")
+                && out.toString(StandardCharsets.UTF_8).contains("pipeline propagate <pipeline dir>"));
+    }
+
+    @Test
     void pipelineCommandsAreDispatchedAndValidateTheirArguments() {
         assertEquals(ExitCode.USAGE_OR_CONFIGURATION_ERROR, run(Map.of(), "pipeline", "status", "no-such-dir"));
         assertTrue(err.toString(StandardCharsets.UTF_8).contains("is not a pipeline directory"));
