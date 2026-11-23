@@ -611,5 +611,84 @@ class PropagationHistoryGraphTest {
         assertEquals(graphText, Files.readString(stage.resolve(PropagationStage.GRAPH)));
         assertTrue(WarningIntegrity.check(run).ok());
     }
+
+    private ExitCode attribute(boolean savedOnly) {
+        out.reset();
+        err.reset();
+        return generalannotator.cli.AttributeCommand.run(run.toString(), savedOnly, env, temp,
+                Path.of(System.getProperty("java.home")), (c, e) -> checker, new JavaParserAnnotationApplier(),
+                new AnchoredWarningMatcher(), PrepareInferenceCommandTest.CLOCK,
+                new PrintStream(out, true, StandardCharsets.UTF_8), new PrintStream(err, true, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void disconnectedCombinedWarningsGetEdgesOnlyForVerifiedContributions() throws Exception {
+        assertEquals(ExitCode.COMPLETED, propagate(), output());
+        Path stage = stage();
+        Path graphFile = stage.resolve(PropagationStage.GRAPH);
+        String hash = combinedId("x.hashCode()");
+        String bCombined = combinedId("b = a;");
+        String shared = combinedId("shared();");
+        String combo = combinedId("e = a;");
+        WarningGraph before = WarningGraphJson.load(graphFile);
+        for (String w : List.of(hash, bCombined, shared, combo)) {
+            assertTrue(before.edges().stream().noneMatch(e -> e.target().equals(w)), w + " starts disconnected");
+        }
+        // a graph-only rebuild claims nothing without saved attribution evidence
+        assertEquals(ExitCode.COMPLETED, rebuild(stage), output());
+        assertEquals(before.edges().size(), WarningGraphJson.load(graphFile).edges().size());
+        String registryBefore = Files.readString(run.resolve(WarningRegistry.FILE));
+        int checks = checker.calls();
+
+        // two packages: every counterfactual is a saved state (the other package's own evaluation)
+        assertEquals(ExitCode.COMPLETED, attribute(true), output());
+
+        assertEquals(checks, checker.calls(), "reused evaluations only, no checker run\n" + output());
+        WarningGraph g = WarningGraphJson.load(graphFile);
+        List<String> edges = edges(g);
+        // A0002 alone introduced x.hashCode, and without it the combined warning is gone: A0002 -> the combined warning
+        assertTrue(edges.contains("A0002 introduces " + hash), edges.toString());
+        assertTrue(edges.contains("A0001 introduces " + bCombined), edges.toString());
+        GraphEdge e = g.edges().stream().filter(x -> x.source().equals("A0002") && x.target().equals(hash))
+                .findFirst().orElseThrow();
+        assertEquals("combined-context contribution (leave one out)", e.provenance().get("basis"));
+        assertTrue(e.provenance().get("claim").contains("not proof that A0002 alone causes it"));
+        assertEquals(roundOne.getFileName().toString(), e.provenance().get("combinedState"));
+        assertTrue(e.provenance().get("counterfactualState").contains("A0001's own evaluation"),
+                e.provenance().toString());
+        assertTrue(e.provenance().get("packageKey").length() == 64);
+        assertEquals("anchored-1", e.provenance().get("matcher"));
+        // both packages alone introduce shared(): each is still reported without the other, so no edge
+        assertTrue(g.edges().stream().noneMatch(x -> x.target().equals(shared)), edges.toString());
+        // e = a only arises in combination: no saved evaluation proposes a candidate, so no edge
+        assertTrue(g.edges().stream().noneMatch(x -> x.target().equals(combo)), edges.toString());
+        Map<?, ?> history = (Map<?, ?>) json(stage.resolve(PropagationStage.RESULT)).get("history");
+        Map<?, ?> sharedAttribution = (Map<?, ?>) inputWarning(history, shared).get("attribution");
+        assertEquals("UNATTRIBUTED", sharedAttribution.get("status"));
+        assertEquals("NO_CANDIDATE", ((Map<?, ?>) inputWarning(history, combo).get("attribution")).get("status"));
+        assertEquals(2L, history.get("attributedEdges"));
+        // history, IDs and the occurrences are unchanged; only edges were added
+        before.nodes().forEach(n -> assertEquals(n, g.node(n.id()).orElseThrow()));
+        assertEquals(before.edges().size() + 2, g.edges().size());
+        assertEquals(registryBefore, Files.readString(run.resolve(WarningRegistry.FILE)), "no ID allocated or changed");
+        assertTrue(WarningIntegrity.check(run).ok(), WarningIntegrity.check(run).problems().toString());
+        Map<?, ?> pipeline = json(run.resolve("pipeline.json"));
+        assertTrue(String.valueOf(((Map<?, ?>) ((Map<?, ?>) ((Map<?, ?>) pipeline.get("stages")).get("combined"))
+                .get("artifacts")).get("attribution")).startsWith("attributions/"));
+        assertOnlyWarningAndAnnotationNodesAndCausalEdges(g, Files.readString(graphFile));
+
+        // repeated: identical graph and record
+        String graphText = Files.readString(graphFile);
+        assertEquals(ExitCode.COMPLETED, attribute(true), output());
+        assertEquals(graphText, Files.readString(graphFile));
+        assertEquals(ExitCode.COMPLETED, rebuild(stage), output());
+        assertEquals(graphText, Files.readString(graphFile), "a graph-only rebuild keeps the evidence-backed edges");
+
+        // a forged edge without verified evidence is caught by the integrity check
+        Path record = run.resolve(e.provenance().get("attribution"));
+        Files.writeString(record, Files.readString(record).replace("\"status\": \"VERIFIED\"",
+                "\"status\": \"NOT_A_CONTRIBUTOR\""));
+        assertTrue(WarningIntegrity.check(run).problems().stream().anyMatch(p -> p.contains("attribution edge")));
+    }
 }
 

@@ -2,6 +2,7 @@ package generalannotator;
 
 import generalannotator.cli.ApplyProposalCommand;
 import generalannotator.cli.ApplyRoundCommand;
+import generalannotator.cli.AttributeCommand;
 import generalannotator.cli.CheckCommand;
 import generalannotator.checker.Checkers;
 import generalannotator.cli.ContextCommand;
@@ -114,6 +115,12 @@ public final class Main {
                       compatible successful ones together and recheck once (rounds/). Writes
                       propagation/<id>/ (analysis.json, propagation.json, summary.txt,
                       evaluation-graph.json: the earlier evaluation graph kept whole plus this stage).
+              attribute <run directory> [--saved-only]
+                      Attribute every combined round's introduced warnings to the included packages
+                      that contribute to them (leave one package out; candidates from saved
+                      evaluations; counterfactual states reused or checked locally, cached), then
+                      rebuild the propagation graphs with package -> warning edges for verified
+                      contributions and check warning IDs. --saved-only runs no checker. No LLM.
               warning-ids check|rebuild|migrate <run directory>
                       The run's warning registry (warning-registry.json), the authority for public
                       warning IDs. check: verify that registry, reports and graphs agree (exit 3 if
@@ -329,6 +336,18 @@ public final class Main {
             try {
                 return PropagateCommand.rebuildGraph(args[2], Path.of("").toAbsolutePath(), new AnchoredWarningMatcher(),
                         Clock.systemUTC(), out, err);
+            } catch (RuntimeException e) {
+                err.println("GeneralAnnotator: internal error:");
+                e.printStackTrace(err);
+                return ExitCode.INTERNAL_ERROR;
+            }
+        }
+        if ((args.length == 2 || (args.length == 3 && args[2].equals("--saved-only"))) && args[0].equals("attribute")) {
+            try {
+                return AttributeCommand.run(args[1], args.length == 3, env, Path.of("").toAbsolutePath(),
+                        Path.of(System.getProperty("java.home")),
+                        (config, e) -> Checkers.create(config, e, new ProcessCommandRunner()),
+                        new JavaParserAnnotationApplier(), new AnchoredWarningMatcher(), Clock.systemUTC(), out, err);
             } catch (RuntimeException e) {
                 err.println("GeneralAnnotator: internal error:");
                 e.printStackTrace(err);

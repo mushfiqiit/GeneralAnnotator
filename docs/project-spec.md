@@ -611,6 +611,27 @@ interface or in one named class), labeled provisional, and noted here.
     - **Superseded stages:** propagation stages whose input no longer
       resolves keep their old graph as `evaluation-graph.legacy.json`,
       outside the identity check.
+- **Combined-warning attribution (T23).** `evaluation.CombinedAttribution`
+  (`attribute <run>`, model `leave-one-out-1`) attributes each combined
+  round's introduced warnings.
+  - **Candidates:** packages whose own saved evaluation introduced a
+    matcher-equivalent warning.
+  - **Verification:** a leave-one-out counterfactual (the other packages'
+    edits, shared edits kept; reused when it is exactly the base state or
+    one saved attempt, otherwise checked locally and cached). The warning
+    must be absent from that complete, comparable result.
+  - **Edges:** `HistoryGraph` draws `package -> warning` edges only from a
+    current record's `VERIFIED` verdicts; `WarningIntegrity` re-verifies
+    them.
+  - **Provisional:**
+    - **Meaning of an edge:** contribution in that combined context, not
+      sole cause.
+    - **Candidate discovery** covers saved evaluations only, so
+      combination-only effects stay unattributed rather than being searched
+      exhaustively.
+    - **Single exclusions:** packages whose effects are redundant (each
+      alone suffices) are never verified by single exclusions; pairwise or
+      larger exclusions are open (§6.5).
 - **Pipeline orchestration (T16).** Provisional, in `pipeline.Pipeline`:
   - **Composition.** The existing commands are called in-process; the run
     directory is the pipeline directory and `pipeline.json` its state.

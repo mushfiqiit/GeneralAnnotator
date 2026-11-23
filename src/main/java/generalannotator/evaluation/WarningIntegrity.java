@@ -247,6 +247,10 @@ public final class WarningIntegrity {
                 if (!keys.add(e.key())) {
                     problems.add(rel + ": duplicate edge " + e.key());
                 }
+                String attribution = e.provenance().get("attribution");
+                if (attribution != null) {
+                    attributionEdge(dir, rel, e, attribution, problems);
+                }
             }
             for (GraphNode n : g.nodes()) {
                 if (n instanceof AnnotationNode a && r != null) {
@@ -281,6 +285,34 @@ public final class WarningIntegrity {
         counts.put("graphEdges", edges);
         if (files.isEmpty()) {
             notes.add("no evaluation graph to check");
+        }
+    }
+
+    /** An attribution edge is backed by a current record that lists its package as a verified contributor. */
+    private static void attributionEdge(Path dir, String rel, GraphEdge e, String attribution, List<String> problems)
+            throws IOException {
+        Path record = dir.resolve(attribution);
+        String edge = rel + ": attribution edge " + e.source() + " -> " + e.target();
+        if (!Files.isRegularFile(record)) {
+            problems.add(edge + " names missing record " + attribution);
+            return;
+        }
+        Map<?, ?> r = WarningRegistry.parse(record);
+        Path round = dir.resolve(String.valueOf(r.get("roundResult")));
+        Path evaluation = dir.resolve(String.valueOf(r.get("evaluation")));
+        if (!CombinedAttribution.MODEL.equals(r.get("model")) || !Files.isDirectory(round)
+                || !Files.isDirectory(evaluation)
+                || !CombinedAttribution.identity(round, evaluation).equals(r.get("identity"))) {
+            problems.add(edge + " rests on " + attribution + ", which no longer matches its round result and "
+                    + "evaluation");
+            return;
+        }
+        boolean verified = WarningRegistry.list(r.get("warnings")).stream().map(o -> (Map<?, ?>) o)
+                .filter(w -> e.target().equals(w.get("warningId")))
+                .flatMap(w -> WarningRegistry.list(w.get("candidates")).stream().map(o -> (Map<?, ?>) o))
+                .anyMatch(c -> e.source().equals(c.get("package")) && "VERIFIED".equals(c.get("status")));
+        if (!verified) {
+            problems.add(edge + " is not a VERIFIED contribution in " + attribution);
         }
     }
 

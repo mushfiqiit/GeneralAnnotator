@@ -2197,6 +2197,74 @@ Evaluation keys are now written in a fixed order. They used a `Map.of`, whose
 per-process random order could change an evaluation's ID between commands,
 so a repeated command might not find its own evaluation.
 
+## Attributing combined warnings (`attribute`)
+
+Warnings that only appear in a combined round state are distinct
+occurrences, with their own IDs (see above). By default the expanded graph
+gives them no incoming edge: a matching warning in one package's own
+evaluation is a correspondence, not a cause in the combined state.
+`attribute` establishes contributions with evidence, and draws an edge only
+where that evidence exists:
+
+```sh
+$GA attribute runs/<run id>               # local checks where needed (checker settings as for evaluate-annotations)
+$GA attribute runs/<run id> --saved-only  # saved evidence only; no checker run
+```
+
+For every combined round (the pipeline's round 1 and each propagation round):
+1. **Targets:** the round's `INTRODUCED` findings. They must be absent from
+   the round's baseline, which the matcher checks again. `AMBIGUOUS`
+   findings are not attributed.
+2. **Candidates:** included packages whose own saved evaluation introduced a
+   warning that the semantic matcher pairs with the target, by declaration
+   anchor and site, never by ID or message.
+3. **Leave one out:** for candidate `c`, the counterfactual state is the
+   round's base snapshot plus every other included package's edits. An edit
+   that `c` shares with another package therefore stays.
+   - **No effective change:** if excluding `c` removes no edit, or leaves
+     exactly the combined source, the result is `INCONCLUSIVE`.
+   - **Reuse:** the state is reused when it is the base state (the
+     evaluation's baseline) or exactly one package's saved attempt.
+   - **Local check:** otherwise it is checked locally with the AST applier
+     and the full NullAway configuration, and cached under
+     `attributions/counterfactuals/<key>`. The key covers the base
+     snapshot and baseline, the effective edit set, the checker
+     configuration, the matcher and the model (`leave-one-out-1`).
+4. **Verification:** the complete counterfactual result is compared with the
+   recorded combined result.
+   - `VERIFIED`: the warning is absent without `c` (and present with it).
+   - `NOT_A_CONTRIBUTOR`: the warning is still reported without `c`.
+   - `AMBIGUOUS`: the matcher cannot decide.
+   - `FAILED`: a compilation failure, timeout, rejected edit, or a result
+     from a different tool. A failed state is checked again next time.
+   - Neither `AMBIGUOUS` nor `FAILED` establishes anything.
+5. **Edges:** each verified contributor becomes a solid `package -> warning`
+   (`introduces`) edge in the next round's expanded graph. Its metadata
+   holds the `basis` (combined-context contribution), the `claim` ("not
+   proof that it alone causes it"), the combined and counterfactual states,
+   the package key, the matcher and the record. Several verified
+   contributors are all kept.
+6. **No edge:** a warning without a verified contributor gets no edge, and
+   its reason is recorded in `history.inputWarnings[].attribution`. The
+   statuses are `NO_CANDIDATE` (for example an effect of the combination
+   only; discovery covers saved evaluations, so this is no claim that
+   nothing contributes), `UNATTRIBUTED` and `AMBIGUOUS`.
+
+Records go in `attributions/<round result>-<key>/attribution.json`. They
+list every target, candidate verdict with its evidence, and counterfactual
+state. The pipeline stages reference them (`artifacts.attribution`). After
+attributing, the command rebuilds every propagation graph in round order and
+runs `warning-ids check`, which also verifies that every attribution edge
+rests on a current record listing it as `VERIFIED`.
+
+**Guarantees:**
+- A graph-only rebuild (`propagate --rebuild-graph`) uses saved records and
+  never claims new attribution.
+- No warning ID is allocated or changed.
+- Snapshots, round results and raw checker output are untouched.
+- The last round's combined warnings have no next graph to appear in; their
+  attribution is recorded, not drawn.
+
 ## How the local NullAway checkout is used
 
 1. **Setup.** GeneralAnnotator writes `generated/nullaway-processor-path.init.gradle`

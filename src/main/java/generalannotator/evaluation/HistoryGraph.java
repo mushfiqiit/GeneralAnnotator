@@ -102,6 +102,10 @@ public final class HistoryGraph {
         Map<String, Integer> counts = new TreeMap<>();
         List<String> notes = new ArrayList<>();
         List<Object> correspondences = new ArrayList<>();
+        Map<String, Map<?, ?>> attribution = new LinkedHashMap<>();
+        String attributionRef = null;
+        String attributionMatcher = null;
+        int attributed = 0;
         String roundRef = null;
 
         if (earlierGraph.isEmpty()) {
@@ -125,6 +129,16 @@ public final class HistoryGraph {
             Path roundDir = roundResult.get();
             roundRef = rel(runDir, roundDir);
             Map<?, ?> round = parse(roundDir.resolve(RoundApplication.RECORD));
+            // verified contributions in the combined context, only from a saved attribution valid for this round
+            Optional<Path> attributionDir = CombinedAttribution.find(runDir, roundDir, evaluationDir);
+            if (attributionDir.isPresent()) {
+                Map<?, ?> a = parse(attributionDir.get().resolve(CombinedAttribution.RECORD));
+                attributionRef = rel(runDir, attributionDir.get().resolve(CombinedAttribution.RECORD));
+                attributionMatcher = String.valueOf(a.get("matcher"));
+                for (Object o : list(a.get("warnings"))) {
+                    attribution.put(String.valueOf(((Map<?, ?>) o).get("warningId")), (Map<?, ?>) o);
+                }
+            }
             Map<?, ?> findings = parse(roundDir.resolve(RoundApplication.FINDINGS));
             String baseState = String.valueOf(round.get("baseState"));
             Map<String, Map<?, ?>> byId = new LinkedHashMap<>();
@@ -286,6 +300,47 @@ public final class HistoryGraph {
                     own(w, none ? "introduced-in-combined-state" : "ambiguous-correspondence", prov, nodes, toGraph,
                             identities, counts);
                 }
+                Map<?, ?> att = attribution.get(w.id());
+                if (att == null) {
+                    identities.get(w.id()).put("attribution", attributionRef == null ? "no saved attribution for "
+                            + roundRef + " (run `attribute`); no incoming edge is claimed" : "not a target of "
+                            + attributionRef);
+                    continue;
+                }
+                Map<String, Object> summary = new LinkedHashMap<>();
+                summary.put("status", att.get("status"));
+                summary.put("reason", att.get("reason"));
+                summary.put("contributors", att.get("contributors"));
+                summary.put("record", attributionRef);
+                identities.get(w.id()).put("attribution", summary);
+                for (Object o : list(att.get("candidates"))) {
+                    Map<?, ?> v = (Map<?, ?>) o;
+                    String pkg = String.valueOf(v.get("package"));
+                    if (!"VERIFIED".equals(v.get("status"))) {
+                        continue;
+                    }
+                    if (!(nodes.get(pkg) instanceof AnnotationNode an) || !an.baselineState().equals(baseState)) {
+                        notes.add(w.id() + ": verified contributor " + pkg + " is not an annotation package of state "
+                                + baseState + " in the earlier graph; no edge");
+                        continue;
+                    }
+                    Map<String, String> ep = new LinkedHashMap<>();
+                    ep.put("basis", "combined-context contribution (leave one out)");
+                    ep.put("claim", pkg + " contributes to " + w.id() + " in " + inputState + ": reported with every "
+                            + "included package and absent from the complete result without " + pkg + "; not proof that "
+                            + pkg + " alone causes it");
+                    ep.put("combinedState", inputState);
+                    ep.put("sourceState", baseState);
+                    ep.put("counterfactualState", String.valueOf(v.get("counterfactualState")));
+                    ep.put("counterfactual", String.valueOf(v.get("counterfactual")));
+                    ep.put("packageKey", String.valueOf(v.get("packageKey")));
+                    ep.put("matcher", attributionMatcher);
+                    ep.put("attribution", attributionRef);
+                    ep.put("reportWarning", w.id());
+                    ep.put("evidence", String.valueOf(v.get("evidence")));
+                    putEdge(edges, new GraphEdge(pkg, w.id(), GraphEdge.INTRODUCES, ep));
+                    attributed++;
+                }
             }
         }
 
@@ -336,6 +391,8 @@ public final class HistoryGraph {
         identities.forEach((k, v) -> reportToGraph.put(k, String.valueOf(v.get("graphNode"))));
         record.put("reportToGraph", reportToGraph);
         record.put("correspondences", correspondences);
+        record.put("attribution", attributionRef);
+        record.put("attributedEdges", attributed);
         record.put("inputWarnings", List.copyOf(identities.values()));
         record.put("notes", notes);
         record.put("nodes", graph.nodes().size());

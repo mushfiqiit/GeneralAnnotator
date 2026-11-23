@@ -680,11 +680,11 @@ public final class WarningRegistry {
         return text == null ? "" : text.lines().findFirst().orElse("").strip();
     }
 
-    static List<?> list(Object o) {
+    public static List<?> list(Object o) {
         return o instanceof List<?> l ? l : List.of();
     }
 
-    static Map<?, ?> parse(Path file) throws IOException {
+    public static Map<?, ?> parse(Path file) throws IOException {
         try {
             return (Map<?, ?>) JsonParser.parse(Files.readString(file, StandardCharsets.UTF_8));
         } catch (RuntimeException e) {

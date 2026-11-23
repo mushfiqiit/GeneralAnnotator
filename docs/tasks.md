@@ -1640,3 +1640,63 @@ Verified by:
   - **Reruns:** a repeated `pipeline propagate --round 5` reuses the original
     evaluation with no NullAway run, and the graph and registry stay
     byte-identical.
+
+## T23 — Evidence-backed attribution of combined-round warnings · `done`
+
+Since T22, a combined-state warning (for example EventBus W1004, the
+`subscription` dereference in round 1's combined code) was a node with no
+incoming edge. Its correspondence to a package's own warning (A0012's W1034)
+was metadata only.
+
+- **`CombinedAttribution`** (`attribute <run> [--saved-only]`, model
+  `leave-one-out-1`):
+  - **Targets:** each combined round's `INTRODUCED` warnings, re-checked
+    against the round baseline.
+  - **Candidates:** from the packages' own saved evaluations, by matcher.
+  - **Leave one out:** the other packages' edits, with shared edits kept.
+    No effective change gives `INCONCLUSIVE`. The base state or a single
+    saved attempt is reused when it is exactly the required state;
+    otherwise there is a local check, cached by base, edit set,
+    configuration, matcher and model.
+  - **Verdicts:** `VERIFIED`, `NOT_A_CONTRIBUTOR`, `INCONCLUSIVE`,
+    `AMBIGUOUS` and `FAILED`; failures are retried.
+  - **Records:** `attributions/<round>-<key>/attribution.json`, referenced
+    from pipeline stages (`artifacts.attribution`).
+- **`HistoryGraph`:** `package -> warning` (`introduces`) edges only for
+  `VERIFIED` verdicts of a current record, with metadata (basis, claim,
+  combined and counterfactual states, package key, matcher, record,
+  evidence); reasons for every other warning go in `inputWarnings`. A
+  graph-only rebuild uses saved records only.
+- **`WarningIntegrity`:** every attribution edge must rest on a current
+  record that lists it as `VERIFIED`.
+
+Verified by:
+- `CombinedAttributionTest` (four packages):
+  - one verified contributor;
+  - a shared edit (inconclusive) and its counterfactual keeping the shared
+    edit;
+  - two verified contributors;
+  - an ambiguous verification;
+  - failed checks establishing nothing and being retried;
+  - saved-only mode running nothing and reusing saved checks;
+  - caching and determinism.
+- `PropagationHistoryGraphTest`:
+  - the disconnected-warning example (A0002 -> the combined x.hashCode);
+  - each-alone-suffices and combination-only warnings left without edges,
+    with reasons;
+  - reuse with no checker run, unchanged nodes and registry, the pipeline
+    reference, identical repeats and rebuilds;
+  - a forged verdict caught by the integrity check.
+- A copy of the EventBus run, which currently has rounds 1 and 2:
+  - **Round 1:** 22 of 22 introduced combined warnings attributed to one
+    verified contributor each, from 13 local leave-one-out checks (13
+    distinct candidate packages). A0012 -> W1004 was verified: without
+    A0012, W1004 is absent.
+  - **Round 2:** 5 of 5 (W2006–W2010) attributed, from 5 local checks.
+    They are drawn once a round-3 graph exists.
+  - **Time:** 18 checker runs in all, about 47 s.
+  - **Graph:** the round-2 graph went from 22 disconnected combined warnings
+    to 0, with 22 attribution edges (103 edges in all).
+  - **Repeats and originals:** a repeat ran no checks and gave identical
+    records and graph. `warning-ids check` reports OK, and the raw
+    artifacts are byte-identical.
